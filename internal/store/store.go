@@ -23,7 +23,7 @@ type Store struct {
 	fts5Available bool // Whether FTS5 is available for full-text search
 }
 
-const defaultSQLiteParams = "?_journal_mode=WAL&_busy_timeout=5000&_foreign_keys=ON"
+const defaultSQLiteParams = "?_journal_mode=WAL&_busy_timeout=30000&_synchronous=NORMAL&_foreign_keys=ON"
 
 // isSQLiteError checks if err is a sqlite3.Error with a message containing substr.
 // This is more robust than strings.Contains on err.Error() because it first
@@ -77,9 +77,33 @@ func Open(dbPath string) (*Store, error) {
 	}, nil
 }
 
-// Close closes the database connection.
+// Close checkpoints the WAL and closes the database connection.
 func (s *Store) Close() error {
+	// Checkpoint WAL before closing to fold it back into the main database.
+	// This prevents WAL accumulation across sessions and reduces the risk of
+	// corruption from stale WAL entries.
+	_ = s.CheckpointWAL()
 	return s.db.Close()
+}
+
+// CheckpointWAL forces a WAL checkpoint, folding the WAL back into the main
+// database file. Uses TRUNCATE mode which also resets the WAL file to zero
+// bytes. Returns nil on success; callers may log but should not fail on error.
+func (s *Store) CheckpointWAL() error {
+	var busy, log, checkpointed int
+	err := s.db.QueryRow(
+		"PRAGMA wal_checkpoint(TRUNCATE)",
+	).Scan(&busy, &log, &checkpointed)
+	if err != nil {
+		return err
+	}
+	if busy != 0 {
+		return fmt.Errorf(
+			"WAL checkpoint incomplete: database busy "+
+				"(log=%d, checkpointed=%d)", log, checkpointed,
+		)
+	}
+	return nil
 }
 
 // DB returns the underlying database connection for advanced queries.

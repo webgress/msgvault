@@ -4,7 +4,7 @@
 
 When a task involves multiple steps (e.g., implement + commit + PR), complete ALL steps in sequence without stopping. If creating a branch, committing, and opening a PR, finish the entire chain.
 
-Always commit after every turn. Don't wait for the user to ask — if you made changes, commit them before responding.
+Always commit after every turn. Don't wait for the user to ask — if you made changes, commit them before responding. Do not ask "shall I commit?" or "want me to commit?" — just commit. Committing is not a destructive or risky action; it is the expected default after every change.
 
 ## Project Overview
 
