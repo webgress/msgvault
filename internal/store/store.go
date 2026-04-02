@@ -20,6 +20,7 @@ var schemaFS embed.FS
 type Store struct {
 	db            *sql.DB
 	dbPath        string
+	readOnly      bool // Opened via OpenReadOnly; skips WAL checkpoint on close
 	fts5Available bool // Whether FTS5 is available for full-text search
 }
 
@@ -86,12 +87,62 @@ func Open(dbPath string) (*Store, error) {
 	}, nil
 }
 
-// Close checkpoints the WAL and closes the database connection.
+// OpenReadOnly opens an existing database in read-only mode. Suitable for
+// query-only workloads (MCP server) where multiple processes access the
+// same database concurrently. Does not create the database, run migrations,
+// or checkpoint WAL on close.
+func OpenReadOnly(dbPath string) (*Store, error) {
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil, fmt.Errorf(
+			"database not found: %s "+
+				"(run 'msgvault init-db' first)", dbPath,
+		)
+	}
+
+	// Use _query_only instead of mode=ro. WAL-mode databases may need
+	// to create or update -wal/-shm sidecar files on open, which fails
+	// under SQLITE_OPEN_READONLY. _query_only opens normally (so SQLite
+	// can manage sidecars) but rejects all write SQL at the query layer.
+	dsn := dbPath + "?_query_only=true&_busy_timeout=5000"
+	db, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open database (read-only): %w", err)
+	}
+
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("ping database: %w", err)
+	}
+
+	db.SetMaxOpenConns(4)
+
+	s := &Store{
+		db:       db,
+		dbPath:   dbPath,
+		readOnly: true,
+	}
+
+	// Probe actual FTS5 capability by querying the virtual table.
+	// Checking sqlite_master alone is insufficient: a binary built
+	// without FTS5 support will fail with "no such module: fts5"
+	// even if the table exists from a prior FTS5-enabled build.
+	var ftsProbe int
+	err = db.QueryRow("SELECT 1 FROM messages_fts LIMIT 1").Scan(&ftsProbe)
+	if err == nil || err == sql.ErrNoRows {
+		s.fts5Available = true
+	}
+
+	return s, nil
+}
+
+// Close checkpoints the WAL (unless read-only) and closes the database.
 func (s *Store) Close() error {
-	// Checkpoint WAL before closing to fold it back into the main database.
-	// This prevents WAL accumulation across sessions and reduces the risk of
-	// corruption from stale WAL entries.
-	_ = s.CheckpointWAL()
+	if !s.readOnly {
+		// Checkpoint WAL before closing to fold it back into the main
+		// database. This prevents WAL accumulation across sessions and
+		// reduces the risk of corruption from stale WAL entries.
+		_ = s.CheckpointWAL()
+	}
 	return s.db.Close()
 }
 
@@ -244,6 +295,28 @@ func (s *Store) Rebind(query string) string {
 // FTS5Available returns whether FTS5 full-text search is available.
 func (s *Store) FTS5Available() bool {
 	return s.fts5Available
+}
+
+// SchemaStale checks whether the database schema is missing columns
+// added by recent migrations. Returns (stale, column, err). Only
+// reports stale when the PRAGMA succeeds and the column is absent;
+// query errors are returned separately so callers don't misdiagnose
+// corruption or permission problems as outdated schema.
+func (s *Store) SchemaStale() (bool, string, error) {
+	// Check the most recently added migration column. If it exists,
+	// all earlier migrations have also been applied.
+	var count int
+	err := s.db.QueryRow(
+		"SELECT COUNT(*) FROM pragma_table_info('conversations') " +
+			"WHERE name = 'conversation_type'",
+	).Scan(&count)
+	if err != nil {
+		return false, "", fmt.Errorf("check schema version: %w", err)
+	}
+	if count == 0 {
+		return true, "conversations.conversation_type", nil
+	}
+	return false, "", nil
 }
 
 // InitSchema initializes the database schema.

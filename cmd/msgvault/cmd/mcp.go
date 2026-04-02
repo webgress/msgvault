@@ -34,22 +34,31 @@ Add to Claude Desktop config:
   }`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath := cfg.DatabaseDSN()
-		s, err := store.Open(dbPath)
+
+		// Open read-only: MCP is a query-only workload. This avoids
+		// SQLite write-lock contention when multiple MCP processes
+		// (one per Claude Code session) access the same database.
+		// Schema migrations and FTS backfill are write operations
+		// handled by init-db / sync / tui — not by MCP.
+		s, err := store.OpenReadOnly(dbPath)
 		if err != nil {
 			return fmt.Errorf("open database: %w", err)
 		}
 		defer func() { _ = s.Close() }()
 
-		// Ensure schema is up to date
-		if err := s.InitSchema(); err != nil {
-			return fmt.Errorf("init schema: %w", err)
+		if stale, col, err := s.SchemaStale(); err != nil {
+			return fmt.Errorf("check schema: %w", err)
+		} else if stale {
+			return fmt.Errorf(
+				"database schema is outdated (missing %s); "+
+					"run 'msgvault init-db' to update", col)
 		}
 
-		// Build FTS index in background — MCP should start serving immediately
-		if s.NeedsFTSBackfill() {
-			go func() {
-				_, _ = s.BackfillFTS(nil)
-			}()
+		if s.FTS5Available() && s.NeedsFTSBackfill() {
+			fmt.Fprintf(os.Stderr,
+				"Warning: full-text search index needs populating; "+
+					"body-text search will return incomplete results "+
+					"until 'msgvault tui' or 'msgvault search' is run\n")
 		}
 
 		var engine query.Engine
