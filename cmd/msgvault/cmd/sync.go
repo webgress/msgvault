@@ -178,6 +178,9 @@ Examples:
 			}
 		}
 
+		// Rebuild analytics cache.
+		rebuildCacheAfterWrite(dbPath)
+
 		if len(syncErrors) > 0 {
 			fmt.Println()
 			fmt.Println("Errors:")
