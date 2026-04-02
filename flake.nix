@@ -45,6 +45,7 @@
             go
             golangci-lint
             gcc
+            prek
           ];
         };
       });
