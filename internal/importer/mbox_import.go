@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/wesm/msgvault/internal/mbox"
@@ -23,8 +24,8 @@ type MboxImportOptions struct {
 	// Identifier is the sources.identifier (e.g. "you@hey.com").
 	Identifier string
 
-	// Label, if non-empty, is applied to all imported messages.
-	Label string
+	// Labels, if non-empty, are applied to all imported messages.
+	Labels []string
 
 	// NoResume forces a fresh import even if an active sync run exists for the source.
 	NoResume bool
@@ -60,6 +61,7 @@ type MboxImportSummary struct {
 	MessagesAdded     int64
 	MessagesUpdated   int64
 	MessagesSkipped   int64
+	LabelsUpdated     int64
 	Errors            int64
 	HardErrors        bool
 }
@@ -184,15 +186,21 @@ func ImportMbox(ctx context.Context, st *store.Store, mboxPath string, opts Mbox
 		log.Warn("failed to save initial checkpoint", "error", err)
 	}
 
-	// Ensure label (once).
+	// Ensure labels (once). Deduplicate to avoid PK violations.
 	var labelIDs []int64
-	if opts.Label != "" {
-		labelID, err := st.EnsureLabel(src.ID, opts.Label, opts.Label, "user")
+	seen := make(map[string]bool)
+	for _, lbl := range opts.Labels {
+		lbl = strings.TrimSpace(lbl)
+		if lbl == "" || seen[lbl] {
+			continue
+		}
+		seen[lbl] = true
+		labelID, err := st.EnsureLabel(src.ID, lbl, lbl, "user")
 		if err != nil {
 			failSync(err.Error())
-			return nil, fmt.Errorf("ensure label: %w", err)
+			return nil, fmt.Errorf("ensure label %q: %w", lbl, err)
 		}
-		labelIDs = []int64{labelID}
+		labelIDs = append(labelIDs, labelID)
 	}
 
 	// Open file and (if resuming) seek.
@@ -316,11 +324,30 @@ func ImportMbox(ctx context.Context, st *store.Store, mboxPath string, opts Mbox
 					log.Warn("existence check failed; attempting ingest anyway", "error", err)
 				} else {
 					_, exists = one[p.SourceMsg]
+					// Merge into existingWithRaw so label update can find the message ID.
+					if existingWithRaw == nil {
+						existingWithRaw = make(map[string]int64)
+					}
+					for k, v := range one {
+						existingWithRaw[k] = v
+					}
 				}
 			}
 
 			if exists {
 				summary.MessagesSkipped++
+
+				// Add labels to existing message (same pattern as emlx importer).
+				if len(labelIDs) > 0 {
+					if msgID, ok := existingWithRaw[p.SourceMsg]; ok && msgID > 0 {
+						if err := st.AddMessageLabels(msgID, labelIDs); err != nil {
+							log.Warn("failed to add labels to existing message",
+								"source_message_id", p.SourceMsg, "error", err)
+						} else {
+							summary.LabelsUpdated++
+						}
+					}
+				}
 
 				// Update checkpoint offset even when skipping so resumption progresses.
 				if !checkpointBlocked {

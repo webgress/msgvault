@@ -17,7 +17,7 @@ import (
 
 var (
 	importMboxSourceType         string
-	importMboxLabel              string
+	importMboxLabels             []string
 	importMboxNoResume           bool
 	importMboxCheckpointInterval int
 	importMboxNoAttachments      bool
@@ -34,8 +34,8 @@ var importMboxCmd = &cobra.Command{
 	Short: "Import an MBOX export into msgvault",
 	Long: `Import an MBOX export into msgvault.
 
-The export file may be a plain .mbox/.mbx file or a .zip containing one or
-more .mbox files.
+The export file may be a plain mbox file (any extension) or a .zip containing
+one or more .mbox files.
 
 This is useful for email providers that offer an export but no IMAP/POP access.
 The importer stores raw MIME, bodies, recipients, and optional attachments.
@@ -232,13 +232,14 @@ Examples:
 		}
 
 		var (
-			totalProcessed int64
-			totalAdded     int64
-			totalUpdated   int64
-			totalSkipped   int64
-			totalErrors    int64
-			totalBytes     int64
-			hadHardErrors  bool
+			totalProcessed     int64
+			totalAdded         int64
+			totalUpdated       int64
+			totalSkipped       int64
+			totalLabelsUpdated int64
+			totalErrors        int64
+			totalBytes         int64
+			hadHardErrors      bool
 		)
 		type processedFile struct {
 			Path    string
@@ -250,7 +251,7 @@ Examples:
 			summary, err := importer.ImportMbox(ctx, st, mboxPath, importer.MboxImportOptions{
 				SourceType:         importMboxSourceType,
 				Identifier:         identifier,
-				Label:              importMboxLabel,
+				Labels:             importMboxLabels,
 				NoResume:           importMboxNoResume,
 				CheckpointInterval: importMboxCheckpointInterval,
 				AttachmentsDir:     attachmentsDir,
@@ -264,6 +265,7 @@ Examples:
 			totalAdded += summary.MessagesAdded
 			totalUpdated += summary.MessagesUpdated
 			totalSkipped += summary.MessagesSkipped
+			totalLabelsUpdated += summary.LabelsUpdated
 			totalErrors += summary.Errors
 			totalBytes += summary.BytesProcessed
 			if summary.HardErrors {
@@ -308,6 +310,7 @@ Examples:
 		_, _ = fmt.Fprintf(out, "  Added:          %d messages\n", totalAdded)
 		_, _ = fmt.Fprintf(out, "  Updated:        %d messages\n", totalUpdated)
 		_, _ = fmt.Fprintf(out, "  Skipped:        %d messages\n", totalSkipped)
+		_, _ = fmt.Fprintf(out, "  Labels updated: %d messages\n", totalLabelsUpdated)
 		_, _ = fmt.Fprintf(out, "  Errors:         %d\n", totalErrors)
 		_, _ = fmt.Fprintf(out, "  Bytes:          %.2f MB\n", float64(totalBytes)/(1024*1024))
 
@@ -327,7 +330,7 @@ func init() {
 	rootCmd.AddCommand(importMboxCmd)
 
 	importMboxCmd.Flags().StringVar(&importMboxSourceType, "source-type", "mbox", "Source type to record in the database (e.g. mbox, hey)")
-	importMboxCmd.Flags().StringVar(&importMboxLabel, "label", "", "Label to apply to newly imported messages")
+	importMboxCmd.Flags().StringSliceVar(&importMboxLabels, "label", nil, "Label(s) to apply to imported messages (repeatable, or comma-separated)")
 	importMboxCmd.Flags().BoolVar(&importMboxNoResume, "no-resume", false, "Do not resume from an interrupted import")
 	importMboxCmd.Flags().IntVar(&importMboxCheckpointInterval, "checkpoint-interval", 200, "Save progress every N messages")
 	importMboxCmd.Flags().BoolVar(&importMboxNoAttachments, "no-attachments", false, "Do not store attachments (disk or database). Messages will still be marked as having attachments. Note: rerunning later without --no-attachments will not backfill attachments for already-imported messages.")
