@@ -20,13 +20,11 @@ func (d *SQLiteDialect) Rebind(query string) string { return query }
 // Now returns the SQLite expression for the current UTC timestamp.
 func (d *SQLiteDialect) Now() string { return "datetime('now')" }
 
-// GroupConcat returns SQLite's GROUP_CONCAT(expr, sep).
-func (d *SQLiteDialect) GroupConcat(expr, sep string) string {
-	return fmt.Sprintf("GROUP_CONCAT(%s, %s)", expr, sep)
-}
-
 // InsertOrIgnore is a no-op for SQLite — the syntax is native.
 func (d *SQLiteDialect) InsertOrIgnore(sql string) string { return sql }
+
+// InsertOrIgnoreSuffix returns "" for SQLite — OR IGNORE is in the statement prefix.
+func (d *SQLiteDialect) InsertOrIgnoreSuffix() string { return "" }
 
 // UpdateOrIgnore is a no-op for SQLite — the syntax is native.
 func (d *SQLiteDialect) UpdateOrIgnore(sql string) string { return sql }
@@ -103,7 +101,7 @@ func (d *SQLiteDialect) FTSClearSQL() string {
 	return "DELETE FROM messages_fts"
 }
 
-// SchemaFTS returns the embedded FTS5 virtual table DDL filename content.
+// SchemaFTS returns the embedded filename containing FTS5 virtual table DDL.
 func (d *SQLiteDialect) SchemaFTS() string {
 	return "schema_sqlite.sql"
 }
