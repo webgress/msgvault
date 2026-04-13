@@ -55,14 +55,23 @@ func isSQLiteError(err error, substr string) bool {
 	return false
 }
 
-// Open opens or creates the database at the given path.
-// Currently only SQLite is supported. PostgreSQL URLs will return an error.
-func Open(dbPath string) (*Store, error) {
-	// Check for unsupported database URLs
-	if strings.HasPrefix(dbPath, "postgresql://") || strings.HasPrefix(dbPath, "postgres://") {
-		return nil, fmt.Errorf("PostgreSQL is not yet supported in the Go implementation; use SQLite path instead")
-	}
+// isPostgresURL returns true if the path looks like a PostgreSQL connection URL.
+func isPostgresURL(dbPath string) bool {
+	return strings.HasPrefix(dbPath, "postgresql://") || strings.HasPrefix(dbPath, "postgres://")
+}
 
+// Open opens or creates the database at the given path.
+// If dbPath is a postgres:// or postgresql:// URL, opens a PostgreSQL connection.
+// Otherwise, opens a SQLite database at the file path.
+func Open(dbPath string) (*Store, error) {
+	if isPostgresURL(dbPath) {
+		return openPostgres(dbPath)
+	}
+	return openSQLite(dbPath)
+}
+
+// openSQLite opens a SQLite database at the given file path.
+func openSQLite(dbPath string) (*Store, error) {
 	// Ensure directory exists (skip for in-memory databases)
 	if dbPath != ":memory:" && !strings.Contains(dbPath, ":memory:") {
 		dir := filepath.Dir(dbPath)
@@ -77,7 +86,6 @@ func Open(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
 
-	// Test connection
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping database: %w", err)
@@ -107,11 +115,44 @@ func Open(dbPath string) (*Store, error) {
 	}, nil
 }
 
+// openPostgres opens a PostgreSQL database using the given connection URL.
+func openPostgres(dbURL string) (*Store, error) {
+	db, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		return nil, fmt.Errorf("open PostgreSQL: %w", err)
+	}
+
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("ping PostgreSQL: %w", err)
+	}
+
+	// PostgreSQL supports full concurrency — use a larger pool than SQLite.
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+
+	dialect := &PostgreSQLDialect{}
+	if err := dialect.InitConn(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("init PostgreSQL connection: %w", err)
+	}
+
+	return &Store{
+		db:      db,
+		dbPath:  dbURL,
+		dialect: dialect,
+	}, nil
+}
+
 // OpenReadOnly opens an existing database in read-only mode. Suitable for
 // query-only workloads (MCP server) where multiple processes access the
 // same database concurrently. Does not create the database, run migrations,
 // or checkpoint WAL on close.
 func OpenReadOnly(dbPath string) (*Store, error) {
+	if isPostgresURL(dbPath) {
+		return openPostgresReadOnly(dbPath)
+	}
+
 	if _, err := os.Stat(dbPath); err != nil {
 		return nil, fmt.Errorf(
 			"database not found: %s "+
@@ -150,6 +191,45 @@ func OpenReadOnly(dbPath string) (*Store, error) {
 	}
 
 	s.fts5Available = dialect.FTSAvailable(db)
+
+	return s, nil
+}
+
+// openPostgresReadOnly opens a PostgreSQL database in read-only mode.
+func openPostgresReadOnly(dbURL string) (*Store, error) {
+	db, err := sql.Open("pgx", dbURL)
+	if err != nil {
+		return nil, fmt.Errorf("open PostgreSQL (read-only): %w", err)
+	}
+
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("ping PostgreSQL: %w", err)
+	}
+
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+
+	// Set transaction to read-only for safety
+	dialect := &PostgreSQLDialect{}
+	if err := dialect.InitConn(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("init PostgreSQL connection: %w", err)
+	}
+	if _, err := db.Exec("SET default_transaction_read_only = ON"); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("set read-only mode: %w", err)
+	}
+
+	s := &Store{
+		db:       db,
+		dbPath:   dbURL,
+		dialect:  dialect,
+		readOnly: true,
+	}
+
+	ftsAvailable, _ := dialect.FTSAvailable(db)
+	s.fts5Available = ftsAvailable
 
 	return s, nil
 }

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	_ "github.com/jackc/pgx/v5/stdlib" // Register pgx driver for database/sql
 )
 
 // PostgreSQLDialect implements Dialect for PostgreSQL.
