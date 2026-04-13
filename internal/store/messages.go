@@ -454,6 +454,7 @@ func replaceMessageRecipientsTx(tx *sql.Tx, messageID int64, recipientType strin
 
 	return insertInChunks(tx, len(participantIDs), 4,
 		"INSERT INTO message_recipients (message_id, participant_id, recipient_type, display_name) VALUES ",
+		"",
 		func(start, end int) ([]string, []interface{}) {
 			values := make([]string, end-start)
 			args := make([]interface{}, 0, (end-start)*4)
@@ -701,6 +702,7 @@ func replaceMessageLabelsTx(tx *sql.Tx, messageID int64, labelIDs []int64) error
 
 	return insertInChunks(tx, len(labelIDs), 2,
 		"INSERT INTO message_labels (message_id, label_id) VALUES ",
+		"",
 		func(start, end int) ([]string, []interface{}) {
 			values := make([]string, end-start)
 			args := make([]interface{}, 0, (end-start)*2)
@@ -718,10 +720,10 @@ func (s *Store) AddMessageLabels(messageID int64, labelIDs []int64) error {
 	if len(labelIDs) == 0 {
 		return nil
 	}
-	prefix := s.dialect.InsertOrIgnore("INSERT OR IGNORE INTO message_labels (message_id, label_id) VALUES ")
 	return s.withTx(func(tx *sql.Tx) error {
 		return insertInChunks(tx, len(labelIDs), 2,
-			prefix,
+			s.dialect.InsertOrIgnore("INSERT OR IGNORE INTO message_labels (message_id, label_id) VALUES "),
+			s.dialect.InsertOrIgnoreSuffix(),
 			func(start, end int) ([]string, []interface{}) {
 				values := make([]string, end-start)
 				args := make([]interface{}, 0, (end-start)*2)

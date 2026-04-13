@@ -31,6 +31,10 @@ const defaultSQLiteParams = "?_journal_mode=WAL&_busy_timeout=30000&_synchronous
 // This is more robust than strings.Contains on err.Error() because it first
 // type-asserts to the specific driver error type using errors.As.
 // Handles both value (sqlite3.Error) and pointer (*sqlite3.Error) forms.
+//
+// NOTE: This duplicates isSQLiteErrorMatch in dialect_sqlite.go. It is retained
+// here because subset.go (intentionally not migrated to Dialect) still calls it.
+// Remove this when subset.go is migrated.
 func isSQLiteError(err error, substr string) bool {
 	var sqliteErr sqlite3.Error
 	if errors.As(err, &sqliteErr) {
@@ -82,10 +86,16 @@ func Open(dbPath string) (*Store, error) {
 		db.SetMaxOpenConns(4)
 	}
 
+	dialect := &SQLiteDialect{}
+	if err := dialect.InitConn(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("init connection: %w", err)
+	}
+
 	return &Store{
 		db:      db,
 		dbPath:  dbPath,
-		dialect: &SQLiteDialect{},
+		dialect: dialect,
 	}, nil
 }
 
@@ -157,11 +167,6 @@ func (s *Store) DB() *sql.DB {
 	return s.db
 }
 
-// StoreDialect returns the active Dialect for this Store.
-func (s *Store) StoreDialect() Dialect {
-	return s.dialect
-}
-
 // withTx executes fn within a database transaction. If fn returns an error,
 // the transaction is rolled back; otherwise it is committed.
 func (s *Store) withTx(fn func(tx *sql.Tx) error) error {
@@ -221,7 +226,7 @@ func queryInChunks[T any](db *sql.DB, ids []T, prefixArgs []interface{}, queryTe
 // parameter limit (999). The valuesPerRow specifies how many parameters are in
 // each VALUES tuple (e.g., 4 for "(?, ?, ?, ?)"). The valueBuilder function
 // generates the VALUES placeholders and args for each chunk of indices.
-func insertInChunks(tx *sql.Tx, totalRows int, valuesPerRow int, queryPrefix string, valueBuilder func(start, end int) ([]string, []interface{})) error {
+func insertInChunks(tx *sql.Tx, totalRows int, valuesPerRow int, queryPrefix string, querySuffix string, valueBuilder func(start, end int) ([]string, []interface{})) error {
 	// SQLite default SQLITE_MAX_VARIABLE_NUMBER is 999
 	// Leave some margin for safety
 	const maxParams = 900
@@ -237,7 +242,7 @@ func insertInChunks(tx *sql.Tx, totalRows int, valuesPerRow int, queryPrefix str
 		}
 
 		values, args := valueBuilder(i, end)
-		query := queryPrefix + strings.Join(values, ",")
+		query := queryPrefix + strings.Join(values, ",") + querySuffix
 		if _, err := tx.Exec(query, args...); err != nil {
 			return err
 		}

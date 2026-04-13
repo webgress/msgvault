@@ -16,14 +16,17 @@ type Dialect interface {
 	// SQLite: "datetime('now')"  PostgreSQL: "NOW()"
 	Now() string
 
-	// GroupConcat returns the SQL expression for concatenating values with a separator.
-	// SQLite: GROUP_CONCAT(expr, sep)  PostgreSQL: STRING_AGG(expr, sep)
-	GroupConcat(expr, sep string) string
-
-	// InsertOrIgnore rewrites an INSERT statement to silently ignore conflicts.
+	// InsertOrIgnore rewrites a complete INSERT statement to silently ignore conflicts.
 	// SQLite: INSERT OR IGNORE INTO ...  PostgreSQL: INSERT INTO ... ON CONFLICT DO NOTHING
-	// The input sql must start with "INSERT OR IGNORE INTO " (SQLite form).
+	// The input sql must be a complete statement in SQLite form
+	// (starting with "INSERT OR IGNORE INTO").
 	InsertOrIgnore(sql string) string
+
+	// InsertOrIgnoreSuffix returns a SQL suffix to append after VALUES for
+	// conflict-ignoring inserts built incrementally (e.g., by insertInChunks).
+	// SQLite: "" (OR IGNORE is in the prefix)
+	// PostgreSQL: " ON CONFLICT DO NOTHING"
+	InsertOrIgnoreSuffix() string
 
 	// UpdateOrIgnore rewrites an UPDATE statement to silently ignore constraint violations.
 	// SQLite: UPDATE OR IGNORE ...  PostgreSQL: requires a different approach.
@@ -43,7 +46,8 @@ type Dialect interface {
 	// For PostgreSQL: uses tsvector column with @@/ts_rank (no extra join needed).
 	FTSSearchClause(paramIndex int) (join, where, orderBy string)
 
-	// FTSDeleteSQL returns the SQL to remove a message from the search index.
+	// FTSDeleteSQL returns the SQL to remove FTS entries for messages belonging to
+	// a given source. Takes one parameter: source_id.
 	FTSDeleteSQL() string
 
 	// FTSBackfillBatchSQL returns the SQL to populate the search index for a range of message IDs.
@@ -59,16 +63,16 @@ type Dialect interface {
 	// FTSClearSQL returns the SQL to clear all FTS data before a full backfill.
 	FTSClearSQL() string
 
-	// SchemaFTS returns the DDL for creating the FTS schema.
-	// For SQLite this is the FTS5 virtual table; for PostgreSQL this is a no-op
-	// (the tsvector column + GIN index are in schema_pg.sql).
+	// SchemaFTS returns the embedded filename containing FTS DDL to execute during
+	// schema initialization. Returns "" if no separate FTS schema file is needed
+	// (e.g., PostgreSQL includes tsvector in its main schema).
 	SchemaFTS() string
 
 	// Connection lifecycle
 
 	// InitConn performs driver-specific connection initialization.
-	// For SQLite: no-op (PRAGMAs are set via DSN parameters).
-	// For PostgreSQL: SET search_path, statement_timeout, etc.
+	// Called after opening a connection. For SQLite: no-op (PRAGMAs are set via
+	// DSN parameters). For PostgreSQL: SET search_path, statement_timeout, etc.
 	InitConn(db *sql.DB) error
 
 	// SchemaFiles returns the filenames of embedded schema files to execute during InitSchema.
