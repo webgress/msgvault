@@ -100,12 +100,7 @@ func (s *Store) GetSourcesByDisplayName(displayName string) ([]*Source, error) {
 func (s *Store) RemoveSource(sourceID int64) error {
 	return s.withTx(func(tx *sql.Tx) error {
 		if s.fts5Available {
-			_, err := tx.Exec(`
-				DELETE FROM messages_fts
-				WHERE message_id IN (
-					SELECT id FROM messages WHERE source_id = ?
-				)
-			`, sourceID)
+			_, err := tx.Exec(s.dialect.FTSDeleteSQL(), sourceID)
 			if err != nil {
 				return fmt.Errorf("delete FTS rows: %w", err)
 			}
