@@ -20,6 +20,7 @@ var schemaFS embed.FS
 type Store struct {
 	db            *sql.DB
 	dbPath        string
+	dialect       Dialect
 	readOnly      bool // Opened via OpenReadOnly; skips WAL checkpoint on close
 	fts5Available bool // Whether FTS5 is available for full-text search
 }
@@ -82,8 +83,9 @@ func Open(dbPath string) (*Store, error) {
 	}
 
 	return &Store{
-		db:     db,
-		dbPath: dbPath,
+		db:      db,
+		dbPath:  dbPath,
+		dialect: &SQLiteDialect{},
 	}, nil
 }
 
@@ -116,21 +118,17 @@ func OpenReadOnly(dbPath string) (*Store, error) {
 
 	db.SetMaxOpenConns(4)
 
+	dialect := &SQLiteDialect{}
 	s := &Store{
 		db:       db,
 		dbPath:   dbPath,
+		dialect:  dialect,
 		readOnly: true,
 	}
 
-	// Probe actual FTS5 capability by querying the virtual table.
-	// Checking sqlite_master alone is insufficient: a binary built
-	// without FTS5 support will fail with "no such module: fts5"
-	// even if the table exists from a prior FTS5-enabled build.
-	var ftsProbe int
-	err = db.QueryRow("SELECT 1 FROM messages_fts LIMIT 1").Scan(&ftsProbe)
-	if err == nil || err == sql.ErrNoRows {
-		s.fts5Available = true
-	}
+	// Probe actual FTS5 capability via the dialect.
+	ftsAvailable, _ := dialect.FTSAvailable(db)
+	s.fts5Available = ftsAvailable
 
 	return s, nil
 }
@@ -149,26 +147,19 @@ func (s *Store) Close() error {
 // CheckpointWAL forces a WAL checkpoint, folding the WAL back into the main
 // database file. Uses TRUNCATE mode which also resets the WAL file to zero
 // bytes. Returns nil on success; callers may log but should not fail on error.
+// No-op for non-SQLite backends.
 func (s *Store) CheckpointWAL() error {
-	var busy, log, checkpointed int
-	err := s.db.QueryRow(
-		"PRAGMA wal_checkpoint(TRUNCATE)",
-	).Scan(&busy, &log, &checkpointed)
-	if err != nil {
-		return err
-	}
-	if busy != 0 {
-		return fmt.Errorf(
-			"WAL checkpoint incomplete: database busy "+
-				"(log=%d, checkpointed=%d)", log, checkpointed,
-		)
-	}
-	return nil
+	return s.dialect.CheckpointWAL(s.db)
 }
 
 // DB returns the underlying database connection for advanced queries.
 func (s *Store) DB() *sql.DB {
 	return s.db
+}
+
+// StoreDialect returns the active Dialect for this Store.
+func (s *Store) StoreDialect() Dialect {
+	return s.dialect
 }
 
 // withTx executes fn within a database transaction. If fn returns an error,
@@ -284,12 +275,10 @@ func execInChunks[T any](db *sql.DB, ids []T, prefixArgs []interface{}, queryTem
 }
 
 // Rebind converts a query with ? placeholders to the appropriate format
-// for the current database driver. Currently SQLite-only (no conversion needed).
-// When PostgreSQL support is added, this will convert ? to $1, $2, etc.
+// for the current database driver. No-op for SQLite; converts to $1, $2, ...
+// for PostgreSQL.
 func (s *Store) Rebind(query string) string {
-	// SQLite uses ? placeholders, no conversion needed
-	// TODO: When adding PostgreSQL support, convert ? to $1, $2, etc.
-	return query
+	return s.dialect.Rebind(query)
 }
 
 // FTS5Available returns whether FTS5 full-text search is available.
@@ -299,17 +288,12 @@ func (s *Store) FTS5Available() bool {
 
 // SchemaStale checks whether the database schema is missing columns
 // added by recent migrations. Returns (stale, column, err). Only
-// reports stale when the PRAGMA succeeds and the column is absent;
+// reports stale when the query succeeds and the column is absent;
 // query errors are returned separately so callers don't misdiagnose
 // corruption or permission problems as outdated schema.
 func (s *Store) SchemaStale() (bool, string, error) {
-	// Check the most recently added migration column. If it exists,
-	// all earlier migrations have also been applied.
 	var count int
-	err := s.db.QueryRow(
-		"SELECT COUNT(*) FROM pragma_table_info('conversations') " +
-			"WHERE name = 'conversation_type'",
-	).Scan(&count)
+	err := s.db.QueryRow(s.dialect.SchemaStaleCheck()).Scan(&count)
 	if err != nil {
 		return false, "", fmt.Errorf("check schema version: %w", err)
 	}
@@ -322,19 +306,19 @@ func (s *Store) SchemaStale() (bool, string, error) {
 // InitSchema initializes the database schema.
 // This creates all tables if they don't exist.
 func (s *Store) InitSchema() error {
-	// Load and execute main schema
-	schema, err := schemaFS.ReadFile("schema.sql")
-	if err != nil {
-		return fmt.Errorf("read schema.sql: %w", err)
-	}
-
-	if _, err := s.db.Exec(string(schema)); err != nil {
-		return fmt.Errorf("execute schema.sql: %w", err)
+	// Load and execute schema files provided by the dialect.
+	for _, filename := range s.dialect.SchemaFiles() {
+		schema, err := schemaFS.ReadFile(filename)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", filename, err)
+		}
+		if _, err := s.db.Exec(string(schema)); err != nil {
+			return fmt.Errorf("execute %s: %w", filename, err)
+		}
 	}
 
 	// Migrations: add columns for databases created before these features.
-	// SQLite returns "duplicate column name" if the column already exists,
-	// which we treat as success.
+	// The dialect determines whether a "duplicate column" error is benign.
 	for _, m := range []struct {
 		sql  string
 		desc string
@@ -353,51 +337,41 @@ func (s *Store) InitSchema() error {
 		{`ALTER TABLE conversations ADD COLUMN conversation_type TEXT NOT NULL DEFAULT 'email_thread'`, "conversation_type"},
 	} {
 		if _, err := s.db.Exec(m.sql); err != nil {
-			if !isSQLiteError(err, "duplicate column name") {
+			if !s.dialect.IsDuplicateColumnError(err) {
 				return fmt.Errorf("migrate schema (%s): %w", m.desc, err)
 			}
 		}
 	}
 
-	// Try to load and execute SQLite-specific schema (FTS5)
-	// This is optional - FTS5 may not be available in all builds
-	sqliteSchema, err := schemaFS.ReadFile("schema_sqlite.sql")
-	if err != nil {
-		return fmt.Errorf("read schema_sqlite.sql: %w", err)
-	}
-
-	if _, err := s.db.Exec(string(sqliteSchema)); err != nil {
-		if isSQLiteError(err, "no such module: fts5") {
-			s.fts5Available = false
-		} else {
-			return fmt.Errorf("init fts5 schema: %w", err)
+	// Try to load and execute FTS schema (optional — may not be available).
+	ftsFile := s.dialect.SchemaFTS()
+	if ftsFile != "" {
+		ftsSchema, err := schemaFS.ReadFile(ftsFile)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", ftsFile, err)
 		}
-	} else {
-		s.fts5Available = true
+
+		if _, err := s.db.Exec(string(ftsSchema)); err != nil {
+			if s.dialect.IsNoSuchModuleError(err) {
+				s.fts5Available = false
+			} else {
+				return fmt.Errorf("init FTS schema: %w", err)
+			}
+		} else {
+			s.fts5Available = true
+		}
 	}
 
 	return nil
 }
 
-// NeedsFTSBackfill reports whether the FTS table needs to be populated.
-// Uses MAX(id) comparisons (instant B-tree lookups) instead of COUNT(*)
-// to avoid full table scans on large databases.
+// NeedsFTSBackfill reports whether the FTS index needs to be populated.
 func (s *Store) NeedsFTSBackfill() bool {
 	if !s.fts5Available {
 		return false
 	}
-	var msgMax int64
-	if err := s.db.QueryRow("SELECT COALESCE(MAX(id), 0) FROM messages").Scan(&msgMax); err != nil || msgMax == 0 {
-		return false
-	}
-	var ftsMax int64
-	if err := s.db.QueryRow("SELECT COALESCE(MAX(rowid), 0) FROM messages_fts").Scan(&ftsMax); err != nil {
-		return false
-	}
-	// Backfill needed if FTS hasn't reached near the end of the messages table.
-	// Using subtraction (msgMax - msgMax/10) instead of multiplication (msgMax*9/10)
-	// ensures the threshold is at least msgMax for small values (e.g., msgMax=1).
-	return ftsMax < msgMax-msgMax/10
+	needs, _ := s.dialect.FTSNeedsBackfill(s.db)
+	return needs
 }
 
 // Stats holds database statistics.
@@ -427,7 +401,7 @@ func (s *Store) GetStats() (*Stats, error) {
 
 	for _, q := range queries {
 		if err := s.db.QueryRow(q.query).Scan(q.dest); err != nil {
-			if isSQLiteError(err, "no such table") {
+			if s.dialect.IsNoSuchTableError(err) {
 				continue
 			}
 			return nil, fmt.Errorf("get stats %q: %w", q.query, err)
