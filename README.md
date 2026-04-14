@@ -154,6 +154,23 @@ To switch an existing account to a different OAuth app:
 msgvault add-account you@acme.com --oauth-app acme   # re-authorizes
 ```
 
+### Database Backend
+
+msgvault stores messages in SQLite by default — one file, no daemon, and
+plenty fast for a personal archive. PostgreSQL is also supported as an
+opt-in backend for multi-client deployments, server-mode hosting, or
+co-locating with downstream analytics (pgvector, BI tools):
+
+```toml
+[data]
+database_url = "postgres://user:pass@localhost:5432/msgvault?sslmode=disable"
+```
+
+When `database_url` is set, all CLI commands transparently use PostgreSQL
+— `init-db`, `sync-full`, `tui`, `mcp`, `serve`, etc. all work the same
+way. See [pg_refactor_docs/PG_SETUP.md](pg_refactor_docs/PG_SETUP.md) for
+role creation, connection URL options, and deployment notes.
+
 ## MCP Server
 
 msgvault includes an MCP server that lets AI assistants search, analyze, and read your archived messages. Connect it to Claude Desktop or any MCP-capable agent and query your full message history conversationally. See the [MCP documentation](https://msgvault.io/usage/chat/) for setup instructions.
