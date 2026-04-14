@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/mattn/go-sqlite3"
@@ -136,6 +137,16 @@ func (d *SQLiteDialect) LegacyColumnMigrations() []ColumnMigration {
 		{`ALTER TABLE conversations ADD COLUMN title TEXT`, "title"},
 		{`ALTER TABLE conversations ADD COLUMN conversation_type TEXT NOT NULL DEFAULT 'email_thread'`, "conversation_type"},
 	}
+}
+
+// DatabaseSize returns the on-disk size of the SQLite database file.
+func (d *SQLiteDialect) DatabaseSize(db *sql.DB, dbPath string) (int64, error) {
+	info, err := os.Stat(dbPath)
+	if err != nil {
+		// For in-memory or missing databases, return 0 silently.
+		return 0, nil
+	}
+	return info.Size(), nil
 }
 
 // CheckpointWAL forces a WAL checkpoint using TRUNCATE mode.
