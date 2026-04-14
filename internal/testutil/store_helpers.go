@@ -14,6 +14,24 @@ import (
 	"github.com/wesm/msgvault/internal/store"
 )
 
+// IsPostgresTest reports whether MSGVAULT_TEST_DB selects a PostgreSQL backend.
+// Useful for skipping tests that exercise SQLite-specific driver quirks
+// (e.g., go-sqlite3 coercing invalid timestamps to zero time).
+func IsPostgresTest() bool {
+	testDB := os.Getenv("MSGVAULT_TEST_DB")
+	return strings.HasPrefix(testDB, "postgres://") || strings.HasPrefix(testDB, "postgresql://")
+}
+
+// SkipIfPostgres marks the test as skipped when running against PostgreSQL.
+// Use only for tests that depend on SQLite-specific driver behavior which
+// PostgreSQL deliberately rejects (e.g., lenient timestamp coercion).
+func SkipIfPostgres(t *testing.T, reason string) {
+	t.Helper()
+	if IsPostgresTest() {
+		t.Skipf("skipping on PostgreSQL: %s", reason)
+	}
+}
+
 // NewTestStore creates a temporary database for testing.
 // The database is automatically cleaned up when the test completes.
 //

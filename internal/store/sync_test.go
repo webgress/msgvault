@@ -38,13 +38,14 @@ func TestScanSource_NullLastSyncAt_Valid(t *testing.T) {
 // the go-sqlite3 driver normalizes to zero time (from invalid input).
 // The driver converts unparseable DATETIME values to "0001-01-01T00:00:00Z".
 func TestScanSyncRun_ZeroTime(t *testing.T) {
+	testutil.SkipIfPostgres(t, "test inserts an invalid timestamp string, which PostgreSQL rejects (SQLite coerces to zero time)")
 	f := storetest.New(t)
 
 	syncID := f.StartSync()
 
 	// Corrupt the started_at with an invalid value.
 	// go-sqlite3 normalizes this to "0001-01-01T00:00:00Z" for DATETIME columns.
-	_, err := f.Store.DB().Exec(`
+	_, err := f.Store.Exec(`
 		UPDATE sync_runs SET started_at = 'invalid-timestamp' WHERE id = ?
 	`, syncID)
 	testutil.MustNoErr(t, err, "corrupt started_at")
@@ -66,6 +67,7 @@ func TestScanSyncRun_ZeroTime(t *testing.T) {
 // TestScanSource_ZeroTime verifies that sources with timestamps that the driver
 // normalizes to zero time are handled correctly.
 func TestScanSource_ZeroTime(t *testing.T) {
+	testutil.SkipIfPostgres(t, "test inserts an invalid timestamp string, which PostgreSQL rejects (SQLite coerces to zero time)")
 	st := testutil.NewTestStore(t)
 
 	// Create a source
@@ -74,7 +76,7 @@ func TestScanSource_ZeroTime(t *testing.T) {
 
 	// Corrupt the created_at with an invalid value.
 	// go-sqlite3 normalizes this to "0001-01-01T00:00:00Z" for DATETIME columns.
-	_, err = st.DB().Exec(`
+	_, err = st.Exec(`
 		UPDATE sources SET created_at = 'garbage' WHERE id = ?
 	`, source.ID)
 	testutil.MustNoErr(t, err, "corrupt created_at")
@@ -176,7 +178,7 @@ func TestScanSource_NullRequiredTimestamp(t *testing.T) {
 	testutil.MustNoErr(t, err, "GetOrCreateSource")
 
 	// Corrupt created_at to NULL (violates expected schema invariant)
-	_, err = st.DB().Exec(`UPDATE sources SET created_at = NULL WHERE id = ?`, source.ID)
+	_, err = st.Exec(`UPDATE sources SET created_at = NULL WHERE id = ?`, source.ID)
 	testutil.MustNoErr(t, err, "set created_at to NULL")
 
 	// Attempting to retrieve should fail with a clear error

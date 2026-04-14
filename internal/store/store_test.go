@@ -637,7 +637,7 @@ func TestStore_GetMessage_DeletedMessageVisibleByID(t *testing.T) {
 	f := storetest.New(t)
 
 	msgID := f.CreateMessage("deleted-msg-1")
-	_, err := f.Store.DB().Exec(
+	_, err := f.Store.Exec(
 		f.Store.Rebind("UPDATE messages SET deleted_from_source_at = ? WHERE id = ?"),
 		time.Date(2026, 3, 18, 14, 30, 0, 0, time.UTC),
 		msgID,
@@ -686,7 +686,7 @@ func TestStore_MarkMessagesDeletedByGmailIDBatch(t *testing.T) {
 
 	// Verify all are marked deleted
 	var deletedCount int
-	err = f.Store.DB().QueryRow(
+	err = f.Store.QueryRow(
 		`SELECT COUNT(*) FROM messages WHERE deleted_from_source_at IS NOT NULL`,
 	).Scan(&deletedCount)
 	testutil.MustNoErr(t, err, "count deleted")
@@ -884,7 +884,7 @@ func TestStore_GetStats_MissingTable(t *testing.T) {
 	st := testutil.NewTestStore(t)
 
 	// Drop a table to simulate missing table scenario
-	_, err := st.DB().Exec("DROP TABLE IF EXISTS attachments")
+	_, err := st.Exec("DROP TABLE IF EXISTS attachments")
 	testutil.MustNoErr(t, err, "DROP TABLE attachments")
 
 	// GetStats should ignore missing tables and return partial stats
@@ -1074,21 +1074,21 @@ func TestStore_UpsertFTS(t *testing.T) {
 
 	// Verify FTS row exists and is searchable
 	var count int
-	err = f.Store.DB().QueryRow("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'hello'").Scan(&count)
+	err = f.Store.QueryRow("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'hello'").Scan(&count)
 	testutil.MustNoErr(t, err, "FTS MATCH query")
 	if count != 1 {
 		t.Errorf("FTS match count = %d, want 1", count)
 	}
 
 	// Search by subject
-	err = f.Store.DB().QueryRow("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'subject'").Scan(&count)
+	err = f.Store.QueryRow("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'subject'").Scan(&count)
 	testutil.MustNoErr(t, err, "FTS MATCH subject")
 	if count != 1 {
 		t.Errorf("FTS match subject count = %d, want 1", count)
 	}
 
 	// Search by from address
-	err = f.Store.DB().QueryRow("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'alice'").Scan(&count)
+	err = f.Store.QueryRow("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'alice'").Scan(&count)
 	testutil.MustNoErr(t, err, "FTS MATCH from_addr")
 	if count != 1 {
 		t.Errorf("FTS match from_addr count = %d, want 1", count)
@@ -1099,14 +1099,14 @@ func TestStore_UpsertFTS(t *testing.T) {
 	testutil.MustNoErr(t, err, "UpsertFTS update")
 
 	// Old content should no longer match
-	err = f.Store.DB().QueryRow("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'hello'").Scan(&count)
+	err = f.Store.QueryRow("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'hello'").Scan(&count)
 	testutil.MustNoErr(t, err, "FTS MATCH after update")
 	if count != 0 {
 		t.Errorf("FTS match 'hello' after update = %d, want 0", count)
 	}
 
 	// New content should match
-	err = f.Store.DB().QueryRow("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'updated'").Scan(&count)
+	err = f.Store.QueryRow("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'updated'").Scan(&count)
 	testutil.MustNoErr(t, err, "FTS MATCH 'updated'")
 	if count != 1 {
 		t.Errorf("FTS match 'updated' = %d, want 1", count)
@@ -1144,12 +1144,12 @@ func TestStore_BackfillFTS(t *testing.T) {
 	testutil.MustNoErr(t, err, "UpsertMessageBody 2")
 
 	// FTS should already have been auto-populated by InitSchema, so clear it first
-	_, err = f.Store.DB().Exec("DELETE FROM messages_fts")
+	_, err = f.Store.Exec("DELETE FROM messages_fts")
 	testutil.MustNoErr(t, err, "clear FTS")
 
 	// Verify FTS is empty
 	var count int
-	err = f.Store.DB().QueryRow("SELECT COUNT(*) FROM messages_fts").Scan(&count)
+	err = f.Store.QueryRow("SELECT COUNT(*) FROM messages_fts").Scan(&count)
 	testutil.MustNoErr(t, err, "count FTS")
 	if count != 0 {
 		t.Fatalf("FTS count = %d, want 0 after clear", count)
@@ -1163,28 +1163,28 @@ func TestStore_BackfillFTS(t *testing.T) {
 	}
 
 	// Verify FTS is populated
-	err = f.Store.DB().QueryRow("SELECT COUNT(*) FROM messages_fts").Scan(&count)
+	err = f.Store.QueryRow("SELECT COUNT(*) FROM messages_fts").Scan(&count)
 	testutil.MustNoErr(t, err, "count FTS after backfill")
 	if count != 2 {
 		t.Errorf("FTS count after backfill = %d, want 2", count)
 	}
 
 	// Search for first message body
-	err = f.Store.DB().QueryRow("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'first'").Scan(&count)
+	err = f.Store.QueryRow("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'first'").Scan(&count)
 	testutil.MustNoErr(t, err, "FTS MATCH first")
 	if count != 1 {
 		t.Errorf("FTS match 'first' = %d, want 1", count)
 	}
 
 	// Search for sender email (populated via backfill from participants)
-	err = f.Store.DB().QueryRow("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'sender'").Scan(&count)
+	err = f.Store.QueryRow("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'sender'").Scan(&count)
 	testutil.MustNoErr(t, err, "FTS MATCH sender")
 	if count != 1 {
 		t.Errorf("FTS match 'sender' = %d, want 1", count)
 	}
 
 	// Search for second message unique content
-	err = f.Store.DB().QueryRow("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'unique'").Scan(&count)
+	err = f.Store.QueryRow("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'unique'").Scan(&count)
 	testutil.MustNoErr(t, err, "FTS MATCH unique")
 	if count != 1 {
 		t.Errorf("FTS match 'unique' = %d, want 1", count)
@@ -1219,7 +1219,7 @@ func TestStore_NeedsFTSBackfill(t *testing.T) {
 	testutil.MustNoErr(t, err, "ReplaceMessageRecipients")
 
 	// Clear FTS to simulate a pre-existing DB without FTS population
-	_, err = f.Store.DB().Exec("DELETE FROM messages_fts")
+	_, err = f.Store.Exec("DELETE FROM messages_fts")
 	testutil.MustNoErr(t, err, "clear FTS")
 
 	// NeedsFTSBackfill should return true (empty FTS + existing messages)
@@ -1241,7 +1241,7 @@ func TestStore_NeedsFTSBackfill(t *testing.T) {
 
 	// Verify the backfilled data is searchable
 	var count int
-	err = f.Store.DB().QueryRow("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'backfill'").Scan(&count)
+	err = f.Store.QueryRow("SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'backfill'").Scan(&count)
 	testutil.MustNoErr(t, err, "FTS MATCH backfill")
 	if count != 1 {
 		t.Errorf("FTS match 'backfill' = %d, want 1", count)

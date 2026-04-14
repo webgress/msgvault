@@ -110,7 +110,7 @@ type MessageFields struct {
 func (f *Fixture) GetMessageFields(msgID int64) MessageFields {
 	f.T.Helper()
 	var mf MessageFields
-	err := f.Store.DB().QueryRow(
+	err := f.Store.QueryRow(
 		f.Store.Rebind("SELECT subject, snippet, has_attachments FROM messages WHERE id = ?"), msgID,
 	).Scan(&mf.Subject, &mf.Snippet, &mf.HasAttachments)
 	testutil.MustNoErr(f.T, err, "GetMessageFields")
@@ -121,7 +121,7 @@ func (f *Fixture) GetMessageFields(msgID int64) MessageFields {
 func (f *Fixture) GetMessageBody(msgID int64) (sql.NullString, sql.NullString) {
 	f.T.Helper()
 	var bodyText, bodyHTML sql.NullString
-	err := f.Store.DB().QueryRow(
+	err := f.Store.QueryRow(
 		"SELECT body_text, body_html FROM message_bodies WHERE message_id = ?", msgID,
 	).Scan(&bodyText, &bodyHTML)
 	testutil.MustNoErr(f.T, err, "GetMessageBody")
@@ -131,7 +131,7 @@ func (f *Fixture) GetMessageBody(msgID int64) (sql.NullString, sql.NullString) {
 // GetSyncRun returns the status and error_message for a sync run by ID.
 func (f *Fixture) GetSyncRun(syncID int64) (status, errorMsg string) {
 	f.T.Helper()
-	err := f.Store.DB().QueryRow(
+	err := f.Store.QueryRow(
 		f.Store.Rebind("SELECT status, error_message FROM sync_runs WHERE id = ?"), syncID,
 	).Scan(&status, &errorMsg)
 	testutil.MustNoErr(f.T, err, "GetSyncRun")
@@ -142,7 +142,7 @@ func (f *Fixture) GetSyncRun(syncID int64) (status, errorMsg string) {
 func (f *Fixture) GetSingleLabelID(msgID int64) int64 {
 	f.T.Helper()
 	var labelID int64
-	err := f.Store.DB().QueryRow(
+	err := f.Store.QueryRow(
 		f.Store.Rebind("SELECT label_id FROM message_labels WHERE message_id = ?"), msgID,
 	).Scan(&labelID)
 	testutil.MustNoErr(f.T, err, "GetSingleLabelID")
@@ -153,7 +153,7 @@ func (f *Fixture) GetSingleLabelID(msgID int64) int64 {
 func (f *Fixture) GetSingleRecipientID(msgID int64, typ string) int64 {
 	f.T.Helper()
 	var pid int64
-	err := f.Store.DB().QueryRow(
+	err := f.Store.QueryRow(
 		f.Store.Rebind("SELECT participant_id FROM message_recipients WHERE message_id = ? AND recipient_type = ?"), msgID, typ,
 	).Scan(&pid)
 	testutil.MustNoErr(f.T, err, "GetSingleRecipientID")
@@ -166,7 +166,7 @@ func (f *Fixture) GetSingleRecipientID(msgID int64, typ string) int64 {
 func (f *Fixture) AssertLabelCount(msgID int64, want int) {
 	f.T.Helper()
 	var count int
-	err := f.Store.DB().QueryRow(f.Store.Rebind("SELECT COUNT(*) FROM message_labels WHERE message_id = ?"), msgID).Scan(&count)
+	err := f.Store.QueryRow(f.Store.Rebind("SELECT COUNT(*) FROM message_labels WHERE message_id = ?"), msgID).Scan(&count)
 	testutil.MustNoErr(f.T, err, "count message_labels")
 	if count != want {
 		f.T.Errorf("message_labels count = %d, want %d", count, want)
@@ -177,7 +177,7 @@ func (f *Fixture) AssertLabelCount(msgID int64, want int) {
 func (f *Fixture) AssertMessageHasLabel(msgID, labelID int64) {
 	f.T.Helper()
 	var count int
-	err := f.Store.DB().QueryRow(
+	err := f.Store.QueryRow(
 		f.Store.Rebind("SELECT COUNT(*) FROM message_labels WHERE message_id = ? AND label_id = ?"),
 		msgID, labelID,
 	).Scan(&count)
@@ -191,7 +191,7 @@ func (f *Fixture) AssertMessageHasLabel(msgID, labelID int64) {
 func (f *Fixture) AssertRecipientCount(msgID int64, typ string, want int) {
 	f.T.Helper()
 	var count int
-	err := f.Store.DB().QueryRow(f.Store.Rebind("SELECT COUNT(*) FROM message_recipients WHERE message_id = ? AND recipient_type = ?"), msgID, typ).Scan(&count)
+	err := f.Store.QueryRow(f.Store.Rebind("SELECT COUNT(*) FROM message_recipients WHERE message_id = ? AND recipient_type = ?"), msgID, typ).Scan(&count)
 	testutil.MustNoErr(f.T, err, "count message_recipients")
 	if count != want {
 		f.T.Errorf("message_recipients(%s) count = %d, want %d", typ, count, want)
@@ -202,7 +202,7 @@ func (f *Fixture) AssertRecipientCount(msgID int64, typ string, want int) {
 func (f *Fixture) AssertMessageDeleted(msgID int64) {
 	f.T.Helper()
 	var deletedAt sql.NullTime
-	err := f.Store.DB().QueryRow(f.Store.Rebind("SELECT deleted_from_source_at FROM messages WHERE id = ?"), msgID).Scan(&deletedAt)
+	err := f.Store.QueryRow(f.Store.Rebind("SELECT deleted_from_source_at FROM messages WHERE id = ?"), msgID).Scan(&deletedAt)
 	testutil.MustNoErr(f.T, err, "check deleted_from_source_at")
 	if !deletedAt.Valid {
 		f.T.Error("deleted_from_source_at should be set")
@@ -213,7 +213,7 @@ func (f *Fixture) AssertMessageDeleted(msgID int64) {
 func (f *Fixture) AssertMessageNotDeleted(msgID int64) {
 	f.T.Helper()
 	var deletedAt sql.NullTime
-	err := f.Store.DB().QueryRow(f.Store.Rebind("SELECT deleted_from_source_at FROM messages WHERE id = ?"), msgID).Scan(&deletedAt)
+	err := f.Store.QueryRow(f.Store.Rebind("SELECT deleted_from_source_at FROM messages WHERE id = ?"), msgID).Scan(&deletedAt)
 	testutil.MustNoErr(f.T, err, "check deleted_from_source_at")
 	if deletedAt.Valid {
 		f.T.Error("deleted_from_source_at should be NULL")

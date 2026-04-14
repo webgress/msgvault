@@ -409,30 +409,35 @@ func (s *Store) Rebind(query string) string {
 	return s.dialect.Rebind(query)
 }
 
-// exec is a Rebind-aware shorthand for s.db.Exec. All internal store code
-// should use this instead of s.db.Exec so PostgreSQL placeholders work.
-func (s *Store) exec(query string, args ...any) (sql.Result, error) {
+// Exec is a Rebind-aware shorthand for s.db.Exec. Portable across SQLite
+// and PostgreSQL. Prefer this over s.db.Exec whenever the query contains
+// ? placeholders.
+func (s *Store) Exec(query string, args ...any) (sql.Result, error) {
 	return s.db.Exec(s.dialect.Rebind(query), args...)
 }
 
-// queryRow is a Rebind-aware shorthand for s.db.QueryRow.
-func (s *Store) queryRow(query string, args ...any) *sql.Row {
+// QueryRow is a Rebind-aware shorthand for s.db.QueryRow.
+func (s *Store) QueryRow(query string, args ...any) *sql.Row {
 	return s.db.QueryRow(s.dialect.Rebind(query), args...)
 }
 
-// query is a Rebind-aware shorthand for s.db.Query.
-func (s *Store) query(query string, args ...any) (*sql.Rows, error) {
+// Query is a Rebind-aware shorthand for s.db.Query.
+func (s *Store) Query(query string, args ...any) (*sql.Rows, error) {
 	return s.db.Query(s.dialect.Rebind(query), args...)
 }
 
-// txExec runs tx.Exec with dialect-aware placeholder rebinding.
-func (s *Store) txExec(tx *sql.Tx, query string, args ...any) (sql.Result, error) {
-	return tx.Exec(s.dialect.Rebind(query), args...)
+// exec, queryRow, query are internal aliases for Exec/QueryRow/Query kept
+// for internal store code consistency.
+func (s *Store) exec(query string, args ...any) (sql.Result, error) {
+	return s.Exec(query, args...)
 }
 
-// txQueryRow runs tx.QueryRow with dialect-aware placeholder rebinding.
-func (s *Store) txQueryRow(tx *sql.Tx, query string, args ...any) *sql.Row {
-	return tx.QueryRow(s.dialect.Rebind(query), args...)
+func (s *Store) queryRow(query string, args ...any) *sql.Row {
+	return s.QueryRow(query, args...)
+}
+
+func (s *Store) query(query string, args ...any) (*sql.Rows, error) {
+	return s.Query(query, args...)
 }
 
 // FTS5Available returns whether FTS5 full-text search is available.

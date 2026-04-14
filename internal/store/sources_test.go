@@ -82,7 +82,7 @@ func TestStore_RemoveSource(t *testing.T) {
 
 	// Verify labels are gone
 	var labelCount int
-	err = f.Store.DB().QueryRow(
+	err = f.Store.QueryRow(
 		`SELECT COUNT(*) FROM labels WHERE source_id = ?`, f.Source.ID,
 	).Scan(&labelCount)
 	testutil.MustNoErr(t, err, "count labels")
@@ -93,7 +93,7 @@ func TestStore_RemoveSource(t *testing.T) {
 	// Verify FTS rows are gone
 	if f.Store.FTS5Available() {
 		var ftsCount int
-		err = f.Store.DB().QueryRow(
+		err = f.Store.QueryRow(
 			`SELECT COUNT(*) FROM messages_fts`,
 		).Scan(&ftsCount)
 		testutil.MustNoErr(t, err, "count FTS")
@@ -139,7 +139,7 @@ func TestStore_RemoveSource_CascadesConversations(t *testing.T) {
 
 	// Verify conversations are gone
 	var convCount int
-	err = f.Store.DB().QueryRow(
+	err = f.Store.QueryRow(
 		`SELECT COUNT(*) FROM conversations WHERE source_id = ?`,
 		f.Source.ID,
 	).Scan(&convCount)
@@ -150,7 +150,7 @@ func TestStore_RemoveSource_CascadesConversations(t *testing.T) {
 
 	// Verify message_bodies are gone (cascaded via messages)
 	var bodyCount int
-	err = f.Store.DB().QueryRow(
+	err = f.Store.QueryRow(
 		`SELECT COUNT(*) FROM message_bodies WHERE message_id = ?`, msgID,
 	).Scan(&bodyCount)
 	testutil.MustNoErr(t, err, "count message_bodies")
@@ -160,7 +160,7 @@ func TestStore_RemoveSource_CascadesConversations(t *testing.T) {
 
 	// Verify message_raw is gone (cascaded via messages)
 	var rawCount int
-	err = f.Store.DB().QueryRow(
+	err = f.Store.QueryRow(
 		`SELECT COUNT(*) FROM message_raw WHERE message_id = ?`, msgID,
 	).Scan(&rawCount)
 	testutil.MustNoErr(t, err, "count message_raw")
@@ -170,7 +170,7 @@ func TestStore_RemoveSource_CascadesConversations(t *testing.T) {
 
 	// Verify message_recipients are gone (cascaded via messages)
 	var recipCount int
-	err = f.Store.DB().QueryRow(
+	err = f.Store.QueryRow(
 		`SELECT COUNT(*) FROM message_recipients WHERE message_id = ?`, msgID,
 	).Scan(&recipCount)
 	testutil.MustNoErr(t, err, "count message_recipients")
@@ -190,7 +190,7 @@ func TestInitSchema_MigratesOAuthAppColumn(t *testing.T) {
 
 	// Create the sources table WITHOUT the oauth_app column,
 	// matching the schema as it existed before this feature.
-	_, err = st.DB().Exec(`
+	_, err = st.Exec(`
 		CREATE TABLE IF NOT EXISTS sources (
 			id INTEGER PRIMARY KEY,
 			source_type TEXT NOT NULL,
@@ -210,7 +210,7 @@ func TestInitSchema_MigratesOAuthAppColumn(t *testing.T) {
 	}
 
 	// Insert a row into the legacy table.
-	_, err = st.DB().Exec(`
+	_, err = st.Exec(`
 		INSERT INTO sources (source_type, identifier, display_name)
 		VALUES ('gmail', 'legacy@example.com', 'Legacy User')
 	`)
@@ -245,7 +245,7 @@ func TestInitSchema_MigratesOAuthAppColumn(t *testing.T) {
 	}
 
 	// Verify oauth_app can be written and read back.
-	_, err = st.DB().Exec(
+	_, err = st.Exec(
 		`UPDATE sources SET oauth_app = ? WHERE identifier = ?`,
 		"acme", "legacy@example.com",
 	)

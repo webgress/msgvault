@@ -169,16 +169,17 @@ func (s *Store) EnsureConversation(sourceID int64, sourceConversationID, title s
 		return 0, err
 	}
 
-	// Create new
-	result, err := s.exec(fmt.Sprintf(`
+	// Create new — use RETURNING for driver portability (pgx has no LastInsertId).
+	var newID int64
+	err = s.queryRow(fmt.Sprintf(`
 		INSERT INTO conversations (source_id, source_conversation_id, conversation_type, title, created_at, updated_at)
 		VALUES (?, ?, 'email_thread', ?, %s, %s)
-	`, s.dialect.Now(), s.dialect.Now()), sourceID, sourceConversationID, title)
+		RETURNING id
+	`, s.dialect.Now(), s.dialect.Now()), sourceID, sourceConversationID, title).Scan(&newID)
 	if err != nil {
 		return 0, err
 	}
-
-	return result.LastInsertId()
+	return newID, nil
 }
 
 // upsertMessageSQL returns the message upsert SQL with dialect-specific timestamp.
@@ -371,16 +372,17 @@ func (s *Store) EnsureParticipant(email, displayName, domain string) (int64, err
 		return 0, err
 	}
 
-	// Create new
-	result, err := s.exec(fmt.Sprintf(`
+	// Create new — use RETURNING for driver portability.
+	var newID int64
+	err = s.queryRow(fmt.Sprintf(`
 		INSERT INTO participants (email_address, display_name, domain, created_at, updated_at)
 		VALUES (?, ?, ?, %s, %s)
-	`, s.dialect.Now(), s.dialect.Now()), email, displayName, domain)
+		RETURNING id
+	`, s.dialect.Now(), s.dialect.Now()), email, displayName, domain).Scan(&newID)
 	if err != nil {
 		return 0, err
 	}
-
-	return result.LastInsertId()
+	return newID, nil
 }
 
 // EnsureParticipantsBatch gets or creates participants in batch.
@@ -1080,17 +1082,18 @@ func (s *Store) EnsureConversationWithType(sourceID int64, sourceConversationID,
 		return 0, err
 	}
 
-	// Create new
+	// Create new — use RETURNING for driver portability.
 	now := s.dialect.Now()
-	result, err := s.exec(fmt.Sprintf(`
+	var newID int64
+	err = s.queryRow(fmt.Sprintf(`
 		INSERT INTO conversations (source_id, source_conversation_id, conversation_type, title, created_at, updated_at)
 		VALUES (?, ?, ?, ?, %s, %s)
-	`, now, now), sourceID, sourceConversationID, conversationType, title)
+		RETURNING id
+	`, now, now), sourceID, sourceConversationID, conversationType, title).Scan(&newID)
 	if err != nil {
 		return 0, err
 	}
-
-	return result.LastInsertId()
+	return newID, nil
 }
 
 // EnsureParticipantByPhone gets or creates a participant by phone number.
@@ -1123,19 +1126,14 @@ func (s *Store) EnsureParticipantByPhone(phone, displayName, identifierType stri
 	} else if err != sql.ErrNoRows {
 		return 0, err
 	} else {
-		// Create new participant
+		// Create new participant — use RETURNING for driver portability.
 		now := s.dialect.Now()
-		result, err := s.exec(fmt.Sprintf(`
+		if err := s.queryRow(fmt.Sprintf(`
 			INSERT INTO participants (phone_number, display_name, created_at, updated_at)
 			VALUES (?, ?, %s, %s)
-		`, now, now), phone, displayName)
-		if err != nil {
+			RETURNING id
+		`, now, now), phone, displayName).Scan(&id); err != nil {
 			return 0, fmt.Errorf("insert participant: %w", err)
-		}
-
-		id, err = result.LastInsertId()
-		if err != nil {
-			return 0, err
 		}
 	}
 
