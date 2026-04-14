@@ -6,6 +6,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -107,9 +108,37 @@ func openSQLite(dbPath string) (*Store, error) {
 	}, nil
 }
 
+// pgOptionsParam builds a libpq "options" parameter value from -c settings.
+// These apply to every connection the pool opens (unlike SET, which only
+// affects the one connection that runs it).
+func pgOptionsParam(settings map[string]string) string {
+	parts := make([]string, 0, len(settings))
+	for k, v := range settings {
+		parts = append(parts, "-c "+k+"="+v)
+	}
+	return strings.Join(parts, " ")
+}
+
+// applyPgDefaults augments a postgres:// URL with per-connection defaults
+// (statement_timeout, optional read-only mode). Returns the modified URL.
+func applyPgDefaults(dbURL string, extras map[string]string) string {
+	settings := map[string]string{
+		"statement_timeout": "30000", // milliseconds
+	}
+	for k, v := range extras {
+		settings[k] = v
+	}
+	sep := "?"
+	if strings.Contains(dbURL, "?") {
+		sep = "&"
+	}
+	// Preserve existing query-string params by appending.
+	return dbURL + sep + "options=" + url.QueryEscape(pgOptionsParam(settings))
+}
+
 // openPostgres opens a PostgreSQL database using the given connection URL.
 func openPostgres(dbURL string) (*Store, error) {
-	db, err := sql.Open("pgx", dbURL)
+	db, err := sql.Open("pgx", applyPgDefaults(dbURL, nil))
 	if err != nil {
 		return nil, fmt.Errorf("open PostgreSQL: %w", err)
 	}
@@ -124,10 +153,6 @@ func openPostgres(dbURL string) (*Store, error) {
 	db.SetMaxIdleConns(5)
 
 	dialect := &PostgreSQLDialect{}
-	if err := dialect.InitConn(db); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("init PostgreSQL connection: %w", err)
-	}
 
 	return &Store{
 		db:      db,
@@ -186,7 +211,12 @@ func OpenReadOnly(dbPath string) (*Store, error) {
 
 // openPostgresReadOnly opens a PostgreSQL database in read-only mode.
 func openPostgresReadOnly(dbURL string) (*Store, error) {
-	db, err := sql.Open("pgx", dbURL)
+	// Apply read-only mode via libpq options so every pool connection
+	// inherits it (SET on one connection doesn't propagate).
+	readOnlyURL := applyPgDefaults(dbURL, map[string]string{
+		"default_transaction_read_only": "on",
+	})
+	db, err := sql.Open("pgx", readOnlyURL)
 	if err != nil {
 		return nil, fmt.Errorf("open PostgreSQL (read-only): %w", err)
 	}
@@ -199,16 +229,7 @@ func openPostgresReadOnly(dbURL string) (*Store, error) {
 	db.SetMaxOpenConns(25)
 	db.SetMaxIdleConns(5)
 
-	// Set transaction to read-only for safety
 	dialect := &PostgreSQLDialect{}
-	if err := dialect.InitConn(db); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("init PostgreSQL connection: %w", err)
-	}
-	if _, err := db.Exec("SET default_transaction_read_only = ON"); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("set read-only mode: %w", err)
-	}
 
 	s := &Store{
 		db:       db,
