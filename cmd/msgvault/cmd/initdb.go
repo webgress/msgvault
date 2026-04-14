@@ -17,7 +17,8 @@ labels, and sync state. It is safe to run multiple times - tables are only
 created if they don't already exist.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dbPath := cfg.DatabaseDSN()
-		logger.Info("initializing database", "path", dbPath)
+		displayPath := store.RedactPassword(dbPath)
+		logger.Info("initializing database", "path", displayPath)
 
 		s, err := store.Open(dbPath)
 		if err != nil {
@@ -37,7 +38,7 @@ created if they don't already exist.`,
 			return fmt.Errorf("get stats: %w", err)
 		}
 
-		fmt.Printf("Database: %s\n", dbPath)
+		fmt.Printf("Database: %s\n", displayPath)
 		fmt.Printf("  Messages:    %d\n", stats.MessageCount)
 		fmt.Printf("  Threads:     %d\n", stats.ThreadCount)
 		fmt.Printf("  Attachments: %d\n", stats.AttachmentCount)

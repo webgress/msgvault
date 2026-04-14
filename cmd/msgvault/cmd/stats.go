@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+	"github.com/wesm/msgvault/internal/store"
 )
 
 var statsCmd = &cobra.Command{
@@ -38,7 +39,7 @@ Use --local to force local database.`,
 		if IsRemoteMode() {
 			fmt.Printf("Remote: %s\n", cfg.Remote.URL)
 		} else {
-			fmt.Printf("Database: %s\n", cfg.DatabaseDSN())
+			fmt.Printf("Database: %s\n", store.RedactPassword(cfg.DatabaseDSN()))
 		}
 
 		fmt.Printf("  Messages:    %d\n", stats.MessageCount)

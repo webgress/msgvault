@@ -62,6 +62,46 @@ func isPostgresURL(dbPath string) bool {
 	return strings.HasPrefix(dbPath, "postgresql://") || strings.HasPrefix(dbPath, "postgres://")
 }
 
+// RedactPassword returns a version of a database path or URL safe to log or
+// print to stdout. For PostgreSQL URLs with a userinfo:password@ component,
+// the password is replaced with `***`. SQLite paths are returned unchanged.
+//
+// Malformed URLs are returned unchanged rather than failing — this function
+// is display-only and should never error the caller.
+func RedactPassword(dbPath string) string {
+	if !isPostgresURL(dbPath) {
+		return dbPath
+	}
+	// Parse to validate structure, then do a targeted string edit on the
+	// original. We can't use url.URL.String() to reassemble because Go's
+	// url.UserPassword percent-encodes "***" to "%2A%2A%2A", which is
+	// correct for machines but ugly for display.
+	u, err := url.Parse(dbPath)
+	if err != nil || u.User == nil {
+		return dbPath
+	}
+	if _, hasPassword := u.User.Password(); !hasPassword {
+		return dbPath
+	}
+	// Replace everything between "://<user>:" and the next "@" with "***".
+	schemeSep := strings.Index(dbPath, "://")
+	if schemeSep < 0 {
+		return dbPath
+	}
+	afterScheme := schemeSep + 3
+	atIdx := strings.Index(dbPath[afterScheme:], "@")
+	if atIdx < 0 {
+		return dbPath
+	}
+	atIdx += afterScheme
+	colonIdx := strings.Index(dbPath[afterScheme:atIdx], ":")
+	if colonIdx < 0 {
+		return dbPath
+	}
+	colonIdx += afterScheme
+	return dbPath[:colonIdx+1] + "***" + dbPath[atIdx:]
+}
+
 // Open opens or creates the database at the given path.
 // If dbPath is a postgres:// or postgresql:// URL, opens a PostgreSQL connection.
 // Otherwise, opens a SQLite database at the file path.
