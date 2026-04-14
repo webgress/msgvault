@@ -2,6 +2,13 @@ package store
 
 import "database/sql"
 
+// ColumnMigration is a single ALTER TABLE ADD COLUMN statement used by
+// dialects that need to evolve older databases to the current schema.
+type ColumnMigration struct {
+	SQL  string // full ALTER TABLE ... ADD COLUMN statement
+	Desc string // short label for error messages
+}
+
 // Dialect abstracts database-specific SQL generation and behavior.
 // Implementations exist for SQLite (default) and PostgreSQL (opt-in).
 type Dialect interface {
@@ -77,6 +84,13 @@ type Dialect interface {
 
 	// SchemaFiles returns the filenames of embedded schema files to execute during InitSchema.
 	SchemaFiles() []string
+
+	// LegacyColumnMigrations returns ALTER TABLE statements to bring older
+	// databases up to date with schema columns added over time.
+	// For SQLite, this is a list of ADD COLUMN statements that no-op via
+	// IsDuplicateColumnError when already applied. For PostgreSQL, this returns
+	// an empty slice because schema_pg.sql is always the complete, current schema.
+	LegacyColumnMigrations() []ColumnMigration
 
 	// CheckpointWAL checkpoints the WAL (SQLite) or is a no-op (PostgreSQL).
 	CheckpointWAL(db *sql.DB) error

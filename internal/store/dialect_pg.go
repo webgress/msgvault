@@ -151,9 +151,10 @@ func (d *PostgreSQLDialect) FTSClearSQL() string {
 	return "UPDATE messages SET search_fts = NULL"
 }
 
-// SchemaFTS returns the embedded filename containing PostgreSQL FTS DDL.
+// SchemaFTS returns "" — PostgreSQL's tsvector column is part of schema_pg.sql,
+// so no separate FTS schema file needs to be loaded.
 func (d *PostgreSQLDialect) SchemaFTS() string {
-	return "schema_pg.sql"
+	return ""
 }
 
 // InitConn performs PostgreSQL-specific connection initialization.
@@ -162,9 +163,18 @@ func (d *PostgreSQLDialect) InitConn(db *sql.DB) error {
 	return err
 }
 
-// SchemaFiles returns the schema files to execute during InitSchema.
+// SchemaFiles returns the PostgreSQL-native schema file.
+// Does not share schema.sql — that file uses SQLite-specific types
+// (DATETIME, BLOB, INTEGER PRIMARY KEY) that PostgreSQL does not accept.
 func (d *PostgreSQLDialect) SchemaFiles() []string {
-	return []string{"schema.sql"}
+	return []string{"schema_pg.sql"}
+}
+
+// LegacyColumnMigrations returns an empty list. schema_pg.sql is always
+// the complete, current schema — there are no older PostgreSQL databases
+// that need legacy ALTER TABLE fixups.
+func (d *PostgreSQLDialect) LegacyColumnMigrations() []ColumnMigration {
+	return nil
 }
 
 // CheckpointWAL is a no-op for PostgreSQL (no WAL checkpoint needed).
