@@ -167,16 +167,16 @@ func (s *Store) StartSync(sourceID int64, syncType string) (int64, error) {
 		return 0, fmt.Errorf("mark old syncs failed: %w", err)
 	}
 
-	// Create new sync run
-	result, err := s.exec(fmt.Sprintf(`
+	// Create new sync run — use RETURNING for driver portability.
+	var newID int64
+	if err := s.queryRow(fmt.Sprintf(`
 		INSERT INTO sync_runs (source_id, started_at, status, messages_processed, messages_added, messages_updated, errors_count)
 		VALUES (?, %s, 'running', 0, 0, 0, 0)
-	`, now), sourceID)
-	if err != nil {
+		RETURNING id
+	`, now), sourceID).Scan(&newID); err != nil {
 		return 0, fmt.Errorf("insert sync_run: %w", err)
 	}
-
-	return result.LastInsertId()
+	return newID, nil
 }
 
 // UpdateSyncCheckpoint saves progress for resumption.
@@ -289,24 +289,24 @@ func (s *Store) GetOrCreateSource(sourceType, identifier string) (*Source, error
 		return nil, err
 	}
 
-	// Create new
+	// Create new — use RETURNING for driver portability.
 	now := s.dialect.Now()
-	result, err := s.exec(fmt.Sprintf(`
+	var newID int64
+	if err := s.queryRow(fmt.Sprintf(`
 		INSERT INTO sources (source_type, identifier, created_at, updated_at)
 		VALUES (?, ?, %s, %s)
-	`, now, now), sourceType, identifier)
-	if err != nil {
+		RETURNING id
+	`, now, now), sourceType, identifier).Scan(&newID); err != nil {
 		return nil, fmt.Errorf("insert source: %w", err)
 	}
 
 	newSource := &Source{
+		ID:         newID,
 		SourceType: sourceType,
 		Identifier: identifier,
 		CreatedAt:  time.Now(),
 		UpdatedAt:  time.Now(),
 	}
-	newSource.ID, _ = result.LastInsertId()
-
 	return newSource, nil
 }
 

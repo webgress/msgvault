@@ -24,7 +24,7 @@ func TestRecomputeConversationStats(t *testing.T) {
 
 	// Verify initial message_count is 0 (stats not maintained on insert).
 	var initialCount int
-	if err := st.DB().QueryRow(
+	if err := st.QueryRow(
 		`SELECT message_count FROM conversations WHERE id = ?`, convID,
 	).Scan(&initialCount); err != nil {
 		t.Fatalf("initial message_count scan: %v", err)
@@ -92,7 +92,7 @@ func TestRecomputeConversationStats(t *testing.T) {
 	var participantCount int
 	var lastMsgAt sql.NullTime
 	var preview sql.NullString
-	if err := st.DB().QueryRow(
+	if err := st.QueryRow(
 		`SELECT message_count, participant_count, last_message_at, last_message_preview
 		 FROM conversations WHERE id = ?`, convID,
 	).Scan(&count, &participantCount, &lastMsgAt, &preview); err != nil {
@@ -117,7 +117,7 @@ func TestRecomputeConversationStats(t *testing.T) {
 	if err := st.RecomputeConversationStats(source.ID); err != nil {
 		t.Fatalf("RecomputeConversationStats (second call): %v", err)
 	}
-	if err := st.DB().QueryRow(
+	if err := st.QueryRow(
 		`SELECT message_count FROM conversations WHERE id = ?`, convID,
 	).Scan(&count); err != nil {
 		t.Fatalf("idempotency scan: %v", err)
@@ -150,7 +150,7 @@ func TestEnsureParticipantByPhone_IdentifierType(t *testing.T) {
 
 	// Both participant_identifiers rows should exist
 	var count int
-	err = st.DB().QueryRow(
+	err = st.QueryRow(
 		`SELECT COUNT(*) FROM participant_identifiers WHERE participant_id = ?`,
 		id1,
 	).Scan(&count)
@@ -164,7 +164,7 @@ func TestEnsureParticipantByPhone_IdentifierType(t *testing.T) {
 	// Verify each identifier type is present
 	for _, identType := range []string{"whatsapp", "imessage"} {
 		var exists int
-		err = st.DB().QueryRow(
+		err = st.QueryRow(
 			`SELECT COUNT(*) FROM participant_identifiers
 			 WHERE participant_id = ? AND identifier_type = ?`,
 			id1, identType,
