@@ -264,8 +264,8 @@ func (s *Store) withTx(fn func(tx *sql.Tx) error) error {
 // queryInChunks executes a parameterized IN-query in chunks to stay within
 // SQLite's parameter limit. queryTemplate must contain a single %s placeholder
 // for the comma-separated "?" list. The prefix args are prepended before each
-// chunk's args (e.g., a source_id filter).
-func queryInChunks[T any](db *sql.DB, ids []T, prefixArgs []interface{}, queryTemplate string, fn func(*sql.Rows) error) error {
+// chunk's args (e.g., a source_id filter). The query is rebound per dialect.
+func queryInChunks[T any](s *Store, ids []T, prefixArgs []interface{}, queryTemplate string, fn func(*sql.Rows) error) error {
 	const chunkSize = 500
 	for i := 0; i < len(ids); i += chunkSize {
 		end := i + chunkSize
@@ -282,8 +282,8 @@ func queryInChunks[T any](db *sql.DB, ids []T, prefixArgs []interface{}, queryTe
 			args = append(args, id)
 		}
 
-		query := fmt.Sprintf(queryTemplate, strings.Join(placeholders, ","))
-		rows, err := db.Query(query, args...)
+		query := s.Rebind(fmt.Sprintf(queryTemplate, strings.Join(placeholders, ",")))
+		rows, err := s.db.Query(query, args...)
 		if err != nil {
 			return err
 		}
@@ -306,7 +306,8 @@ func queryInChunks[T any](db *sql.DB, ids []T, prefixArgs []interface{}, queryTe
 // parameter limit (999). The valuesPerRow specifies how many parameters are in
 // each VALUES tuple (e.g., 4 for "(?, ?, ?, ?)"). The valueBuilder function
 // generates the VALUES placeholders and args for each chunk of indices.
-func insertInChunks(tx *sql.Tx, totalRows int, valuesPerRow int, queryPrefix string, querySuffix string, valueBuilder func(start, end int) ([]string, []interface{})) error {
+// The assembled query is rebound via the dialect before execution.
+func insertInChunks(tx *sql.Tx, d Dialect, totalRows int, valuesPerRow int, queryPrefix string, querySuffix string, valueBuilder func(start, end int) ([]string, []interface{})) error {
 	// SQLite default SQLITE_MAX_VARIABLE_NUMBER is 999
 	// Leave some margin for safety
 	const maxParams = 900
@@ -322,7 +323,7 @@ func insertInChunks(tx *sql.Tx, totalRows int, valuesPerRow int, queryPrefix str
 		}
 
 		values, args := valueBuilder(i, end)
-		query := queryPrefix + strings.Join(values, ",") + querySuffix
+		query := d.Rebind(queryPrefix + strings.Join(values, ",") + querySuffix)
 		if _, err := tx.Exec(query, args...); err != nil {
 			return err
 		}
@@ -333,8 +334,9 @@ func insertInChunks(tx *sql.Tx, totalRows int, valuesPerRow int, queryPrefix str
 // execInChunks executes a parameterized DELETE/UPDATE with an IN-clause in chunks
 // to stay within SQLite's parameter limit. queryTemplate must contain a single %s
 // placeholder for the comma-separated "?" list. The prefix args are prepended before
-// each chunk's args (e.g., a message_id filter).
-func execInChunks[T any](db *sql.DB, ids []T, prefixArgs []interface{}, queryTemplate string) error {
+// each chunk's args (e.g., a message_id filter). The assembled query is rebound
+// via the dialect before execution.
+func execInChunks[T any](s *Store, ids []T, prefixArgs []interface{}, queryTemplate string) error {
 	const chunkSize = 500
 	for i := 0; i < len(ids); i += chunkSize {
 		end := i + chunkSize
@@ -351,8 +353,8 @@ func execInChunks[T any](db *sql.DB, ids []T, prefixArgs []interface{}, queryTem
 			args = append(args, id)
 		}
 
-		query := fmt.Sprintf(queryTemplate, strings.Join(placeholders, ","))
-		if _, err := db.Exec(query, args...); err != nil {
+		query := s.Rebind(fmt.Sprintf(queryTemplate, strings.Join(placeholders, ",")))
+		if _, err := s.db.Exec(query, args...); err != nil {
 			return err
 		}
 	}
@@ -364,6 +366,32 @@ func execInChunks[T any](db *sql.DB, ids []T, prefixArgs []interface{}, queryTem
 // for PostgreSQL.
 func (s *Store) Rebind(query string) string {
 	return s.dialect.Rebind(query)
+}
+
+// exec is a Rebind-aware shorthand for s.db.Exec. All internal store code
+// should use this instead of s.db.Exec so PostgreSQL placeholders work.
+func (s *Store) exec(query string, args ...any) (sql.Result, error) {
+	return s.db.Exec(s.dialect.Rebind(query), args...)
+}
+
+// queryRow is a Rebind-aware shorthand for s.db.QueryRow.
+func (s *Store) queryRow(query string, args ...any) *sql.Row {
+	return s.db.QueryRow(s.dialect.Rebind(query), args...)
+}
+
+// query is a Rebind-aware shorthand for s.db.Query.
+func (s *Store) query(query string, args ...any) (*sql.Rows, error) {
+	return s.db.Query(s.dialect.Rebind(query), args...)
+}
+
+// txExec runs tx.Exec with dialect-aware placeholder rebinding.
+func (s *Store) txExec(tx *sql.Tx, query string, args ...any) (sql.Result, error) {
+	return tx.Exec(s.dialect.Rebind(query), args...)
+}
+
+// txQueryRow runs tx.QueryRow with dialect-aware placeholder rebinding.
+func (s *Store) txQueryRow(tx *sql.Tx, query string, args ...any) *sql.Row {
+	return tx.QueryRow(s.dialect.Rebind(query), args...)
 }
 
 // FTS5Available returns whether FTS5 full-text search is available.

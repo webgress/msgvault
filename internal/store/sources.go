@@ -11,7 +11,7 @@ import (
 func (s *Store) GetSourcesByIdentifier(
 	identifier string,
 ) ([]*Source, error) {
-	rows, err := s.db.Query(`
+	rows, err := s.query(`
 		SELECT id, source_type, identifier, display_name,
 		       google_user_id, last_sync_at, sync_cursor, sync_config,
 		       oauth_app, created_at, updated_at
@@ -39,7 +39,7 @@ func (s *Store) GetSourcesByIdentifier(
 // display_name matches the given value. This is the preferred single-query
 // lookup when resolving a user-supplied email or identifier string.
 func (s *Store) GetSourcesByIdentifierOrDisplayName(query string) ([]*Source, error) {
-	rows, err := s.db.Query(`
+	rows, err := s.query(`
 		SELECT id, source_type, identifier, display_name,
 		       google_user_id, last_sync_at, sync_cursor, sync_config,
 		       oauth_app, created_at, updated_at
@@ -69,7 +69,7 @@ func (s *Store) GetSourcesByIdentifierOrDisplayName(query string) ([]*Source, er
 // Note: display_name is not constrained to be unique — callers receive all
 // matching rows if more than one source shares the same name.
 func (s *Store) GetSourcesByDisplayName(displayName string) ([]*Source, error) {
-	rows, err := s.db.Query(`
+	rows, err := s.query(`
 		SELECT id, source_type, identifier, display_name,
 		       google_user_id, last_sync_at, sync_cursor, sync_config,
 		       oauth_app, created_at, updated_at
@@ -107,7 +107,7 @@ func (s *Store) RemoveSource(sourceID int64) error {
 		}
 
 		res, err := tx.Exec(
-			`DELETE FROM sources WHERE id = ?`, sourceID,
+			s.Rebind(`DELETE FROM sources WHERE id = ?`), sourceID,
 		)
 		if err != nil {
 			return fmt.Errorf("delete source: %w", err)
