@@ -96,6 +96,39 @@ engine := query.NewEngine(s.DB(), s.IsPostgres())
 `store.Store.IsPostgres()` and `store.Store.DriverName()` let callers pick
 without importing the store package from within query.
 
+## Full-Text Search
+
+Both backends support full-text search with the same public API
+(`UpsertFTS`, `BackfillFTS`, `SearchMessages`). Portable integration
+tests in `internal/storeext/fts_e2e_test.go` verify identical behavior
+across dialects:
+
+- `TestFTSEndToEnd` — upsert + search + no-match
+- `TestFTSUpsertReplacesPriorContent` — replace semantics
+- `TestBackfillFTSRepopulatesIndex` — backfill flow
+- `TestRemoveSourceClearsSearchResults` — cascade cleanup
+- `TestFTSSearchSQLInjection` — metacharacter safety
+
+Backend implementation details:
+
+**SQLite**: FTS5 virtual table `messages_fts` populated via
+`INSERT OR REPLACE`. Search uses `MATCH` + FTS5 rank.
+
+**PostgreSQL**: `tsvector` column `messages.search_fts` with GIN index.
+Search uses `@@ to_tsquery('simple', ?)`. The FTS upsert/backfill
+pre-processes email addresses with `REPLACE('@', ' ')` and
+`REPLACE('.', ' ')` so individual tokens (user, domain) are searchable
+— the 'simple' tsvector config would otherwise treat full addresses as
+single tokens.
+
+User input for both backends is normalized through
+`Dialect.SanitizeFTSQuery(query)`. SQLite strips FTS5 metacharacters
+(`*`, `:`, `-`, `(`, `)`, `.`, `"`) and wraps the result in quotes with
+a `*` prefix suffix. PostgreSQL strips tsquery operators
+(`&`, `|`, `!`, `(`, `)`, `:`, `*`, `\`, `'`), splits on word-boundary
+punctuation, and joins tokens with ` & ` and a `:*` suffix for prefix
+matching.
+
 ## Known Limitations
 
 - **Subset copy (`subset.go`) is SQLite-only.** It uses PRAGMA introspection
@@ -108,3 +141,14 @@ without importing the store package from within query.
 - **Schema migrations run only on SQLite.** The incremental ADD COLUMN
   statements apply to pre-existing SQLite databases. PG databases are always
   initialized from the complete schema_pg.sql.
+- **DuckDB/Parquet analytics (`cmd msgvault build-cache`) is unaffected**
+  but its SQL uses SQLite-flavored `strftime` and `messages_fts MATCH`
+  from DuckDB's own dialect — these paths work against the Parquet files
+  the cache builder produces, not the live Store, so they're dialect-independent.
+
+## Test Timing (local PostgreSQL 16)
+
+Full suite against PostgreSQL completes in ~60s wall clock. The
+`internal/store` package dominates (~40s) due to per-test schema
+create/drop overhead. Individual tests are all well under 1s. SQLite
+runs the same suite in ~12s.
