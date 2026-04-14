@@ -35,6 +35,11 @@ type Dialect interface {
 	// Both SQLite and PostgreSQL support prefix matching via the dialect-appropriate
 	// syntax (FTS5 "term*", tsquery "term:*").
 	BuildFTSTerm(terms []string) (expr string, arg string)
+
+	// SanitizeFTSQuery takes a single user-supplied search string and returns
+	// an argument safe to pass with FTSSearchExpression. Returns "" if the
+	// result is empty after sanitization (caller should treat as no-match).
+	SanitizeFTSQuery(query string) string
 }
 
 // SQLiteQueryDialect implements Dialect for SQLite.
@@ -78,6 +83,25 @@ func (SQLiteQueryDialect) BuildFTSTerm(terms []string) (expr string, arg string)
 		ftsTerms[i] = fmt.Sprintf("\"%s\"*", term)
 	}
 	return "messages_fts MATCH ?", strings.Join(ftsTerms, " ")
+}
+
+// SanitizeFTSQuery strips FTS5 metacharacters from a single query string
+// and wraps it in quotes for literal phrase interpretation with prefix match.
+func (SQLiteQueryDialect) SanitizeFTSQuery(query string) string {
+	var b strings.Builder
+	for _, r := range query {
+		switch r {
+		case '"', '*', ':', '-', '(', ')', '.':
+			continue
+		default:
+			b.WriteRune(r)
+		}
+	}
+	clean := strings.TrimSpace(b.String())
+	if clean == "" {
+		return ""
+	}
+	return `"` + clean + `"*`
 }
 
 // PostgreSQLQueryDialect implements Dialect for PostgreSQL.
@@ -151,10 +175,35 @@ func (PostgreSQLQueryDialect) BuildFTSTerm(terms []string) (expr string, arg str
 	return "m.search_fts @@ to_tsquery('simple', ?)", strings.Join(tsTerms, " & ")
 }
 
+// SanitizeFTSQuery builds a tsquery arg from a single user string: splits
+// on whitespace + word-boundary punctuation, strips tsquery metacharacters,
+// and joins with " & " with ":*" prefix matching. Returns "" if empty.
+func (PostgreSQLQueryDialect) SanitizeFTSQuery(query string) string {
+	var b strings.Builder
+	for _, r := range query {
+		switch r {
+		case '&', '|', '!', '(', ')', ':', '*', '\\', '\'':
+			continue
+		case '@', '.', '-', '/', ',', ';', '"':
+			b.WriteRune(' ')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	tokens := strings.Fields(b.String())
+	if len(tokens) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(tokens))
+	for _, t := range tokens {
+		parts = append(parts, t+":*")
+	}
+	return strings.Join(parts, " & ")
+}
+
 // tsqueryEscape removes PostgreSQL tsquery metacharacters and whitespace,
 // leaving a single alphanumeric+unicode token. Returns "" if nothing remains.
 func tsqueryEscape(s string) string {
-	// Remove &, |, !, (, ), :, and all whitespace — these are tsquery operators.
 	var b strings.Builder
 	for _, r := range s {
 		switch r {
