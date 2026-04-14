@@ -453,26 +453,10 @@ func (s *Store) InitSchema() error {
 
 	// Migrations: add columns for databases created before these features.
 	// The dialect determines whether a "duplicate column" error is benign.
-	for _, m := range []struct {
-		sql  string
-		desc string
-	}{
-		{`ALTER TABLE sources ADD COLUMN sync_config JSON`, "sync_config"},
-		{`ALTER TABLE messages ADD COLUMN rfc822_message_id TEXT`, "rfc822_message_id"},
-		{`ALTER TABLE sources ADD COLUMN oauth_app TEXT`, "oauth_app"},
-		{`ALTER TABLE participants ADD COLUMN phone_number TEXT`, "phone_number"},
-		{`ALTER TABLE participants ADD COLUMN canonical_id TEXT`, "canonical_id"},
-		{`ALTER TABLE messages ADD COLUMN sender_id INTEGER REFERENCES participants(id)`, "sender_id"},
-		{`ALTER TABLE messages ADD COLUMN message_type TEXT NOT NULL DEFAULT 'email'`, "message_type"},
-		{`ALTER TABLE messages ADD COLUMN attachment_count INTEGER DEFAULT 0`, "attachment_count"},
-		{`ALTER TABLE messages ADD COLUMN deleted_from_source_at DATETIME`, "deleted_from_source_at"},
-		{`ALTER TABLE messages ADD COLUMN delete_batch_id TEXT`, "delete_batch_id"},
-		{`ALTER TABLE conversations ADD COLUMN title TEXT`, "title"},
-		{`ALTER TABLE conversations ADD COLUMN conversation_type TEXT NOT NULL DEFAULT 'email_thread'`, "conversation_type"},
-	} {
-		if _, err := s.db.Exec(m.sql); err != nil {
+	for _, m := range s.dialect.LegacyColumnMigrations() {
+		if _, err := s.db.Exec(m.SQL); err != nil {
 			if !s.dialect.IsDuplicateColumnError(err) {
-				return fmt.Errorf("migrate schema (%s): %w", m.desc, err)
+				return fmt.Errorf("migrate schema (%s): %w", m.Desc, err)
 			}
 		}
 	}
