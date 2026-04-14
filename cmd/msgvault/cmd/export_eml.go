@@ -95,7 +95,7 @@ func runExportEML(cmd *cobra.Command, messageRef, outputPath string) error {
 		return fmt.Errorf("init schema: %w", err)
 	}
 
-	engine := query.NewSQLiteEngine(s.DB())
+	engine := query.NewEngine(s.DB(), s.IsPostgres())
 
 	resolved, err := resolveMessage(engine, cmd, messageRef)
 	if err != nil {

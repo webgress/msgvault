@@ -162,6 +162,31 @@ func (d *PostgreSQLDialect) SchemaFTS() string {
 	return ""
 }
 
+// FTSSearchExpression returns the tsvector @@ plainto_tsquery expression.
+func (d *PostgreSQLDialect) FTSSearchExpression() string {
+	return "m.search_fts @@ plainto_tsquery('simple', ?)"
+}
+
+// TimeTruncExpression returns to_char() for the given granularity.
+func (d *PostgreSQLDialect) TimeTruncExpression(column string, granularity string) string {
+	switch granularity {
+	case "year":
+		return fmt.Sprintf("to_char(%s, 'YYYY')", column)
+	case "month":
+		return fmt.Sprintf("to_char(%s, 'YYYY-MM')", column)
+	case "day":
+		return fmt.Sprintf("to_char(%s, 'YYYY-MM-DD')", column)
+	default:
+		return fmt.Sprintf("to_char(%s, 'YYYY-MM')", column)
+	}
+}
+
+// HasFTSTableSQL checks information_schema for the search_fts column.
+func (d *PostgreSQLDialect) HasFTSTableSQL() string {
+	return `SELECT COUNT(*) FROM information_schema.columns
+		WHERE table_name = 'messages' AND column_name = 'search_fts'`
+}
+
 // InitConn is a no-op for PostgreSQL. Connection-scoped settings like
 // statement_timeout are applied via libpq connection options in the DSN
 // (see applyPgDefaults in store.go) so they propagate to every pool

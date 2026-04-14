@@ -111,6 +111,31 @@ func (d *SQLiteDialect) SchemaFTS() string {
 	return "schema_sqlite.sql"
 }
 
+// FTSSearchExpression returns the FTS5 MATCH expression.
+func (d *SQLiteDialect) FTSSearchExpression() string {
+	return "messages_fts MATCH ?"
+}
+
+// TimeTruncExpression returns strftime() for the given granularity.
+// granularity must be one of "year", "month", "day".
+func (d *SQLiteDialect) TimeTruncExpression(column string, granularity string) string {
+	switch granularity {
+	case "year":
+		return fmt.Sprintf("strftime('%%Y', %s)", column)
+	case "month":
+		return fmt.Sprintf("strftime('%%Y-%%m', %s)", column)
+	case "day":
+		return fmt.Sprintf("strftime('%%Y-%%m-%%d', %s)", column)
+	default:
+		return fmt.Sprintf("strftime('%%Y-%%m', %s)", column)
+	}
+}
+
+// HasFTSTableSQL checks sqlite_master for the messages_fts virtual table.
+func (d *SQLiteDialect) HasFTSTableSQL() string {
+	return `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='messages_fts'`
+}
+
 // InitConn is a no-op for SQLite — PRAGMAs are set via DSN parameters.
 func (d *SQLiteDialect) InitConn(db *sql.DB) error { return nil }
 

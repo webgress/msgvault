@@ -127,7 +127,7 @@ Remote Mode:
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Warning: Failed to open Parquet engine: %v\n", err)
 					fmt.Fprintf(os.Stderr, "Falling back to SQLite (may be slow for large archives)\n")
-					engine = query.NewSQLiteEngine(s.DB())
+					engine = query.NewEngine(s.DB(), s.IsPostgres())
 				} else {
 					engine = duckEngine
 					defer func() { _ = duckEngine.Close() }()
@@ -138,7 +138,7 @@ Remote Mode:
 					fmt.Fprintf(os.Stderr, "Note: No cache data available, using SQLite (slow for large archives)\n")
 					fmt.Fprintf(os.Stderr, "Run 'msgvault build-cache' to enable fast queries.\n")
 				}
-				engine = query.NewSQLiteEngine(s.DB())
+				engine = query.NewEngine(s.DB(), s.IsPostgres())
 			}
 		}
 

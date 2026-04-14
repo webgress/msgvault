@@ -85,6 +85,24 @@ type Dialect interface {
 	// (e.g., PostgreSQL includes tsvector in its main schema).
 	SchemaFTS() string
 
+	// FTSSearchExpression returns the SQL boolean expression for a full-text
+	// search MATCH-style clause, where `?` is the placeholder for the search term.
+	// SQLite: "messages_fts MATCH ?" (requires JOIN messages_fts fts ON fts.rowid = m.id).
+	// PostgreSQL: "m.search_fts @@ plainto_tsquery('simple', ?)".
+	// Not all engine code paths need this — FTSSearchClause() above handles
+	// JOIN + WHERE + ORDER BY together for the store layer.
+	FTSSearchExpression() string
+
+	// TimeTruncExpression returns an expression that formats a timestamp column
+	// for GROUP BY by the given granularity (year/month/day).
+	// SQLite: strftime('%Y', col) etc.
+	// PostgreSQL: to_char(col, 'YYYY') etc.
+	TimeTruncExpression(column string, granularity string) string
+
+	// HasFTSTableSQL returns the SQL to probe whether the FTS index is available.
+	// Returns a single-row result: 1 if present, 0 if absent.
+	HasFTSTableSQL() string
+
 	// Connection lifecycle
 
 	// InitConn performs driver-specific connection initialization.

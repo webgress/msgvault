@@ -100,7 +100,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		if engineErr != nil {
 			logger.Warn("DuckDB engine failed, falling back to SQLite",
 				"error", engineErr)
-			engine = query.NewSQLiteEngine(s.DB())
+			engine = query.NewEngine(s.DB(), s.IsPostgres())
 		} else {
 			engine = duckEngine
 		}
@@ -111,7 +111,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		} else {
 			logger.Info("parquet cache not built - using SQLite engine (run 'msgvault build-cache' for faster aggregates)")
 		}
-		engine = query.NewSQLiteEngine(s.DB())
+		engine = query.NewEngine(s.DB(), s.IsPostgres())
 	}
 	defer func() { _ = engine.Close() }()
 

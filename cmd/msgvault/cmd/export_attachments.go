@@ -46,7 +46,7 @@ func runExportAttachments(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("init schema: %w", err)
 	}
 
-	engine := query.NewSQLiteEngine(s.DB())
+	engine := query.NewEngine(s.DB(), s.IsPostgres())
 
 	// Resolve message ID — try numeric first, fallback to Gmail ID
 	var msg *query.MessageDetail

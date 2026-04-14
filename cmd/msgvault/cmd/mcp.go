@@ -73,13 +73,13 @@ Add to Claude Desktop config:
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Warning: Failed to open Parquet engine: %v\n", err)
 				fmt.Fprintf(os.Stderr, "Falling back to SQLite\n")
-				engine = query.NewSQLiteEngine(s.DB())
+				engine = query.NewEngine(s.DB(), s.IsPostgres())
 			} else {
 				engine = duckEngine
 				defer func() { _ = duckEngine.Close() }()
 			}
 		} else {
-			engine = query.NewSQLiteEngine(s.DB())
+			engine = query.NewEngine(s.DB(), s.IsPostgres())
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())

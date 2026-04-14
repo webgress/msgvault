@@ -268,6 +268,19 @@ func (s *Store) DB() *sql.DB {
 	return s.db
 }
 
+// DriverName returns the database/sql driver name backing this Store
+// ("sqlite3" or "pgx"). Callers use this to select a matching query engine
+// without taking a direct dependency on internal/query.
+func (s *Store) DriverName() string {
+	return s.dialect.DriverName()
+}
+
+// IsPostgres reports whether this Store is backed by PostgreSQL.
+// Convenience wrapper for callers that only need a boolean.
+func (s *Store) IsPostgres() bool {
+	return s.dialect.DriverName() == "pgx"
+}
+
 // withTx executes fn within a database transaction. If fn returns an error,
 // the transaction is rolled back; otherwise it is committed.
 func (s *Store) withTx(fn func(tx *sql.Tx) error) error {

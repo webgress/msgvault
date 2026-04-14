@@ -60,7 +60,8 @@ func sqliteDirection(d SortDirection) string {
 
 // buildSQLiteTextFilterConditions builds WHERE conditions from a TextFilter.
 // All conditions use the m. prefix for the messages table.
-func buildSQLiteTextFilterConditions(filter TextFilter) (string, []interface{}) {
+// The dialect parameter supplies backend-specific time-truncation SQL.
+func buildSQLiteTextFilterConditions(d Dialect, filter TextFilter) (string, []interface{}) {
 	conditions := []string{textMsgTypeFilter()}
 	var args []interface{}
 
@@ -123,17 +124,18 @@ func buildSQLiteTextFilterConditions(filter TextFilter) (string, []interface{}) 
 				granularity = TimeDay
 			}
 		}
-		var timeExprStr string
+		var gran string
 		switch granularity {
 		case TimeYear:
-			timeExprStr = "strftime('%Y', m.sent_at)"
+			gran = "year"
 		case TimeMonth:
-			timeExprStr = "strftime('%Y-%m', m.sent_at)"
+			gran = "month"
 		case TimeDay:
-			timeExprStr = "strftime('%Y-%m-%d', m.sent_at)"
+			gran = "day"
 		default:
-			timeExprStr = "strftime('%Y-%m', m.sent_at)"
+			gran = "month"
 		}
+		timeExprStr := d.TimeTruncExpression("m.sent_at", gran)
 		conditions = append(conditions, fmt.Sprintf("%s = ?", timeExprStr))
 		args = append(args, filter.TimeRange.Period)
 	}
@@ -153,7 +155,7 @@ func buildSQLiteTextFilterConditions(filter TextFilter) (string, []interface{}) 
 func (e *SQLiteEngine) ListConversations(
 	ctx context.Context, filter TextFilter,
 ) ([]ConversationRow, error) {
-	where, args := buildSQLiteTextFilterConditions(filter)
+	where, args := buildSQLiteTextFilterConditions(e.dialect, filter)
 
 	// Sort clause.
 	var orderBy string
@@ -203,7 +205,7 @@ func (e *SQLiteEngine) ListConversations(
 
 	args = append(args, limit, filter.Pagination.Offset)
 
-	rows, err := e.db.QueryContext(ctx, query, args...)
+	rows, err := e.queryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list conversations: %w", err)
 	}
@@ -239,8 +241,9 @@ func (e *SQLiteEngine) ListConversations(
 }
 
 // textAggSQLiteDimension returns the dimension definition for a text aggregate view.
+// The dialect parameter supplies backend-specific time-truncation SQL.
 func textAggSQLiteDimension(
-	view TextViewType, granularity TimeGranularity,
+	d Dialect, view TextViewType, granularity TimeGranularity,
 ) (aggDimension, error) {
 	switch view {
 	case TextViewContacts:
@@ -280,17 +283,18 @@ func textAggSQLiteDimension(
 			whereExpr: "lbl_agg.name IS NOT NULL",
 		}, nil
 	case TextViewTime:
-		var timeExprStr string
+		var gran string
 		switch granularity {
 		case TimeYear:
-			timeExprStr = "strftime('%Y', m.sent_at)"
+			gran = "year"
 		case TimeMonth:
-			timeExprStr = "strftime('%Y-%m', m.sent_at)"
+			gran = "month"
 		case TimeDay:
-			timeExprStr = "strftime('%Y-%m-%d', m.sent_at)"
+			gran = "day"
 		default:
-			timeExprStr = "strftime('%Y-%m', m.sent_at)"
+			gran = "month"
 		}
+		timeExprStr := d.TimeTruncExpression("m.sent_at", gran)
 		return aggDimension{
 			keyExpr:   timeExprStr,
 			joins:     "",
@@ -307,7 +311,7 @@ func (e *SQLiteEngine) TextAggregate(
 	viewType TextViewType,
 	opts TextAggregateOptions,
 ) ([]AggregateRow, error) {
-	dim, err := textAggSQLiteDimension(viewType, opts.TimeGranularity)
+	dim, err := textAggSQLiteDimension(e.dialect, viewType, opts.TimeGranularity)
 	if err != nil {
 		return nil, err
 	}
@@ -361,7 +365,7 @@ func (e *SQLiteEngine) TextAggregate(
 func (e *SQLiteEngine) ListConversationMessages(
 	ctx context.Context, convID int64, filter TextFilter,
 ) ([]MessageSummary, error) {
-	where, args := buildSQLiteTextFilterConditions(filter)
+	where, args := buildSQLiteTextFilterConditions(e.dialect, filter)
 	where += " AND m.conversation_id = ?"
 	args = append(args, convID)
 
@@ -400,7 +404,7 @@ func (e *SQLiteEngine) ListConversationMessages(
 
 	args = append(args, limit, filter.Pagination.Offset)
 
-	rows, err := e.db.QueryContext(ctx, query, args...)
+	rows, err := e.queryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list conversation messages: %w", err)
 	}
@@ -424,7 +428,13 @@ func (e *SQLiteEngine) TextSearch(
 		limit = 50
 	}
 
-	sqlQuery := `
+	// Use the dialect's FTS expression. SQLite: messages_fts MATCH.
+	// PostgreSQL: search_fts @@ plainto_tsquery. The join clause is also
+	// dialect-supplied (SQLite needs messages_fts; PG has the column inline).
+	ftsJoin := e.dialect.FTSJoin()
+	ftsWhere := e.dialect.FTSSearchExpression()
+
+	sqlQuery := e.dialect.Rebind(fmt.Sprintf(`
 		SELECT
 			m.id,
 			COALESCE(m.source_message_id, '') AS source_message_id,
@@ -442,17 +452,17 @@ func (e *SQLiteEngine) TextSearch(
 			m.deleted_from_source_at,
 			COALESCE(m.message_type, '') AS message_type,
 			COALESCE(c.title, '') AS conv_title
-		FROM messages_fts fts
-		JOIN messages m ON m.id = fts.rowid
+		FROM messages m
+		%s
 		LEFT JOIN participants p ON p.id = m.sender_id
 		LEFT JOIN conversations c ON c.id = m.conversation_id
-		WHERE fts.messages_fts MATCH ?
+		WHERE %s
 		  AND m.message_type IN ('whatsapp','imessage','sms','google_voice_text')
 		ORDER BY m.sent_at DESC
 		LIMIT ? OFFSET ?
-	`
+	`, ftsJoin, ftsWhere))
 
-	rows, err := e.db.QueryContext(ctx, sqlQuery, query, limit, offset)
+	rows, err := e.queryContext(ctx, sqlQuery, query, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("text search: %w", err)
 	}
@@ -491,7 +501,7 @@ func (e *SQLiteEngine) GetTextStats(
 		WHERE %s
 	`, whereClause)
 
-	if err := e.db.QueryRowContext(ctx, msgQuery, args...).Scan(
+	if err := e.queryRowContext(ctx, msgQuery, args...).Scan(
 		&stats.MessageCount,
 		&stats.TotalSize,
 		&stats.AccountCount,
@@ -508,7 +518,7 @@ func (e *SQLiteEngine) GetTextStats(
 		WHERE %s
 	`, whereClause)
 
-	if err := e.db.QueryRowContext(ctx, attQuery, args...).Scan(
+	if err := e.queryRowContext(ctx, attQuery, args...).Scan(
 		&stats.AttachmentCount,
 		&stats.AttachmentSize,
 	); err != nil {
@@ -523,7 +533,7 @@ func (e *SQLiteEngine) GetTextStats(
 		WHERE %s
 	`, whereClause)
 
-	if err := e.db.QueryRowContext(ctx, labelQuery, args...).Scan(
+	if err := e.queryRowContext(ctx, labelQuery, args...).Scan(
 		&stats.LabelCount,
 	); err != nil {
 		stats.LabelCount = 0

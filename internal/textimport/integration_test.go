@@ -259,7 +259,7 @@ func TestIntegration(t *testing.T) {
 	}
 
 	// --- TextEngine queries ---
-	eng := query.NewSQLiteEngine(s.DB())
+	eng := query.NewEngine(s.DB(), s.IsPostgres())
 	var te query.TextEngine = eng
 
 	// ListConversations — should return both conversations.
