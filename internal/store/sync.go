@@ -156,7 +156,7 @@ func (s *Store) StartSync(sourceID int64, syncType string) (int64, error) {
 	now := s.dialect.Now()
 
 	// Mark any existing running syncs as failed
-	_, err := s.db.Exec(fmt.Sprintf(`
+	_, err := s.exec(fmt.Sprintf(`
 		UPDATE sync_runs
 		SET status = 'failed',
 		    error_message = 'superseded by new sync',
@@ -168,7 +168,7 @@ func (s *Store) StartSync(sourceID int64, syncType string) (int64, error) {
 	}
 
 	// Create new sync run
-	result, err := s.db.Exec(fmt.Sprintf(`
+	result, err := s.exec(fmt.Sprintf(`
 		INSERT INTO sync_runs (source_id, started_at, status, messages_processed, messages_added, messages_updated, errors_count)
 		VALUES (?, %s, 'running', 0, 0, 0, 0)
 	`, now), sourceID)
@@ -181,7 +181,7 @@ func (s *Store) StartSync(sourceID int64, syncType string) (int64, error) {
 
 // UpdateSyncCheckpoint saves progress for resumption.
 func (s *Store) UpdateSyncCheckpoint(syncID int64, cp *Checkpoint) error {
-	_, err := s.db.Exec(`
+	_, err := s.exec(`
 		UPDATE sync_runs
 		SET cursor_before = ?,
 		    messages_processed = ?,
@@ -195,7 +195,7 @@ func (s *Store) UpdateSyncCheckpoint(syncID int64, cp *Checkpoint) error {
 
 // CompleteSync marks a sync as successfully completed.
 func (s *Store) CompleteSync(syncID int64, finalHistoryID string) error {
-	_, err := s.db.Exec(fmt.Sprintf(`
+	_, err := s.exec(fmt.Sprintf(`
 		UPDATE sync_runs
 		SET status = 'completed',
 		    completed_at = %s,
@@ -207,7 +207,7 @@ func (s *Store) CompleteSync(syncID int64, finalHistoryID string) error {
 
 // FailSync marks a sync as failed with an error message.
 func (s *Store) FailSync(syncID int64, errMsg string) error {
-	_, err := s.db.Exec(fmt.Sprintf(`
+	_, err := s.exec(fmt.Sprintf(`
 		UPDATE sync_runs
 		SET status = 'failed',
 		    completed_at = %s,
@@ -219,7 +219,7 @@ func (s *Store) FailSync(syncID int64, errMsg string) error {
 
 // GetActiveSync returns the most recent running sync for a source, if any.
 func (s *Store) GetActiveSync(sourceID int64) (*SyncRun, error) {
-	row := s.db.QueryRow(`
+	row := s.queryRow(`
 		SELECT id, source_id, started_at, completed_at, status,
 		       messages_processed, messages_added, messages_updated, errors_count,
 		       error_message, cursor_before, cursor_after
@@ -238,7 +238,7 @@ func (s *Store) GetActiveSync(sourceID int64) (*SyncRun, error) {
 
 // GetLastSuccessfulSync returns the most recent successful sync for a source.
 func (s *Store) GetLastSuccessfulSync(sourceID int64) (*SyncRun, error) {
-	row := s.db.QueryRow(`
+	row := s.queryRow(`
 		SELECT id, source_id, started_at, completed_at, status,
 		       messages_processed, messages_added, messages_updated, errors_count,
 		       error_message, cursor_before, cursor_after
@@ -273,7 +273,7 @@ type Source struct {
 // GetOrCreateSource gets or creates a source by type and identifier.
 func (s *Store) GetOrCreateSource(sourceType, identifier string) (*Source, error) {
 	// Try to get existing
-	row := s.db.QueryRow(`
+	row := s.queryRow(`
 		SELECT id, source_type, identifier, display_name, google_user_id,
 		       last_sync_at, sync_cursor, sync_config, oauth_app,
 		       created_at, updated_at
@@ -291,7 +291,7 @@ func (s *Store) GetOrCreateSource(sourceType, identifier string) (*Source, error
 
 	// Create new
 	now := s.dialect.Now()
-	result, err := s.db.Exec(fmt.Sprintf(`
+	result, err := s.exec(fmt.Sprintf(`
 		INSERT INTO sources (source_type, identifier, created_at, updated_at)
 		VALUES (?, ?, %s, %s)
 	`, now, now), sourceType, identifier)
@@ -313,7 +313,7 @@ func (s *Store) GetOrCreateSource(sourceType, identifier string) (*Source, error
 // UpdateSourceSyncCursor updates the sync cursor (historyId) for a source.
 func (s *Store) UpdateSourceSyncCursor(sourceID int64, cursor string) error {
 	now := s.dialect.Now()
-	_, err := s.db.Exec(fmt.Sprintf(`
+	_, err := s.exec(fmt.Sprintf(`
 		UPDATE sources
 		SET sync_cursor = ?, last_sync_at = %s, updated_at = %s
 		WHERE id = ?
@@ -328,7 +328,7 @@ func (s *Store) ListSources(sourceType string) ([]*Source, error) {
 	var err error
 
 	if sourceType != "" {
-		rows, err = s.db.Query(`
+		rows, err = s.query(`
 			SELECT id, source_type, identifier, display_name, google_user_id,
 			       last_sync_at, sync_cursor, sync_config, oauth_app,
 			       created_at, updated_at
@@ -337,7 +337,7 @@ func (s *Store) ListSources(sourceType string) ([]*Source, error) {
 			ORDER BY identifier
 		`, sourceType)
 	} else {
-		rows, err = s.db.Query(`
+		rows, err = s.query(`
 			SELECT id, source_type, identifier, display_name, google_user_id,
 			       last_sync_at, sync_cursor, sync_config, oauth_app,
 			       created_at, updated_at
@@ -367,7 +367,7 @@ func (s *Store) ListSources(sourceType string) ([]*Source, error) {
 
 // UpdateSourceDisplayName updates the display name for a source.
 func (s *Store) UpdateSourceDisplayName(sourceID int64, displayName string) error {
-	_, err := s.db.Exec(fmt.Sprintf(`
+	_, err := s.exec(fmt.Sprintf(`
 		UPDATE sources
 		SET display_name = ?, updated_at = %s
 		WHERE id = ?
@@ -377,7 +377,7 @@ func (s *Store) UpdateSourceDisplayName(sourceID int64, displayName string) erro
 
 // UpdateSourceSyncConfig updates the JSON sync configuration for an IMAP source.
 func (s *Store) UpdateSourceSyncConfig(sourceID int64, configJSON string) error {
-	_, err := s.db.Exec(fmt.Sprintf(`
+	_, err := s.exec(fmt.Sprintf(`
 		UPDATE sources
 		SET sync_config = ?, updated_at = %s
 		WHERE id = ?
@@ -389,7 +389,7 @@ func (s *Store) UpdateSourceSyncConfig(sourceID int64, configJSON string) error 
 // Used by add-o365 to fix up the IMAP host when re-authorizing an account
 // whose host classification changed (e.g. personal vs org scope correction).
 func (s *Store) UpdateSourceIdentifier(sourceID int64, identifier string) error {
-	_, err := s.db.Exec(fmt.Sprintf(`
+	_, err := s.exec(fmt.Sprintf(`
 		UPDATE sources
 		SET identifier = ?, updated_at = %s
 		WHERE id = ?
@@ -399,7 +399,7 @@ func (s *Store) UpdateSourceIdentifier(sourceID int64, identifier string) error 
 
 // GetSourceByIdentifier returns a source by its identifier (email address).
 func (s *Store) GetSourceByIdentifier(identifier string) (*Source, error) {
-	row := s.db.QueryRow(`
+	row := s.queryRow(`
 		SELECT id, source_type, identifier, display_name, google_user_id,
 		       last_sync_at, sync_cursor, sync_config, oauth_app,
 		       created_at, updated_at

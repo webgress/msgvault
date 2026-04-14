@@ -40,7 +40,7 @@ type APIAttachment struct {
 func (s *Store) ListMessages(offset, limit int) ([]APIMessage, int64, error) {
 	// Get total count
 	var total int64
-	err := s.db.QueryRow("SELECT COUNT(*) FROM messages WHERE deleted_from_source_at IS NULL").Scan(&total)
+	err := s.queryRow("SELECT COUNT(*) FROM messages WHERE deleted_from_source_at IS NULL").Scan(&total)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -64,7 +64,7 @@ func (s *Store) ListMessages(offset, limit int) ([]APIMessage, int64, error) {
 		LIMIT ? OFFSET ?
 	`
 
-	rows, err := s.db.Query(query, limit, offset)
+	rows, err := s.query(query, limit, offset)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -111,7 +111,7 @@ func (s *Store) GetMessage(id int64) (*APIMessage, error) {
 	var m APIMessage
 	var sentAtStr sql.NullString
 	var deletedAtStr sql.NullString
-	err := s.db.QueryRow(query, id).Scan(&m.ID, &m.ConversationID, &m.Subject, &m.From, &sentAtStr, &m.Snippet, &m.HasAttachments, &m.SizeEstimate, &deletedAtStr)
+	err := s.queryRow(query, id).Scan(&m.ID, &m.ConversationID, &m.Subject, &m.From, &sentAtStr, &m.Snippet, &m.HasAttachments, &m.SizeEstimate, &deletedAtStr)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -148,7 +148,7 @@ func (s *Store) GetMessage(id int64) (*APIMessage, error) {
 
 	// Get body (single PK lookup — only place we touch message_bodies)
 	var bodyText, bodyHTML sql.NullString
-	err = s.db.QueryRow("SELECT body_text, body_html FROM message_bodies WHERE message_id = ?", id).Scan(&bodyText, &bodyHTML)
+	err = s.queryRow("SELECT body_text, body_html FROM message_bodies WHERE message_id = ?", id).Scan(&bodyText, &bodyHTML)
 	if err != nil && err != sql.ErrNoRows {
 		return nil, fmt.Errorf("get message body: %w", err)
 	}
@@ -159,7 +159,7 @@ func (s *Store) GetMessage(id int64) (*APIMessage, error) {
 	}
 
 	// Get attachments
-	attRows, err := s.db.Query("SELECT filename, mime_type, size FROM attachments WHERE message_id = ?", id)
+	attRows, err := s.query("SELECT filename, mime_type, size FROM attachments WHERE message_id = ?", id)
 	if err == nil {
 		defer func() { _ = attRows.Close() }()
 		for attRows.Next() {
@@ -198,7 +198,7 @@ func (s *Store) SearchMessages(query string, offset, limit int) ([]APIMessage, i
 		LIMIT ? OFFSET ?
 	`, ftsJoin, ftsWhere, ftsOrder)
 
-	rows, err := s.db.Query(ftsQuery, query, limit, offset)
+	rows, err := s.query(ftsQuery, query, limit, offset)
 	if err != nil {
 		// FTS might not be available, fall back to LIKE search
 		return s.searchMessagesLike(query, offset, limit)
@@ -222,7 +222,7 @@ func (s *Store) SearchMessages(query string, offset, limit int) ([]APIMessage, i
 		%s
 		WHERE %s AND m.deleted_from_source_at IS NULL
 	`, ftsJoin, ftsWhere)
-	if err := s.db.QueryRow(countQuery, query).Scan(&total); err != nil {
+	if err := s.queryRow(countQuery, query).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("count FTS results: %w", err)
 	}
 
@@ -365,7 +365,7 @@ func (s *Store) SearchMessagesQuery(
 	`, ftsJoin, whereClause)
 
 	var total int64
-	if err := s.db.QueryRow(countSQL, args...).Scan(&total); err != nil {
+	if err := s.queryRow(countSQL, args...).Scan(&total); err != nil {
 		if ftsJoin != "" {
 			return s.searchMessagesQueryNoFTS(q, offset, limit)
 		}
@@ -400,7 +400,7 @@ func (s *Store) SearchMessagesQuery(
 	resultArgs := make([]interface{}, len(args))
 	copy(resultArgs, args)
 	resultArgs = append(resultArgs, limit, offset)
-	rows, err := s.db.Query(searchSQL, resultArgs...)
+	rows, err := s.query(searchSQL, resultArgs...)
 	if err != nil {
 		// FTS5 not available -- fall back if we used it.
 		if ftsJoin != "" {
@@ -462,7 +462,7 @@ func (s *Store) searchMessagesLike(query string, offset, limit int) ([]APIMessag
 		AND (subject LIKE ? ESCAPE '\' OR snippet LIKE ? ESCAPE '\')
 	`
 	var total int64
-	if err := s.db.QueryRow(countQuery, likePattern, likePattern).Scan(&total); err != nil {
+	if err := s.queryRow(countQuery, likePattern, likePattern).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("count search results: %w", err)
 	}
 
@@ -485,7 +485,7 @@ func (s *Store) searchMessagesLike(query string, offset, limit int) ([]APIMessag
 		LIMIT ? OFFSET ?
 	`
 
-	rows, err := s.db.Query(searchQuery, likePattern, likePattern, limit, offset)
+	rows, err := s.query(searchQuery, likePattern, likePattern, limit, offset)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -605,7 +605,7 @@ func (s *Store) batchGetRecipients(messageIDs []int64, recipientType string) (ma
 		WHERE mr.message_id IN (%s) AND mr.recipient_type = ?
 	`, strings.Join(placeholders, ","))
 
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("batch get recipients: %w", err)
 	}
@@ -648,7 +648,7 @@ func (s *Store) batchGetLabels(messageIDs []int64) (map[int64][]string, error) {
 		WHERE ml.message_id IN (%s)
 	`, strings.Join(placeholders, ","))
 
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("batch get labels: %w", err)
 	}
@@ -678,7 +678,7 @@ func (s *Store) getRecipients(messageID int64, recipientType string) ([]string, 
 		JOIN participants p ON p.id = mr.participant_id
 		WHERE mr.message_id = ? AND mr.recipient_type = ?
 	`
-	rows, err := s.db.Query(query, messageID, recipientType)
+	rows, err := s.query(query, messageID, recipientType)
 	if err != nil {
 		return nil, fmt.Errorf("get recipients: %w", err)
 	}
@@ -707,7 +707,7 @@ func (s *Store) getLabels(messageID int64) ([]string, error) {
 		JOIN labels l ON l.id = ml.label_id
 		WHERE ml.message_id = ?
 	`
-	rows, err := s.db.Query(query, messageID)
+	rows, err := s.query(query, messageID)
 	if err != nil {
 		return nil, fmt.Errorf("get labels: %w", err)
 	}
