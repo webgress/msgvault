@@ -185,6 +185,18 @@ func (d *PostgreSQLDialect) LegacyColumnMigrations() []ColumnMigration {
 // CheckpointWAL is a no-op for PostgreSQL (no WAL checkpoint needed).
 func (d *PostgreSQLDialect) CheckpointWAL(db *sql.DB) error { return nil }
 
+// DatabaseSize queries pg_database_size() for the current database.
+// Returns 0 if the query fails (a missing privilege or inaccessible
+// pg_database_size shouldn't break GetStats).
+func (d *PostgreSQLDialect) DatabaseSize(db *sql.DB, dbPath string) (int64, error) {
+	var size int64
+	err := db.QueryRow("SELECT pg_database_size(current_database())").Scan(&size)
+	if err != nil {
+		return 0, nil
+	}
+	return size, nil
+}
+
 // SchemaStaleCheck returns the SQL to check whether migrations are needed.
 // PostgreSQL uses information_schema instead of pragma_table_info.
 func (d *PostgreSQLDialect) SchemaStaleCheck() string {

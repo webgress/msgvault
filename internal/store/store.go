@@ -531,9 +531,10 @@ func (s *Store) GetStats() (*Stats, error) {
 		}
 	}
 
-	// Get database file size
-	if info, err := os.Stat(s.dbPath); err == nil {
-		stats.DatabaseSize = info.Size()
+	// Get database size via the dialect (file size for SQLite,
+	// pg_database_size() for PostgreSQL).
+	if size, err := s.dialect.DatabaseSize(s.db, s.dbPath); err == nil {
+		stats.DatabaseSize = size
 	}
 
 	return stats, nil

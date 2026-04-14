@@ -105,6 +105,12 @@ type Dialect interface {
 	// CheckpointWAL checkpoints the WAL (SQLite) or is a no-op (PostgreSQL).
 	CheckpointWAL(db *sql.DB) error
 
+	// DatabaseSize returns the on-disk size of the database in bytes.
+	// For SQLite, this is the file size at dbPath (or 0 if dbPath isn't a file).
+	// For PostgreSQL, this queries pg_database_size().
+	// Returns 0 if the size cannot be determined; an error only for genuine failures.
+	DatabaseSize(db *sql.DB, dbPath string) (int64, error)
+
 	// Schema migration
 
 	// SchemaStaleCheck returns the SQL to check whether migrations are needed.
