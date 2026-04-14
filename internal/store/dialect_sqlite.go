@@ -30,10 +30,12 @@ func (d *SQLiteDialect) InsertOrIgnoreSuffix() string { return "" }
 func (d *SQLiteDialect) UpdateOrIgnore(sql string) string { return sql }
 
 // FTSUpsertSQL returns the SQL to upsert an FTS5 row.
-// Parameters: messageID(1), messageID(2), subject(3), bodyText(4), fromAddr(5), toAddrs(6), ccAddrs(7)
+// Parameters (6): messageID, subject, bodyText, fromAddr, toAddrs, ccAddrs.
+// Uses SQLite's numbered placeholders (?1) so messageID can serve as both
+// rowid and message_id without passing it twice from Go.
 func (d *SQLiteDialect) FTSUpsertSQL() string {
 	return `INSERT OR REPLACE INTO messages_fts(rowid, message_id, subject, body, from_addr, to_addr, cc_addr)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`
+		VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6)`
 }
 
 // FTSSearchClause returns SQL fragments for FTS5 full-text search.

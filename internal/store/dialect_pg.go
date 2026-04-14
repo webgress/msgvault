@@ -71,18 +71,17 @@ func (d *PostgreSQLDialect) UpdateOrIgnore(sql string) string {
 }
 
 // FTSUpsertSQL returns the SQL to update the tsvector column on messages.
-// Parameters: $1=subject, $2=messageID (for rowid compat), $3=subject, $4=bodyText,
-// $5=fromAddr, $6=toAddrs, $7=ccAddrs
-// Note: For compatibility with the SQLite call convention (which passes messageID
-// as both params 1 and 2), param $1 is the messageID and $2 is also messageID.
-// We use $3-$7 for the text fields and $1 for the WHERE clause.
+// Parameters in order (6): messageID, subject, bodyText, fromAddr, toAddrs, ccAddrs.
+// Uses numbered placeholders so the same messageID can serve the WHERE clause
+// while the text fields map to their logical positions. Rebind is idempotent
+// over $N placeholders, so no pre-rebind is required.
 func (d *PostgreSQLDialect) FTSUpsertSQL() string {
 	return `UPDATE messages SET search_fts =
-		setweight(to_tsvector('simple', COALESCE($3, '')), 'A') ||
-		setweight(to_tsvector('simple', COALESCE($5, '')), 'B') ||
-		to_tsvector('simple', COALESCE($4, '')) ||
-		to_tsvector('simple', COALESCE($6, '')) ||
-		to_tsvector('simple', COALESCE($7, ''))
+		setweight(to_tsvector('simple', COALESCE($2, '')), 'A') ||
+		setweight(to_tsvector('simple', COALESCE($4, '')), 'B') ||
+		to_tsvector('simple', COALESCE($3, '')) ||
+		to_tsvector('simple', COALESCE($5, '')) ||
+		to_tsvector('simple', COALESCE($6, ''))
 	WHERE id = $1`
 }
 
@@ -103,11 +102,16 @@ func (d *PostgreSQLDialect) FTSDeleteSQL() string {
 }
 
 // FTSBackfillBatchSQL returns the SQL to populate tsvector for a range of message IDs.
-// Parameters: $1=fromID, $2=toID
+// Uses a scalar subquery for the body text so bodyless messages still get indexed
+// (parallel to SQLite's LEFT JOIN semantics).
+// Parameters: ?=fromID, ?=toID (rebound to $1, $2 on execution).
 func (d *PostgreSQLDialect) FTSBackfillBatchSQL() string {
 	return `UPDATE messages m SET search_fts =
 		setweight(to_tsvector('simple', COALESCE(m.subject, '')), 'A') ||
-		to_tsvector('simple', COALESCE(mb.body_text, '')) ||
+		to_tsvector('simple', COALESCE(
+			(SELECT mb.body_text FROM message_bodies mb WHERE mb.message_id = m.id),
+			''
+		)) ||
 		setweight(to_tsvector('simple', COALESCE(
 			CASE WHEN m.message_type != 'email' AND m.message_type IS NOT NULL AND m.message_type != ''
 			     THEN (SELECT COALESCE(p.phone_number, p.email_address) FROM participants p WHERE p.id = m.sender_id)
@@ -117,8 +121,7 @@ func (d *PostgreSQLDialect) FTSBackfillBatchSQL() string {
 		)), 'B') ||
 		to_tsvector('simple', COALESCE((SELECT STRING_AGG(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'to'), '')) ||
 		to_tsvector('simple', COALESCE((SELECT STRING_AGG(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'cc'), ''))
-	FROM message_bodies mb
-	WHERE mb.message_id = m.id AND m.id >= $1 AND m.id < $2`
+	WHERE m.id >= ? AND m.id < ?`
 }
 
 // FTSAvailable reports whether tsvector search is available.
@@ -159,11 +162,11 @@ func (d *PostgreSQLDialect) SchemaFTS() string {
 	return ""
 }
 
-// InitConn performs PostgreSQL-specific connection initialization.
-func (d *PostgreSQLDialect) InitConn(db *sql.DB) error {
-	_, err := db.Exec("SET statement_timeout = '30s'")
-	return err
-}
+// InitConn is a no-op for PostgreSQL. Connection-scoped settings like
+// statement_timeout are applied via libpq connection options in the DSN
+// (see applyPgDefaults in store.go) so they propagate to every pool
+// connection, not just the one InitConn happens to receive.
+func (d *PostgreSQLDialect) InitConn(db *sql.DB) error { return nil }
 
 // SchemaFiles returns the PostgreSQL-native schema file.
 // Does not share schema.sql — that file uses SQLite-specific types

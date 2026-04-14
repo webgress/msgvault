@@ -949,8 +949,10 @@ func (s *Store) UpsertFTS(messageID int64, subject, bodyText, fromAddr, toAddrs,
 	if !s.fts5Available {
 		return nil
 	}
+	// 6 args, consistent order across dialects. The dialect SQL references
+	// them by position (SQLite uses ?1 to reuse messageID for rowid).
 	_, err := s.exec(s.dialect.FTSUpsertSQL(),
-		messageID, messageID, subject, bodyText, fromAddr, toAddrs, ccAddrs)
+		messageID, subject, bodyText, fromAddr, toAddrs, ccAddrs)
 	return err
 }
 
