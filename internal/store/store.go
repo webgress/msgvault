@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -116,19 +117,14 @@ func openSQLite(dbPath string) (*Store, error) {
 	}, nil
 }
 
-// pgOptionsParam builds a libpq "options" parameter value from -c settings.
-// These apply to every connection the pool opens (unlike SET, which only
-// affects the one connection that runs it).
-func pgOptionsParam(settings map[string]string) string {
-	parts := make([]string, 0, len(settings))
-	for k, v := range settings {
-		parts = append(parts, "-c "+k+"="+v)
-	}
-	return strings.Join(parts, " ")
-}
-
 // applyPgDefaults augments a postgres:// URL with per-connection defaults
-// (statement_timeout, optional read-only mode). Returns the modified URL.
+// (statement_timeout, optional read-only mode) merged into the libpq
+// "options" parameter. These apply to every connection the pool opens
+// (unlike SET, which only affects the one connection that runs it).
+//
+// If the URL already has an "options" parameter, this merges with it
+// rather than clobbering it — preserving user-supplied libpq flags.
+// Other existing URL parameters (search_path, sslmode, etc.) are preserved.
 func applyPgDefaults(dbURL string, extras map[string]string) string {
 	settings := map[string]string{
 		"statement_timeout": "30000", // milliseconds
@@ -136,12 +132,55 @@ func applyPgDefaults(dbURL string, extras map[string]string) string {
 	for k, v := range extras {
 		settings[k] = v
 	}
-	sep := "?"
-	if strings.Contains(dbURL, "?") {
-		sep = "&"
+
+	u, err := url.Parse(dbURL)
+	if err != nil {
+		// Malformed URL — fall through with a best-effort append.
+		sep := "?"
+		if strings.Contains(dbURL, "?") {
+			sep = "&"
+		}
+		return dbURL + sep + "options=" + url.QueryEscape(buildPgOptionsValue("", settings))
 	}
-	// Preserve existing query-string params by appending.
-	return dbURL + sep + "options=" + url.QueryEscape(pgOptionsParam(settings))
+
+	q := u.Query()
+	existingOpts := q.Get("options")
+	q.Set("options", buildPgOptionsValue(existingOpts, settings))
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// buildPgOptionsValue merges an existing libpq options string with additional
+// -c key=value pairs, preserving existing -c tokens and ensuring each key
+// appears at most once (later wins on conflict).
+func buildPgOptionsValue(existing string, additions map[string]string) string {
+	// Parse existing -c tokens into a map.
+	merged := make(map[string]string)
+	tokens := strings.Fields(existing)
+	for i := 0; i < len(tokens); i++ {
+		if tokens[i] == "-c" && i+1 < len(tokens) {
+			kv := tokens[i+1]
+			if eq := strings.Index(kv, "="); eq >= 0 {
+				merged[kv[:eq]] = kv[eq+1:]
+			}
+			i++
+		}
+	}
+	// Add/override with additions.
+	for k, v := range additions {
+		merged[k] = v
+	}
+	// Re-emit with stable ordering for reproducibility.
+	keys := make([]string, 0, len(merged))
+	for k := range merged {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, "-c", k+"="+merged[k])
+	}
+	return strings.Join(parts, " ")
 }
 
 // openPostgres opens a PostgreSQL database using the given connection URL.

@@ -110,6 +110,15 @@ type Dialect interface {
 	// write JSON strings into JSONB columns.
 	JSONPlaceholder() string
 
+	// SanitizeFTSQuery takes a user-supplied search string and returns an
+	// argument safe to pass to FTSSearchExpression / FTSSearchClause. For
+	// SQLite FTS5 this escapes double quotes and strips wildcard operators;
+	// for PostgreSQL tsquery this strips tsquery operators (&, |, !, etc.)
+	// and appends :* for prefix matching.
+	// If the result would be empty after sanitization, returns "" — callers
+	// should treat that as a no-match condition.
+	SanitizeFTSQuery(query string) string
+
 	// Connection lifecycle
 
 	// InitConn performs driver-specific connection initialization.
