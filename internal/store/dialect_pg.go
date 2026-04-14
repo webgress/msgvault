@@ -88,11 +88,13 @@ func (d *PostgreSQLDialect) FTSUpsertSQL() string {
 
 // FTSSearchClause returns SQL fragments for tsvector full-text search.
 // PostgreSQL stores the tsvector on the messages table — no JOIN needed.
-func (d *PostgreSQLDialect) FTSSearchClause(paramIndex int) (join, where, orderBy string) {
-	p := fmt.Sprintf("$%d", paramIndex)
+// Uses ? placeholders; the caller must Rebind the assembled query. The
+// search term appears in both WHERE and ORDER BY (queryArgCount=2).
+func (d *PostgreSQLDialect) FTSSearchClause() (join, where, orderBy string, queryArgCount int) {
 	return "",
-		fmt.Sprintf("m.search_fts @@ plainto_tsquery('simple', %s)", p),
-		fmt.Sprintf("ts_rank(m.search_fts, plainto_tsquery('simple', %s)) DESC", p)
+		"m.search_fts @@ plainto_tsquery('simple', ?)",
+		"ts_rank(m.search_fts, plainto_tsquery('simple', ?)) DESC",
+		2
 }
 
 // FTSDeleteSQL returns the SQL to clear tsvector data for messages belonging to a source.

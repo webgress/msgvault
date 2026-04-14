@@ -46,12 +46,22 @@ type Dialect interface {
 	// Parameters: messageID, subject, bodyText, fromAddr, toAddrs, ccAddrs
 	FTSUpsertSQL() string
 
-	// FTSSearchClause returns SQL fragments for full-text search.
-	// paramIndex is the placeholder number for the search query parameter (1-based).
-	// Returns: join clause, where clause, order-by clause.
-	// For SQLite: uses messages_fts virtual table with JOIN/MATCH/rank.
-	// For PostgreSQL: uses tsvector column with @@/ts_rank (no extra join needed).
-	FTSSearchClause(paramIndex int) (join, where, orderBy string)
+	// FTSSearchClause returns SQL fragments for full-text search using ?
+	// placeholders consistently. The caller passes the search query string as
+	// an argument queryArgCount times — once if it appears only in WHERE,
+	// twice if it also appears in ORDER BY (as with PostgreSQL's ts_rank).
+	// The full query string (including the returned fragments) must be
+	// rebound via Dialect.Rebind() before execution so the ? placeholders
+	// become $N on PostgreSQL.
+	//
+	// Returns: join clause, where clause, order-by clause, number of times
+	// the search query must appear in args.
+	//
+	// SQLite: uses messages_fts virtual table with JOIN/MATCH/rank; the
+	// search term appears only in WHERE (queryArgCount=1).
+	// PostgreSQL: uses tsvector column with @@/ts_rank (no JOIN needed); the
+	// search term appears in both WHERE and ORDER BY (queryArgCount=2).
+	FTSSearchClause() (join, where, orderBy string, queryArgCount int)
 
 	// FTSDeleteSQL returns the SQL to remove FTS entries for messages belonging to
 	// a given source. Takes one parameter: source_id.

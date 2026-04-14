@@ -37,11 +37,13 @@ func (d *SQLiteDialect) FTSUpsertSQL() string {
 }
 
 // FTSSearchClause returns SQL fragments for FTS5 full-text search.
-// The paramIndex argument is ignored for SQLite (always uses ? placeholder).
-func (d *SQLiteDialect) FTSSearchClause(paramIndex int) (join, where, orderBy string) {
+// The search term appears only in the WHERE clause (queryArgCount=1).
+// The MATCH ordering uses the built-in "rank" pseudo-column (no parameter).
+func (d *SQLiteDialect) FTSSearchClause() (join, where, orderBy string, queryArgCount int) {
 	return "JOIN messages_fts fts ON fts.rowid = m.id",
 		"messages_fts MATCH ?",
-		"rank"
+		"rank",
+		1
 }
 
 // FTSDeleteSQL returns the SQL to delete a message's FTS5 entry.
