@@ -428,8 +428,14 @@ func (e *SQLiteEngine) TextSearch(
 		limit = 50
 	}
 
+	// Sanitize user input so dialect metacharacters don't cause syntax errors.
+	ftsArg := e.dialect.SanitizeFTSQuery(query)
+	if ftsArg == "" {
+		return nil, nil
+	}
+
 	// Use the dialect's FTS expression. SQLite: messages_fts MATCH.
-	// PostgreSQL: search_fts @@ plainto_tsquery. The join clause is also
+	// PostgreSQL: search_fts @@ to_tsquery. The join clause is also
 	// dialect-supplied (SQLite needs messages_fts; PG has the column inline).
 	ftsJoin := e.dialect.FTSJoin()
 	ftsWhere := e.dialect.FTSSearchExpression()
@@ -447,7 +453,7 @@ func (e *SQLiteEngine) TextSearch(
 			COALESCE(p.phone_number, '') AS from_phone,
 			m.sent_at,
 			COALESCE(m.size_estimate, 0) AS size_estimate,
-			COALESCE(m.has_attachments, 0) AS has_attachments,
+			COALESCE(m.has_attachments, FALSE) AS has_attachments,
 			0 AS attachment_count,
 			m.deleted_from_source_at,
 			COALESCE(m.message_type, '') AS message_type,
@@ -462,7 +468,7 @@ func (e *SQLiteEngine) TextSearch(
 		LIMIT ? OFFSET ?
 	`, ftsJoin, ftsWhere))
 
-	rows, err := e.queryContext(ctx, sqlQuery, query, limit, offset)
+	rows, err := e.queryContext(ctx, sqlQuery, ftsArg, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("text search: %w", err)
 	}
