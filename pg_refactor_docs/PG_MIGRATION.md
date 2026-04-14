@@ -249,16 +249,31 @@ wrapper. This is deliberate:
   the destination rolls back and you start over from scratch. For
   multi-hour runs, consider snapshotting the destination tablespace
   (PG) or copying the in-progress `.db` file (SQLite) before retrying.
+- **FTS rebuild is not ctx-cancellable.** The post-copy `BackfillFTS`
+  runs to completion even if the calling context is cancelled (the
+  underlying API does not take a context). On a multi-hour archive
+  this can leave Ctrl-C feeling unresponsive for tens of seconds per
+  5,000-message batch. Pass `--skip-fts-rebuild` for large migrations
+  and trigger the rebuild separately by launching the TUI (which
+  auto-detects and backfills FTS).
 - **Attachments are not walked.** The migration command does not
   inspect the attachments directory. If a `message_raw` row references
   a content hash whose file is missing on the destination host, the
   database copy still succeeds — the file-level check is a separate
   concern (see the `verify` command).
 - **Schema version mismatch.** Both sides must be on the same msgvault
-  schema version. If you built the source with an older binary, run
-  `init-db` on the source first to apply any pending SQLite
-  `LegacyColumnMigrations`. The PG schema is always complete (no
-  `ADD COLUMN` migrations on that side).
+  schema version. A pre-flight check runs `SELECT … LIMIT 0` against
+  every source table before the copy; if a column is missing, Migrate
+  fails fast with a hint to run `init-db` against the source. If you
+  built the source with an older binary, run `init-db` on the source
+  first to apply any pending SQLite `LegacyColumnMigrations`. The PG
+  schema is always complete (no `ADD COLUMN` migrations on that side).
+- **Large-blob memory pressure.** `message_raw.raw_data` can hold
+  multi-MB MIME blobs per row. Tables with a bytes column are batched
+  at 10 rows per INSERT (not the default 200) to keep peak memory
+  bounded. This is an order-of-magnitude improvement but still means
+  ~10 × avg-raw-size of transient memory; plan for it on hosts with
+  very large average message sizes.
 
 ## When to use `pg_dump` or `sqlite3 .dump` instead
 

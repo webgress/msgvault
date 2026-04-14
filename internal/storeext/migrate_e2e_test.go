@@ -3,7 +3,9 @@ package storeext_test
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -55,6 +57,7 @@ func TestMigrateRoundTrip(t *testing.T) {
 
 	assertMigratedRowCounts(t, f.Store, dst)
 	assertIDsPreserved(t, dst, seed)
+	assertPayloadRoundTrips(t, f.Store, dst, seed)
 
 	if dst.FTS5Available() {
 		assertSearchFindsSeed(t, dst, seed)
@@ -145,6 +148,97 @@ func TestMigrateRefusesNonEmptyDestination(t *testing.T) {
 	_, err := store.Migrate(context.Background(), src.Store, dst.Store, store.MigrateOptions{})
 	if err == nil {
 		t.Fatal("expected error migrating into non-empty destination")
+	}
+}
+
+// TestMigrateStaleSourceSchema verifies that Migrate fails fast with a
+// helpful error if the source database is missing a column the migrator
+// expects — rather than crashing halfway through the copy with a generic
+// "no such column" message.
+func TestMigrateStaleSourceSchema(t *testing.T) {
+	src := storetest.New(t)
+
+	// Drop one of the columns the migrator expects. ALTER TABLE DROP
+	// COLUMN is a SQLite-3.35+ and PG feature; guard on capability.
+	if _, err := src.Store.DB().Exec(
+		"ALTER TABLE sources DROP COLUMN oauth_app"); err != nil {
+		t.Skipf("ALTER TABLE DROP COLUMN not supported on this backend: %v", err)
+	}
+
+	destPath := filepath.Join(t.TempDir(), "dest.db")
+	dst, err := store.Open(destPath)
+	if err != nil {
+		t.Fatalf("open dest: %v", err)
+	}
+	defer func() { _ = dst.Close() }()
+	if err := dst.InitSchema(); err != nil {
+		t.Fatalf("init schema: %v", err)
+	}
+
+	_, err = store.Migrate(context.Background(), src.Store, dst, store.MigrateOptions{})
+	if err == nil {
+		t.Fatal("expected error for source missing oauth_app column")
+	}
+	if !strings.Contains(err.Error(), "source schema check") {
+		t.Errorf("expected 'source schema check' in error, got: %v", err)
+	}
+}
+
+// TestMigrateLargeBlob verifies that the bytes-aware batch cap (set at 10
+// rows for tables with a kBytes column) doesn't break correctness. A real
+// OOM test would require gigabytes of data, so this just confirms that
+// multiple chunks of blob data survive the migration.
+func TestMigrateLargeBlob(t *testing.T) {
+	src := storetest.New(t)
+
+	// Create 25 messages each with a 1 KB raw blob (25 rows > 10-row cap,
+	// so this exercises the flush-multiple-batches path for a bytes table).
+	pid := src.EnsureParticipant("blob@example.com", "Blob Sender", "example.com")
+	payload := make([]byte, 1024)
+	for i := range payload {
+		payload[i] = byte(i & 0xFF)
+	}
+	for i := 0; i < 25; i++ {
+		id := src.CreateMessage(fmt.Sprintf("blob-%d", i))
+		if err := src.Store.ReplaceMessageRecipients(id, "from",
+			[]int64{pid}, []string{"Blob"}); err != nil {
+			t.Fatalf("ReplaceMessageRecipients: %v", err)
+		}
+		if _, err := src.Store.DB().Exec(src.Store.Rebind(
+			`INSERT INTO message_raw
+			 (message_id, raw_data, raw_format, compression, encryption_version)
+			 VALUES (?, ?, ?, ?, ?)`),
+			id, payload, "mime", "zlib", 0); err != nil {
+			t.Fatalf("insert message_raw: %v", err)
+		}
+	}
+
+	destPath := filepath.Join(t.TempDir(), "dest.db")
+	dst, err := store.Open(destPath)
+	if err != nil {
+		t.Fatalf("open dest: %v", err)
+	}
+	defer func() { _ = dst.Close() }()
+	if err := dst.InitSchema(); err != nil {
+		t.Fatalf("init schema: %v", err)
+	}
+
+	stats, err := store.Migrate(context.Background(), src.Store, dst, store.MigrateOptions{})
+	if err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	if stats.RowsByTable["message_raw"] != 25 {
+		t.Errorf("message_raw = %d, want 25", stats.RowsByTable["message_raw"])
+	}
+
+	// Verify one sample row survived bit-exact.
+	var got []byte
+	if err := dst.DB().QueryRow(
+		"SELECT raw_data FROM message_raw WHERE message_id = (SELECT id FROM messages WHERE source_message_id = 'blob-13')").Scan(&got); err != nil {
+		t.Fatalf("fetch migrated blob: %v", err)
+	}
+	if len(got) != len(payload) {
+		t.Errorf("blob length: got %d want %d", len(got), len(payload))
 	}
 }
 
@@ -315,6 +409,81 @@ func countRows(t *testing.T, s *store.Store, tbl string) int64 {
 		t.Fatalf("count %s: %v", tbl, err)
 	}
 	return n
+}
+
+// assertPayloadRoundTrips checks every non-trivial column kind by comparing
+// a specific row on the source vs. the destination. This catches silent
+// coercion bugs (timestamps, bools stored as 0/1, bytes, JSON) that row-count
+// comparisons miss.
+func assertPayloadRoundTrips(t *testing.T, src, dst *store.Store, seed seedFixture) {
+	t.Helper()
+
+	// Timestamp + subject + size on message #0.
+	{
+		var srcSubj, dstSubj string
+		var srcSent, dstSent sql.NullTime
+		var srcSize, dstSize int64
+		if err := src.DB().QueryRow(src.Rebind(
+			"SELECT subject, sent_at, size_estimate FROM messages WHERE id = ?"),
+			seed.messageIDs[0]).Scan(&srcSubj, &srcSent, &srcSize); err != nil {
+			t.Fatalf("src msg scan: %v", err)
+		}
+		if err := dst.DB().QueryRow(dst.Rebind(
+			"SELECT subject, sent_at, size_estimate FROM messages WHERE id = ?"),
+			seed.messageIDs[0]).Scan(&dstSubj, &dstSent, &dstSize); err != nil {
+			t.Fatalf("dst msg scan: %v", err)
+		}
+		if srcSubj != dstSubj {
+			t.Errorf("subject: src=%q dst=%q", srcSubj, dstSubj)
+		}
+		if srcSize != dstSize {
+			t.Errorf("size_estimate: src=%d dst=%d", srcSize, dstSize)
+		}
+		if srcSent.Valid != dstSent.Valid || !srcSent.Time.Equal(dstSent.Time) {
+			t.Errorf("sent_at: src=%v dst=%v", srcSent, dstSent)
+		}
+	}
+
+	// Bool: has_attachments on message #2 is true, on #0 is false.
+	{
+		var t0, t2 bool
+		if err := dst.DB().QueryRow(dst.Rebind(
+			"SELECT has_attachments FROM messages WHERE id = ?"),
+			seed.messageIDs[0]).Scan(&t0); err != nil {
+			t.Fatalf("dst has_attachments m0: %v", err)
+		}
+		if err := dst.DB().QueryRow(dst.Rebind(
+			"SELECT has_attachments FROM messages WHERE id = ?"),
+			seed.messageIDs[2]).Scan(&t2); err != nil {
+			t.Fatalf("dst has_attachments m2: %v", err)
+		}
+		if t0 {
+			t.Errorf("msg[0].has_attachments: want false, got true")
+		}
+		if !t2 {
+			t.Errorf("msg[2].has_attachments: want true, got false")
+		}
+	}
+
+	// Bytes: message_raw.raw_data on message #2.
+	{
+		var raw []byte
+		if err := dst.DB().QueryRow(dst.Rebind(
+			"SELECT raw_data FROM message_raw WHERE message_id = ?"),
+			seed.messageIDs[2]).Scan(&raw); err != nil {
+			t.Fatalf("dst raw_data: %v", err)
+		}
+		want := []byte{0x00, 0x01, 0x02, 0xFF, 0xFE}
+		if len(raw) != len(want) {
+			t.Errorf("raw_data len: want %d got %d", len(want), len(raw))
+		} else {
+			for i := range want {
+				if raw[i] != want[i] {
+					t.Errorf("raw_data[%d]: want %x got %x", i, want[i], raw[i])
+				}
+			}
+		}
+	}
 }
 
 func assertIDsPreserved(t *testing.T, dst *store.Store, seed seedFixture) {

@@ -67,6 +67,10 @@ func Migrate(ctx context.Context, src, dst *Store, opts MigrateOptions) (*Migrat
 		}
 	}
 
+	if err := assertSourceSchemaCurrent(ctx, src); err != nil {
+		return nil, err
+	}
+
 	stats := &MigrateStats{RowsByTable: map[string]int64{}}
 	start := time.Now()
 
@@ -136,6 +140,31 @@ func assertEmptyDestination(dst *Store) error {
 	return nil
 }
 
+// assertSourceSchemaCurrent runs a single-row SELECT against each source
+// table to verify every column the migrator expects is present. Catches
+// stale-schema databases (populated by an older msgvault that predates
+// a column we now copy) before we start the long-running copy and emit a
+// generic "no such column" error halfway through.
+//
+// LIMIT 0 ensures the query costs nothing beyond plan parsing.
+func assertSourceSchemaCurrent(ctx context.Context, src *Store) error {
+	for _, spec := range migrationTables {
+		q := fmt.Sprintf("SELECT %s FROM %s LIMIT 0",
+			strings.Join(spec.Columns, ", "), spec.Name)
+		rows, err := src.db.QueryContext(ctx, q)
+		if err != nil {
+			return fmt.Errorf(
+				"source schema check for %s: %w — "+
+					"the source database looks out of date; "+
+					"run 'msgvault init-db' against it first",
+				spec.Name, err,
+			)
+		}
+		_ = rows.Close()
+	}
+	return nil
+}
+
 // copyTable streams rows from src to dst (inside tx) in FK-safe order.
 // Returns the number of rows copied. An empty table is not an error.
 func copyTable(
@@ -148,6 +177,13 @@ func copyTable(
 	maxBatchParams := 900
 	if cap := maxBatchParams / len(spec.Columns); cap < batchSize {
 		batchSize = cap
+	}
+	// Tables with a bytes column (message_raw.raw_data) can hold multi-MB
+	// blobs per row. A full-size batch would pin gigabytes in memory and
+	// in the destination's write buffer. Cap these tables at 10 rows per
+	// INSERT — roundtrips cost less than OOM crashes.
+	if hasBytesColumn(spec.Kinds) && batchSize > 10 {
+		batchSize = 10
 	}
 	if batchSize < 1 {
 		batchSize = 1
@@ -272,6 +308,17 @@ func scanRow(rows *sql.Rows, kinds []colKind) ([]any, error) {
 		}
 	}
 	return args, nil
+}
+
+// hasBytesColumn reports whether any column in the spec is kBytes.
+// Used to cap batch size for tables that may hold multi-MB blobs per row.
+func hasBytesColumn(kinds []colKind) bool {
+	for _, k := range kinds {
+		if k == kBytes {
+			return true
+		}
+	}
+	return false
 }
 
 // placeholdersFor returns per-column placeholder tokens. JSON columns get
