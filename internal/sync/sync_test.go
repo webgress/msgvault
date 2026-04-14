@@ -199,7 +199,7 @@ func TestStoreAttachment_ComputesHashWhenMissing(t *testing.T) {
 	}
 
 	var gotHash, storagePath string
-	if err := env.Store.DB().QueryRow(`SELECT content_hash, storage_path FROM attachments WHERE message_id = ?`, messageID).Scan(&gotHash, &storagePath); err != nil {
+	if err := env.Store.QueryRow(`SELECT content_hash, storage_path FROM attachments WHERE message_id = ?`, messageID).Scan(&gotHash, &storagePath); err != nil {
 		t.Fatalf("select attachment: %v", err)
 	}
 	if gotHash != wantHash {
@@ -256,7 +256,7 @@ func TestStoreAttachment_InvalidContentHash_ReturnsError(t *testing.T) {
 	}
 
 	var count int
-	if err := env.Store.DB().QueryRow(`SELECT COUNT(*) FROM attachments WHERE message_id = ?`, messageID).Scan(&count); err != nil {
+	if err := env.Store.QueryRow(`SELECT COUNT(*) FROM attachments WHERE message_id = ?`, messageID).Scan(&count); err != nil {
 		t.Fatalf("count attachments: %v", err)
 	}
 	if count != 0 {
@@ -1677,7 +1677,7 @@ func TestIMAPThreading(t *testing.T) {
 	// Verify conversation grouping: thread msgs share 1 conversation,
 	// standalone gets its own.
 	var convCount int
-	err := env.Store.DB().QueryRow(`SELECT COUNT(DISTINCT conversation_id) FROM messages`).Scan(&convCount)
+	err := env.Store.QueryRow(`SELECT COUNT(DISTINCT conversation_id) FROM messages`).Scan(&convCount)
 	if err != nil {
 		t.Fatalf("count conversations: %v", err)
 	}
@@ -1718,7 +1718,7 @@ func TestIMAPCrossSyncDedup(t *testing.T) {
 
 	// Only one message should exist in the database
 	var count int
-	err := env.Store.DB().QueryRow(
+	err := env.Store.QueryRow(
 		`SELECT COUNT(*) FROM messages`).Scan(&count)
 	if err != nil {
 		t.Fatalf("count messages: %v", err)
@@ -1730,7 +1730,7 @@ func TestIMAPCrossSyncDedup(t *testing.T) {
 	// The existing row's source_message_id should be updated to the
 	// new composite ID so future syncs don't re-download the message.
 	var srcMsgID string
-	err = env.Store.DB().QueryRow(
+	err = env.Store.QueryRow(
 		`SELECT source_message_id FROM messages LIMIT 1`,
 	).Scan(&srcMsgID)
 	if err != nil {
@@ -1762,7 +1762,7 @@ func TestIncrementalSyncLabelRemovedWithMissingRaw(t *testing.T) {
 	assertRawDataExists(t, env.Store, "msg1")
 
 	// Delete raw MIME data to simulate missing raw
-	_, err := env.Store.DB().Exec(`
+	_, err := env.Store.Exec(`
 		DELETE FROM message_raw WHERE message_id = (
 			SELECT id FROM messages WHERE source_message_id = 'msg1'
 		)`)

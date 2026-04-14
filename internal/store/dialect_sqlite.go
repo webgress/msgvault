@@ -136,6 +136,9 @@ func (d *SQLiteDialect) HasFTSTableSQL() string {
 	return `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='messages_fts'`
 }
 
+// JSONPlaceholder is a plain "?" for SQLite — JSON is stored as TEXT.
+func (d *SQLiteDialect) JSONPlaceholder() string { return "?" }
+
 // InitConn is a no-op for SQLite — PRAGMAs are set via DSN parameters.
 func (d *SQLiteDialect) InitConn(db *sql.DB) error { return nil }
 

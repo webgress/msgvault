@@ -222,7 +222,7 @@ func optsToFilterConditions(opts AggregateOptions, prefix string) ([]string, []i
 		args = append(args, opts.Before.Format("2006-01-02 15:04:05"))
 	}
 	if opts.WithAttachmentsOnly {
-		conditions = append(conditions, prefix+"has_attachments = 1")
+		conditions = append(conditions, prefix+"has_attachments")
 	}
 	if opts.HideDeletedFromSource {
 		conditions = append(conditions, prefix+"deleted_from_source_at IS NULL")
@@ -302,7 +302,7 @@ func buildFilterJoinsAndConditions(d Dialect, filter MessageFilter, tableAlias s
 	}
 
 	if filter.WithAttachmentsOnly {
-		conditions = append(conditions, prefix+"has_attachments = 1")
+		conditions = append(conditions, prefix+"has_attachments")
 	}
 	if filter.HideDeletedFromSource {
 		conditions = append(conditions, prefix+"deleted_from_source_at IS NULL")
@@ -809,7 +809,7 @@ func (e *SQLiteEngine) GetTotalStats(ctx context.Context, opts StatsOptions) (*T
 		args = append(args, *opts.SourceID)
 	}
 	if opts.WithAttachmentsOnly {
-		conditions = append(conditions, "m.has_attachments = 1")
+		conditions = append(conditions, "m.has_attachments")
 	}
 	if opts.HideDeletedFromSource {
 		conditions = append(conditions, "m.deleted_from_source_at IS NULL")
@@ -1157,7 +1157,7 @@ func (e *SQLiteEngine) buildSearchQueryParts(ctx context.Context, q *search.Quer
 
 	// Has attachment filter
 	if q.HasAttachment != nil && *q.HasAttachment {
-		conditions = append(conditions, "m.has_attachments = 1")
+		conditions = append(conditions, "m.has_attachments")
 	}
 
 	// Date range filters

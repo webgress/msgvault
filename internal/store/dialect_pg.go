@@ -187,6 +187,10 @@ func (d *PostgreSQLDialect) HasFTSTableSQL() string {
 		WHERE table_name = 'messages' AND column_name = 'search_fts'`
 }
 
+// JSONPlaceholder returns "?::jsonb" — PostgreSQL requires an explicit cast
+// when binding a text/string arg to a JSONB column.
+func (d *PostgreSQLDialect) JSONPlaceholder() string { return "?::jsonb" }
+
 // InitConn is a no-op for PostgreSQL. Connection-scoped settings like
 // statement_timeout are applied via libpq connection options in the DSN
 // (see applyPgDefaults in store.go) so they propagate to every pool

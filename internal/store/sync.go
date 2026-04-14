@@ -12,10 +12,9 @@ const (
 	SyncStatusFailed    = "failed"
 )
 
-// dbTimeLayouts lists formats used by SQLite/go-sqlite3 for timestamp storage.
-// This matches the full set from SQLiteTimestampFormats in mattn/go-sqlite3,
-// plus RFC3339/RFC3339Nano as fallbacks for maximum compatibility.
-// The order matters: more specific formats (with fractional seconds/timezones) come first.
+// dbTimeLayouts lists formats used by SQLite/go-sqlite3 and PostgreSQL/pgx
+// for timestamp storage. The order matters: more specific formats (with
+// fractional seconds/timezones) come first.
 var dbTimeLayouts = []string{
 	// Formats from mattn/go-sqlite3 SQLiteTimestampFormats
 	"2006-01-02 15:04:05.999999999-07:00", // space-separated with fractional seconds and TZ
@@ -27,9 +26,14 @@ var dbTimeLayouts = []string{
 	"2006-01-02 15:04",                    // space-separated without seconds
 	"2006-01-02T15:04",                    // T-separated without seconds
 	"2006-01-02",                          // date only
+	// PostgreSQL TIMESTAMPTZ text formats (rendered by pgx stdlib). These use
+	// a two-digit numeric offset without a colon, e.g. "+00" or "-0700".
+	"2006-01-02 15:04:05.999999999-07",    // with fractional seconds and ±HH offset
+	"2006-01-02 15:04:05-07",              // with ±HH offset
+	"2006-01-02 15:04:05.999999999Z07:00", // alt with colon offset
 	// Additional fallback formats
-	time.RFC3339,     // go-sqlite3 DATETIME column format (e.g., "2006-01-02T15:04:05Z")
-	time.RFC3339Nano, // RFC3339 with nanoseconds (e.g., "2006-01-02T15:04:05.999999999Z07:00")
+	time.RFC3339,     // e.g., "2006-01-02T15:04:05Z"
+	time.RFC3339Nano, // RFC3339 with nanoseconds
 }
 
 // scanner is satisfied by both *sql.Row and *sql.Rows.
@@ -379,9 +383,9 @@ func (s *Store) UpdateSourceDisplayName(sourceID int64, displayName string) erro
 func (s *Store) UpdateSourceSyncConfig(sourceID int64, configJSON string) error {
 	_, err := s.exec(fmt.Sprintf(`
 		UPDATE sources
-		SET sync_config = ?, updated_at = %s
+		SET sync_config = %s, updated_at = %s
 		WHERE id = ?
-	`, s.dialect.Now()), configJSON, sourceID)
+	`, s.dialect.JSONPlaceholder(), s.dialect.Now()), configJSON, sourceID)
 	return err
 }
 

@@ -161,12 +161,20 @@ func openPostgres(dbURL string) (*Store, error) {
 	db.SetMaxIdleConns(5)
 
 	dialect := &PostgreSQLDialect{}
-
-	return &Store{
+	s := &Store{
 		db:      newLoggedDB(db),
 		dbPath:  dbURL,
 		dialect: dialect,
-	}, nil
+	}
+
+	// Probe FTS availability. On PG, this checks whether the search_fts
+	// column exists on messages. If the schema hasn't been initialized yet,
+	// the probe returns false; InitSchema() will set fts5Available=true
+	// when the schema load completes.
+	ftsAvailable, _ := dialect.FTSAvailable(db)
+	s.fts5Available = ftsAvailable
+
+	return s, nil
 }
 
 // OpenReadOnly opens an existing database in read-only mode. Suitable for
@@ -520,7 +528,15 @@ func (s *Store) InitSchema() error {
 		}
 	}
 
-	// Try to load and execute FTS schema (optional — may not be available).
+	// Probe FTS availability after main schema load. Dialects that integrate
+	// FTS into the main schema (e.g., PostgreSQL's tsvector column) rely on
+	// this probe rather than on a separate FTS schema file.
+	if ftsAvailable, _ := s.dialect.FTSAvailable(s.db); ftsAvailable {
+		s.fts5Available = true
+	}
+
+	// Try to load and execute the separate FTS schema file (SQLite FTS5
+	// virtual table). Optional — FTS5 may not be compiled into the binary.
 	ftsFile := s.dialect.SchemaFTS()
 	if ftsFile != "" {
 		ftsSchema, err := schemaFS.ReadFile(ftsFile)
