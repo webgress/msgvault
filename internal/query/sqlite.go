@@ -12,9 +12,13 @@ import (
 	"github.com/wesm/msgvault/internal/search"
 )
 
-// SQLiteEngine implements Engine using direct SQLite queries.
+// SQLiteEngine implements Engine using direct SQL queries.
+// Despite its name, it is now dialect-agnostic and supports both SQLite
+// (default) and PostgreSQL via the dialect field. The name is retained
+// for compatibility with existing callers.
 type SQLiteEngine struct {
-	db *sql.DB
+	db      *sql.DB
+	dialect Dialect
 
 	// FTS availability cache - thread-safe with mutex.
 	// Only caches successful checks; errors cause retries on next call.
@@ -23,12 +27,20 @@ type SQLiteEngine struct {
 	ftsChecked bool
 }
 
-// NewSQLiteEngine creates a new SQLite-backed query engine.
+// NewSQLiteEngine creates a SQLite-backed query engine.
 func NewSQLiteEngine(db *sql.DB) *SQLiteEngine {
-	return &SQLiteEngine{db: db}
+	return &SQLiteEngine{db: db, dialect: SQLiteQueryDialect{}}
 }
 
-// hasFTSTable checks if the messages_fts table exists.
+// NewEngineWithDialect creates a query engine with an explicit dialect.
+// Use this to construct a PostgreSQL-backed engine:
+//
+//	engine := query.NewEngineWithDialect(db, query.PostgreSQLQueryDialect{})
+func NewEngineWithDialect(db *sql.DB, d Dialect) *SQLiteEngine {
+	return &SQLiteEngine{db: db, dialect: d}
+}
+
+// hasFTSTable checks if the FTS index is available for this dialect.
 // Result is cached after first successful check. Errors cause retries on next call.
 // Thread-safe via mutex.
 func (e *SQLiteEngine) hasFTSTable(ctx context.Context) bool {
@@ -41,10 +53,7 @@ func (e *SQLiteEngine) hasFTSTable(ctx context.Context) bool {
 	}
 
 	var count int
-	err := e.db.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM sqlite_master
-		WHERE type='table' AND name='messages_fts'
-	`).Scan(&count)
+	err := e.queryRowContext(ctx, e.dialect.HasFTSTableSQL()).Scan(&count)
 
 	if err != nil {
 		// On error (canceled context, temporary DB issue), return false
@@ -63,6 +72,16 @@ func (e *SQLiteEngine) Close() error {
 	return nil
 }
 
+// queryContext runs QueryContext with dialect-aware placeholder rebinding.
+func (e *SQLiteEngine) queryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+	return e.db.QueryContext(ctx, e.dialect.Rebind(query), args...)
+}
+
+// queryRowContext runs QueryRowContext with dialect-aware placeholder rebinding.
+func (e *SQLiteEngine) queryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row {
+	return e.db.QueryRowContext(ctx, e.dialect.Rebind(query), args...)
+}
+
 // escapeSQLiteLike escapes LIKE wildcard characters (%, _, \) with \.
 func escapeSQLiteLike(s string) string {
 	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
@@ -77,7 +96,7 @@ type aggDimension struct {
 }
 
 // aggDimensionForView returns the SQL dimension definition for a given ViewType.
-func aggDimensionForView(view ViewType, timeGranularity TimeGranularity) (aggDimension, error) {
+func aggDimensionForView(d Dialect, view ViewType, timeGranularity TimeGranularity) (aggDimension, error) {
 	switch view {
 	case ViewSenders:
 		return aggDimension{
@@ -122,17 +141,18 @@ func aggDimensionForView(view ViewType, timeGranularity TimeGranularity) (aggDim
 			whereExpr: "",
 		}, nil
 	case ViewTime:
-		var timeExpr string
+		var gran string
 		switch timeGranularity {
 		case TimeYear:
-			timeExpr = "strftime('%Y', m.sent_at)"
+			gran = "year"
 		case TimeMonth:
-			timeExpr = "strftime('%Y-%m', m.sent_at)"
+			gran = "month"
 		case TimeDay:
-			timeExpr = "strftime('%Y-%m-%d', m.sent_at)"
+			gran = "day"
 		default:
 			return aggDimension{}, fmt.Errorf("unsupported time granularity: %d", timeGranularity)
 		}
+		timeExpr := d.TimeTruncExpression("m.sent_at", gran)
 		return aggDimension{
 			keyExpr:   timeExpr,
 			joins:     "",
@@ -245,7 +265,7 @@ func sortClause(opts AggregateOptions) (string, error) {
 // buildFilterJoinsAndConditions builds JOIN and WHERE clauses from a MessageFilter.
 // Returns joinClauses (already joined by \n), conditions (slice), and args.
 // This is used for SubAggregate to apply drill-down filters before sub-grouping.
-func buildFilterJoinsAndConditions(filter MessageFilter, tableAlias string) (string, []string, []interface{}) {
+func buildFilterJoinsAndConditions(d Dialect, filter MessageFilter, tableAlias string) (string, []string, []interface{}) {
 	var joins []string
 	var conditions []string
 	var args []interface{}
@@ -428,17 +448,18 @@ func buildFilterJoinsAndConditions(filter MessageFilter, tableAlias string) (str
 			}
 		}
 
-		var timeExpr string
+		var gran string
 		switch granularity {
 		case TimeYear:
-			timeExpr = "strftime('%Y', " + prefix + "sent_at)"
+			gran = "year"
 		case TimeMonth:
-			timeExpr = "strftime('%Y-%m', " + prefix + "sent_at)"
+			gran = "month"
 		case TimeDay:
-			timeExpr = "strftime('%Y-%m-%d', " + prefix + "sent_at)"
+			gran = "day"
 		default:
-			timeExpr = "strftime('%Y-%m', " + prefix + "sent_at)"
+			gran = "month"
 		}
+		timeExpr := d.TimeTruncExpression(prefix+"sent_at", gran)
 		conditions = append(conditions, fmt.Sprintf("%s = ?", timeExpr))
 		args = append(args, filter.TimeRange.Period)
 	}
@@ -449,7 +470,7 @@ func buildFilterJoinsAndConditions(filter MessageFilter, tableAlias string) (str
 // SubAggregate performs aggregation on a filtered subset of messages.
 // This is used for sub-grouping after drill-down.
 func (e *SQLiteEngine) SubAggregate(ctx context.Context, filter MessageFilter, groupBy ViewType, opts AggregateOptions) ([]AggregateRow, error) {
-	filterJoins, filterConditions, args := buildFilterJoinsAndConditions(filter, "m")
+	filterJoins, filterConditions, args := buildFilterJoinsAndConditions(e.dialect, filter, "m")
 
 	// Add opts-based conditions
 	optsConds, optsArgs := optsToFilterConditions(opts, "m.")
@@ -532,7 +553,7 @@ func (e *SQLiteEngine) buildAggregateSearchParts(
 
 // executeAggregate is the shared implementation for Aggregate and SubAggregate.
 func (e *SQLiteEngine) executeAggregate(ctx context.Context, groupBy ViewType, opts AggregateOptions, filterJoins string, filterConditions []string, args []interface{}) ([]AggregateRow, error) {
-	dim, err := aggDimensionForView(groupBy, opts.TimeGranularity)
+	dim, err := aggDimensionForView(e.dialect, groupBy, opts.TimeGranularity)
 	if err != nil {
 		return nil, err
 	}
@@ -560,7 +581,7 @@ func (e *SQLiteEngine) executeAggregate(ctx context.Context, groupBy ViewType, o
 // executeAggregateQuery runs an aggregate query and returns the results.
 // Expects 6 columns: key, count, total_size, attachment_size, attachment_count, total_unique
 func (e *SQLiteEngine) executeAggregateQuery(ctx context.Context, query string, args []interface{}) ([]AggregateRow, error) {
-	rows, err := e.db.QueryContext(ctx, query, args...)
+	rows, err := e.queryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("aggregate query: %w", err)
 	}
@@ -584,7 +605,7 @@ func (e *SQLiteEngine) executeAggregateQuery(ctx context.Context, query string, 
 
 // ListMessages retrieves messages matching the filter.
 func (e *SQLiteEngine) ListMessages(ctx context.Context, filter MessageFilter) ([]MessageSummary, error) {
-	filterJoins, conditions, args := buildFilterJoinsAndConditions(filter, "m")
+	filterJoins, conditions, args := buildFilterJoinsAndConditions(e.dialect, filter, "m")
 
 	// Build ORDER BY with validation
 	var orderBy string
@@ -644,7 +665,7 @@ func (e *SQLiteEngine) ListMessages(ctx context.Context, filter MessageFilter) (
 
 	args = append(args, limit, filter.Pagination.Offset)
 
-	rows, err := e.db.QueryContext(ctx, query, args...)
+	rows, err := e.queryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list messages: %w", err)
 	}
@@ -724,7 +745,7 @@ func (e *SQLiteEngine) getMessageByQuery(ctx context.Context, whereClause string
 // GetAttachment retrieves attachment metadata by ID.
 func (e *SQLiteEngine) GetAttachment(ctx context.Context, id int64) (*AttachmentInfo, error) {
 	var att AttachmentInfo
-	err := e.db.QueryRowContext(ctx, `
+	err := e.queryRowContext(ctx, `
 		SELECT id, COALESCE(filename, ''), COALESCE(mime_type, ''), COALESCE(size, 0), COALESCE(content_hash, '')
 		FROM attachments
 		WHERE id = ?
@@ -740,7 +761,7 @@ func (e *SQLiteEngine) GetAttachment(ctx context.Context, id int64) (*Attachment
 
 // ListAccounts returns all source accounts.
 func (e *SQLiteEngine) ListAccounts(ctx context.Context) ([]AccountInfo, error) {
-	rows, err := e.db.QueryContext(ctx, `
+	rows, err := e.queryContext(ctx, `
 		SELECT id, source_type, identifier, COALESCE(display_name, '')
 		FROM sources
 		ORDER BY identifier
@@ -836,7 +857,7 @@ func (e *SQLiteEngine) GetTotalStats(ctx context.Context, opts StatsOptions) (*T
 		`, whereClause)
 	}
 
-	if err := e.db.QueryRowContext(ctx, msgQuery, args...).Scan(&stats.MessageCount, &stats.TotalSize); err != nil {
+	if err := e.queryRowContext(ctx, msgQuery, args...).Scan(&stats.MessageCount, &stats.TotalSize); err != nil {
 		return nil, fmt.Errorf("message stats: %w", err)
 	}
 
@@ -862,7 +883,7 @@ func (e *SQLiteEngine) GetTotalStats(ctx context.Context, opts StatsOptions) (*T
 		`, whereClause)
 	}
 
-	if err := e.db.QueryRowContext(ctx, attQuery, args...).Scan(&stats.AttachmentCount, &stats.AttachmentSize); err != nil {
+	if err := e.queryRowContext(ctx, attQuery, args...).Scan(&stats.AttachmentCount, &stats.AttachmentSize); err != nil {
 		return nil, fmt.Errorf("attachment stats: %w", err)
 	}
 
@@ -870,23 +891,23 @@ func (e *SQLiteEngine) GetTotalStats(ctx context.Context, opts StatsOptions) (*T
 	var labelQuery string
 	if opts.SourceID != nil {
 		labelQuery = "SELECT COUNT(*) FROM labels WHERE source_id = ?"
-		if err := e.db.QueryRowContext(ctx, labelQuery, *opts.SourceID).Scan(&stats.LabelCount); err != nil {
+		if err := e.queryRowContext(ctx, labelQuery, *opts.SourceID).Scan(&stats.LabelCount); err != nil {
 			return nil, fmt.Errorf("label count: %w", err)
 		}
 	} else {
 		labelQuery = "SELECT COUNT(*) FROM labels"
-		if err := e.db.QueryRowContext(ctx, labelQuery).Scan(&stats.LabelCount); err != nil {
+		if err := e.queryRowContext(ctx, labelQuery).Scan(&stats.LabelCount); err != nil {
 			return nil, fmt.Errorf("label count: %w", err)
 		}
 	}
 
 	// Account count - verify source exists when filtering by sourceID
 	if opts.SourceID != nil {
-		if err := e.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sources WHERE id = ?", *opts.SourceID).Scan(&stats.AccountCount); err != nil {
+		if err := e.queryRowContext(ctx, "SELECT COUNT(*) FROM sources WHERE id = ?", *opts.SourceID).Scan(&stats.AccountCount); err != nil {
 			return nil, fmt.Errorf("account count: %w", err)
 		}
 	} else {
-		if err := e.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sources").Scan(&stats.AccountCount); err != nil {
+		if err := e.queryRowContext(ctx, "SELECT COUNT(*) FROM sources").Scan(&stats.AccountCount); err != nil {
 			return nil, fmt.Errorf("account count: %w", err)
 		}
 	}
@@ -995,17 +1016,18 @@ func (e *SQLiteEngine) GetGmailIDsByFilter(ctx context.Context, filter MessageFi
 			}
 		}
 
-		var timeExpr string
+		var gran string
 		switch granularity {
 		case TimeYear:
-			timeExpr = "strftime('%Y', m.sent_at)"
+			gran = "year"
 		case TimeMonth:
-			timeExpr = "strftime('%Y-%m', m.sent_at)"
+			gran = "month"
 		case TimeDay:
-			timeExpr = "strftime('%Y-%m-%d', m.sent_at)"
+			gran = "day"
 		default:
-			timeExpr = "strftime('%Y-%m', m.sent_at)"
+			gran = "month"
 		}
+		timeExpr := e.dialect.TimeTruncExpression("m.sent_at", gran)
 		conditions = append(conditions, fmt.Sprintf("%s = ?", timeExpr))
 		args = append(args, filter.TimeRange.Period)
 	}
@@ -1025,7 +1047,7 @@ func (e *SQLiteEngine) GetGmailIDsByFilter(ctx context.Context, filter MessageFi
 		args = append(args, filter.Pagination.Limit)
 	}
 
-	rows, err := e.db.QueryContext(ctx, query, args...)
+	rows, err := e.queryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("get gmail ids: %w", err)
 	}
@@ -1158,23 +1180,18 @@ func (e *SQLiteEngine) buildSearchQueryParts(ctx context.Context, q *search.Quer
 		args = append(args, *q.SmallerThan)
 	}
 
-	// Full-text search: use FTS5 if available, fall back to LIKE
+	// Full-text search: use FTS if available, fall back to LIKE
 	if len(q.TextTerms) > 0 {
 		if e.hasFTSTable(ctx) {
-			// Use FTS5 for efficient full-text search.
-			// Prefix matching (*) enables partial word matches.
-			// Multiple terms are AND-ed: all must appear (in any column).
-			ftsJoin = "JOIN messages_fts fts ON fts.rowid = m.id"
-			ftsTerms := make([]string, len(q.TextTerms))
-			for i, term := range q.TextTerms {
-				// Quote all terms to prevent FTS5 special chars
-				// (-, :, (, ), etc.) from being parsed as query syntax.
-				term = strings.ReplaceAll(term, "\"", "\"\"")
-				term = strings.ReplaceAll(term, "*", "")
-				ftsTerms[i] = fmt.Sprintf("\"%s\"*", term)
+			// Use the dialect's FTS backend.
+			// SQLite: messages_fts MATCH "term1"* "term2"*
+			// PostgreSQL: search_fts @@ to_tsquery('simple', 'term1:* & term2:*')
+			ftsJoin = e.dialect.FTSJoin()
+			expr, arg := e.dialect.BuildFTSTerm(q.TextTerms)
+			conditions = append(conditions, expr)
+			if arg != "" {
+				args = append(args, arg)
 			}
-			conditions = append(conditions, "messages_fts MATCH ?")
-			args = append(args, strings.Join(ftsTerms, " "))
 		} else {
 			// Fall back to LIKE-based search on subject/snippet only
 			// Body text is in a separate table; use FTS for body search
@@ -1256,7 +1273,7 @@ func (e *SQLiteEngine) executeSearchQuery(ctx context.Context, conditions []stri
 
 	args = append(args, limit, offset)
 
-	rows, err := e.db.QueryContext(ctx, query, args...)
+	rows, err := e.queryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("search messages: %w", err)
 	}
@@ -1454,7 +1471,7 @@ func (e *SQLiteEngine) SearchFastCount(ctx context.Context, q *search.Query, fil
 	`, ftsJoin, strings.Join(joins, "\n"), whereClause)
 
 	var count int64
-	if err := e.db.QueryRowContext(ctx, query, args...).Scan(&count); err != nil {
+	if err := e.queryRowContext(ctx, query, args...).Scan(&count); err != nil {
 		return 0, fmt.Errorf("search fast count: %w", err)
 	}
 	return count, nil
