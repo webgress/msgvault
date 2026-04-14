@@ -103,6 +103,13 @@ type Dialect interface {
 	// Returns a single-row result: 1 if present, 0 if absent.
 	HasFTSTableSQL() string
 
+	// JSONPlaceholder returns the placeholder expression for a JSON-typed column.
+	// SQLite: "?" (JSON is stored as TEXT)
+	// PostgreSQL: "?::jsonb" (explicit cast required when the column type is JSONB)
+	// Callers substitute this for the bare "?" in UPDATE/INSERT statements that
+	// write JSON strings into JSONB columns.
+	JSONPlaceholder() string
+
 	// Connection lifecycle
 
 	// InitConn performs driver-specific connection initialization.

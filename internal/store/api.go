@@ -343,7 +343,7 @@ func (s *Store) SearchMessagesQuery(
 	// has:attachment
 	if q.HasAttachment != nil && *q.HasAttachment {
 		conditions = append(conditions,
-			"m.has_attachments = 1")
+			"m.has_attachments")
 	}
 
 	// larger: / smaller:
@@ -551,29 +551,15 @@ func scanMessageRows(rows *sql.Rows) ([]APIMessage, []int64, error) {
 	return messages, ids, nil
 }
 
-// parseSQLiteTime parses a datetime string from SQLite into time.Time.
-// Uses the same comprehensive format list as dbTimeLayouts in sync.go.
+// parseSQLiteTime parses a datetime string from SQLite or PostgreSQL into time.Time.
+// Delegates to parseDBTime (sync.go) which maintains the full format list.
+// Returns zero time for unrecognized formats.
 func parseSQLiteTime(s string) time.Time {
-	// Same formats as dbTimeLayouts - order matters: more specific first
-	layouts := []string{
-		"2006-01-02 15:04:05.999999999-07:00", // space-separated with fractional seconds and TZ
-		"2006-01-02T15:04:05.999999999-07:00", // T-separated with fractional seconds and TZ
-		"2006-01-02 15:04:05.999999999",       // space-separated with fractional seconds
-		"2006-01-02T15:04:05.999999999",       // T-separated with fractional seconds
-		"2006-01-02 15:04:05",                 // SQLite datetime('now') format
-		"2006-01-02T15:04:05",                 // T-separated basic
-		"2006-01-02 15:04",                    // space-separated without seconds
-		"2006-01-02T15:04",                    // T-separated without seconds
-		"2006-01-02",                          // date only
-		time.RFC3339,                          // e.g., "2006-01-02T15:04:05Z"
-		time.RFC3339Nano,                      // e.g., "2006-01-02T15:04:05.999999999Z07:00"
+	t, err := parseDBTime(s)
+	if err != nil {
+		return time.Time{}
 	}
-	for _, layout := range layouts {
-		if t, err := time.Parse(layout, s); err == nil {
-			return t
-		}
-	}
-	return time.Time{}
+	return t
 }
 
 // batchPopulate batch-loads recipients and labels for a slice of messages.

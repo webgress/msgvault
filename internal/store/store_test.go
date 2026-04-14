@@ -1053,6 +1053,7 @@ func TestStore_ReplaceMessageRecipients_LargeBatch(t *testing.T) {
 }
 
 func TestStore_UpsertFTS(t *testing.T) {
+	testutil.SkipIfPostgres(t, "test inspects SQLite messages_fts virtual table directly; see TestFTSEndToEnd for the portable equivalent")
 	f := storetest.New(t)
 
 	if !f.Store.FTS5Available() {
@@ -1114,6 +1115,7 @@ func TestStore_UpsertFTS(t *testing.T) {
 }
 
 func TestStore_BackfillFTS(t *testing.T) {
+	testutil.SkipIfPostgres(t, "test inspects SQLite messages_fts virtual table directly")
 	f := storetest.New(t)
 
 	if !f.Store.FTS5Available() {
@@ -1200,6 +1202,7 @@ func TestStore_FTS5Available(t *testing.T) {
 }
 
 func TestStore_NeedsFTSBackfill(t *testing.T) {
+	testutil.SkipIfPostgres(t, "test directly manipulates SQLite messages_fts virtual table")
 	f := storetest.New(t)
 
 	if !f.Store.FTS5Available() {

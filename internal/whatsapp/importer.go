@@ -396,13 +396,13 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 						// Only clear if the message has no pre-existing attachment rows
 						// (a previous import with --media-dir may have created them).
 						var existingCount int
-						_ = imp.store.DB().QueryRow(
+						_ = imp.store.QueryRow(
 							"SELECT COUNT(*) FROM attachments WHERE message_id = ?",
 							messageID,
 						).Scan(&existingCount)
 						if existingCount == 0 {
-							_, _ = imp.store.DB().Exec(
-								"UPDATE messages SET has_attachments = 0, attachment_count = 0 WHERE id = ?",
+							_, _ = imp.store.Exec(
+								"UPDATE messages SET has_attachments = FALSE, attachment_count = 0 WHERE id = ?",
 								messageID)
 						}
 					}
@@ -655,7 +655,7 @@ func (imp *Importer) updateAttachmentMetadata(messageID int64, contentHash, medi
 		durationMS = sql.NullInt64{Int64: media.MediaDuration.Int64 * 1000, Valid: true}
 	}
 
-	_, _ = imp.store.DB().Exec(`
+	_, _ = imp.store.Exec(`
 		UPDATE attachments SET media_type = ?, width = ?, height = ?, duration_ms = ?
 		WHERE message_id = ? AND (content_hash = ? OR content_hash IS NULL)
 	`, mediaType, width, height, durationMS, messageID, contentHash)
@@ -665,7 +665,7 @@ func (imp *Importer) updateAttachmentMetadata(messageID int64, contentHash, medi
 // Returns 0 if not found.
 func (imp *Importer) lookupMessageByKeyID(sourceID int64, keyID string) (int64, error) {
 	var msgID int64
-	err := imp.store.DB().QueryRow(
+	err := imp.store.QueryRow(
 		`SELECT id FROM messages WHERE source_id = ? AND source_message_id = ?`,
 		sourceID, keyID,
 	).Scan(&msgID)
@@ -677,7 +677,7 @@ func (imp *Importer) lookupMessageByKeyID(sourceID int64, keyID string) (int64, 
 
 // setReplyTo sets the reply_to_message_id on a message.
 func (imp *Importer) setReplyTo(messageID, replyToID int64) {
-	_, _ = imp.store.DB().Exec(`
+	_, _ = imp.store.Exec(`
 		UPDATE messages SET reply_to_message_id = ? WHERE id = ?
 	`, replyToID, messageID)
 }

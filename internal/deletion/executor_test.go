@@ -928,7 +928,7 @@ func (c *TestContext) SeedMessages(gmailIDs []string) {
 func (c *TestContext) CountDeleted() int {
 	c.t.Helper()
 	var count int
-	err := c.Store.DB().QueryRow(
+	err := c.Store.QueryRow(
 		`SELECT COUNT(*) FROM messages WHERE deleted_from_source_at IS NOT NULL`,
 	).Scan(&count)
 	if err != nil {

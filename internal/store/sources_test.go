@@ -90,8 +90,11 @@ func TestStore_RemoveSource(t *testing.T) {
 		t.Errorf("label count = %d, want 0", labelCount)
 	}
 
-	// Verify FTS rows are gone
-	if f.Store.FTS5Available() {
+	// Verify FTS rows are gone. SQLite stores FTS in a separate virtual table
+	// that CASCADE doesn't cover, so we use a direct SELECT. PostgreSQL
+	// stores search_fts as a column on messages, so CASCADE handles it and
+	// this post-condition check isn't needed there.
+	if f.Store.FTS5Available() && !testutil.IsPostgresTest() {
 		var ftsCount int
 		err = f.Store.QueryRow(
 			`SELECT COUNT(*) FROM messages_fts`,
