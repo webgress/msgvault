@@ -177,6 +177,21 @@ func (s *Store) GetMessage(id int64) (*APIMessage, error) {
 
 // SearchMessages searches messages using full-text search, with batch-loaded recipients and labels.
 func (s *Store) SearchMessages(query string, offset, limit int) ([]APIMessage, int64, error) {
+	// If FTS isn't available in this build (e.g., SQLite without FTS5 or
+	// a PG schema that predates the tsvector column), fall back to a
+	// LIKE-based search on subject/snippet only.
+	if !s.fts5Available {
+		return s.searchMessagesLike(query, offset, limit)
+	}
+
+	// Sanitize user input for the FTS engine. SanitizeFTSQuery strips
+	// dialect metacharacters that would otherwise produce syntax errors
+	// (FTS5 operators like *, :, - or tsquery operators like &, |, !).
+	ftsArg := s.dialect.SanitizeFTSQuery(query)
+	if ftsArg == "" {
+		return []APIMessage{}, 0, nil
+	}
+
 	ftsJoin, ftsWhere, ftsOrder, argCount := s.dialect.FTSSearchClause()
 
 	ftsQuery := fmt.Sprintf(`
@@ -200,7 +215,7 @@ func (s *Store) SearchMessages(query string, offset, limit int) ([]APIMessage, i
 
 	args := make([]interface{}, 0, argCount+2)
 	for i := 0; i < argCount; i++ {
-		args = append(args, query)
+		args = append(args, ftsArg)
 	}
 	args = append(args, limit, offset)
 
@@ -229,7 +244,7 @@ func (s *Store) SearchMessages(query string, offset, limit int) ([]APIMessage, i
 		%s
 		WHERE %s AND m.deleted_from_source_at IS NULL
 	`, ftsJoin, ftsWhere)
-	if err := s.queryRow(countQuery, query).Scan(&total); err != nil {
+	if err := s.queryRow(countQuery, ftsArg).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("count FTS results: %w", err)
 	}
 
@@ -252,21 +267,24 @@ func (s *Store) SearchMessagesQuery(
 	conditions = append(conditions,
 		"m.deleted_from_source_at IS NULL")
 
-	// FTS text terms.
+	// FTS text terms. Join the user-supplied terms with spaces and let the
+	// dialect's SanitizeFTSQuery escape them appropriately for the backend.
 	ftsJoin := ""
 	ftsOrder := ""
 	ftsExpr := ""
 	ftsOrderArgCount := 0
 	if len(q.TextTerms) > 0 {
-		ftsExpr = buildFTSExpression(q.TextTerms)
-		join, where, orderBy, queryArgCount := s.dialect.FTSSearchClause()
-		ftsJoin = join
-		ftsOrder = orderBy
-		// WHERE consumes 1 query-term arg; the rest (queryArgCount-1) are
-		// for ORDER BY ranking (PostgreSQL's ts_rank).
-		ftsOrderArgCount = queryArgCount - 1
-		conditions = append(conditions, where)
-		args = append(args, ftsExpr)
+		ftsExpr = s.dialect.SanitizeFTSQuery(strings.Join(q.TextTerms, " "))
+		if ftsExpr != "" {
+			join, where, orderBy, queryArgCount := s.dialect.FTSSearchClause()
+			ftsJoin = join
+			ftsOrder = orderBy
+			// WHERE consumes 1 query-term arg; the rest (queryArgCount-1) are
+			// for ORDER BY ranking (PostgreSQL's ts_rank).
+			ftsOrderArgCount = queryArgCount - 1
+			conditions = append(conditions, where)
+			args = append(args, ftsExpr)
+		}
 	}
 
 	// from: filter

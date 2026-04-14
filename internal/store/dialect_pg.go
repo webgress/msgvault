@@ -75,13 +75,17 @@ func (d *PostgreSQLDialect) UpdateOrIgnore(sql string) string {
 // Uses numbered placeholders so the same messageID can serve the WHERE clause
 // while the text fields map to their logical positions. Rebind is idempotent
 // over $N placeholders, so no pre-rebind is required.
+//
+// Address fields are pre-processed with REPLACE to split on @ and . — this
+// makes "alice" match "alice@example.com" under the 'simple' tsvector config,
+// which otherwise treats the whole address as a single token.
 func (d *PostgreSQLDialect) FTSUpsertSQL() string {
 	return `UPDATE messages SET search_fts =
 		setweight(to_tsvector('simple', COALESCE($2, '')), 'A') ||
-		setweight(to_tsvector('simple', COALESCE($4, '')), 'B') ||
+		setweight(to_tsvector('simple', REPLACE(REPLACE(COALESCE($4, ''), '@', ' '), '.', ' ')), 'B') ||
 		to_tsvector('simple', COALESCE($3, '')) ||
-		to_tsvector('simple', COALESCE($5, '')) ||
-		to_tsvector('simple', COALESCE($6, ''))
+		to_tsvector('simple', REPLACE(REPLACE(COALESCE($5, ''), '@', ' '), '.', ' ')) ||
+		to_tsvector('simple', REPLACE(REPLACE(COALESCE($6, ''), '@', ' '), '.', ' '))
 	WHERE id = $1`
 }
 
@@ -89,10 +93,15 @@ func (d *PostgreSQLDialect) FTSUpsertSQL() string {
 // PostgreSQL stores the tsvector on the messages table — no JOIN needed.
 // Uses ? placeholders; the caller must Rebind the assembled query. The
 // search term appears in both WHERE and ORDER BY (queryArgCount=2).
+//
+// Uses to_tsquery (not plainto_tsquery) because callers pre-sanitize user
+// input via SanitizeFTSQuery which emits tsquery operators (e.g., term:*
+// AND term:*). plainto_tsquery would strip those operators, breaking
+// prefix matching.
 func (d *PostgreSQLDialect) FTSSearchClause() (join, where, orderBy string, queryArgCount int) {
 	return "",
-		"m.search_fts @@ plainto_tsquery('simple', ?)",
-		"ts_rank(m.search_fts, plainto_tsquery('simple', ?)) DESC",
+		"m.search_fts @@ to_tsquery('simple', ?)",
+		"ts_rank(m.search_fts, to_tsquery('simple', ?)) DESC",
 		2
 }
 
@@ -102,8 +111,11 @@ func (d *PostgreSQLDialect) FTSDeleteSQL() string {
 }
 
 // FTSBackfillBatchSQL returns the SQL to populate tsvector for a range of message IDs.
-// Uses a scalar subquery for the body text so bodyless messages still get indexed
-// (parallel to SQLite's LEFT JOIN semantics).
+// Uses scalar subqueries for body and recipient aggregation (parallel to
+// SQLite's LEFT JOIN semantics — bodyless messages still get indexed).
+// Email addresses are pre-processed with REPLACE('@', ' ') and REPLACE('.', ' ')
+// so individual tokens are searchable (tsvector 'simple' config treats full
+// email addresses as single tokens).
 // Parameters: ?=fromID, ?=toID (rebound to $1, $2 on execution).
 func (d *PostgreSQLDialect) FTSBackfillBatchSQL() string {
 	return `UPDATE messages m SET search_fts =
@@ -112,15 +124,15 @@ func (d *PostgreSQLDialect) FTSBackfillBatchSQL() string {
 			(SELECT mb.body_text FROM message_bodies mb WHERE mb.message_id = m.id),
 			''
 		)) ||
-		setweight(to_tsvector('simple', COALESCE(
+		setweight(to_tsvector('simple', REPLACE(REPLACE(COALESCE(
 			CASE WHEN m.message_type != 'email' AND m.message_type IS NOT NULL AND m.message_type != ''
 			     THEN (SELECT COALESCE(p.phone_number, p.email_address) FROM participants p WHERE p.id = m.sender_id)
 			END,
 			(SELECT STRING_AGG(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'from'),
 			''
-		)), 'B') ||
-		to_tsvector('simple', COALESCE((SELECT STRING_AGG(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'to'), '')) ||
-		to_tsvector('simple', COALESCE((SELECT STRING_AGG(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'cc'), ''))
+		), '@', ' '), '.', ' ')), 'B') ||
+		to_tsvector('simple', REPLACE(REPLACE(COALESCE((SELECT STRING_AGG(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'to'), ''), '@', ' '), '.', ' ')) ||
+		to_tsvector('simple', REPLACE(REPLACE(COALESCE((SELECT STRING_AGG(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'cc'), ''), '@', ' '), '.', ' '))
 	WHERE m.id >= ? AND m.id < ?`
 }
 
@@ -162,9 +174,10 @@ func (d *PostgreSQLDialect) SchemaFTS() string {
 	return ""
 }
 
-// FTSSearchExpression returns the tsvector @@ plainto_tsquery expression.
+// FTSSearchExpression returns the tsvector @@ to_tsquery expression.
+// Callers must pre-sanitize their input with SanitizeFTSQuery.
 func (d *PostgreSQLDialect) FTSSearchExpression() string {
-	return "m.search_fts @@ plainto_tsquery('simple', ?)"
+	return "m.search_fts @@ to_tsquery('simple', ?)"
 }
 
 // TimeTruncExpression returns to_char() for the given granularity.
@@ -190,6 +203,39 @@ func (d *PostgreSQLDialect) HasFTSTableSQL() string {
 // JSONPlaceholder returns "?::jsonb" — PostgreSQL requires an explicit cast
 // when binding a text/string arg to a JSONB column.
 func (d *PostgreSQLDialect) JSONPlaceholder() string { return "?::jsonb" }
+
+// SanitizeFTSQuery builds a tsquery from user input. Strips tsquery
+// metacharacters (&, |, !, (, ), :, *, \, '), collapses whitespace into
+// single spaces, then joins tokens with " & " and appends ":*" to each
+// for prefix matching.
+//
+// Returns "" if nothing indexable remains — callers should treat this as
+// a no-match condition rather than an error.
+func (d *PostgreSQLDialect) SanitizeFTSQuery(query string) string {
+	// Replace tsquery metacharacters and word-boundary punctuation with
+	// spaces so @, ., -, etc. in email addresses get tokenized.
+	var b strings.Builder
+	for _, r := range query {
+		switch r {
+		case '&', '|', '!', '(', ')', ':', '*', '\\', '\'':
+			continue
+		case '@', '.', '-', '/', ',', ';', '"':
+			b.WriteRune(' ')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	// Split on whitespace.
+	tokens := strings.Fields(b.String())
+	if len(tokens) == 0 {
+		return ""
+	}
+	prefix := make([]string, 0, len(tokens))
+	for _, tok := range tokens {
+		prefix = append(prefix, tok+":*")
+	}
+	return strings.Join(prefix, " & ")
+}
 
 // InitConn is a no-op for PostgreSQL. Connection-scoped settings like
 // statement_timeout are applied via libpq connection options in the DSN

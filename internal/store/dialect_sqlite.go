@@ -139,6 +139,32 @@ func (d *SQLiteDialect) HasFTSTableSQL() string {
 // JSONPlaceholder is a plain "?" for SQLite — JSON is stored as TEXT.
 func (d *SQLiteDialect) JSONPlaceholder() string { return "?" }
 
+// SanitizeFTSQuery quotes the user's search string for FTS5 MATCH.
+// Strips the FTS5 metacharacters that would cause syntax errors when
+// interpreted as FTS5 query operators (`*`, `"`, `:`, `-`, `(`, `)`, etc.).
+// Then wraps in double-quotes to force phrase-literal interpretation and
+// appends `*` for prefix matching.
+//
+// Returns "" if the result would be empty (only whitespace / metacharacters).
+func (d *SQLiteDialect) SanitizeFTSQuery(query string) string {
+	var b strings.Builder
+	for _, r := range query {
+		switch r {
+		case '"', '*', ':', '-', '(', ')', '.':
+			continue
+		default:
+			b.WriteRune(r)
+		}
+	}
+	clean := strings.TrimSpace(b.String())
+	if clean == "" {
+		return ""
+	}
+	// Quote to prevent any remaining whitespace from being interpreted as
+	// multiple tokens, and append * for prefix matching.
+	return `"` + clean + `"*`
+}
+
 // InitConn is a no-op for SQLite — PRAGMAs are set via DSN parameters.
 func (d *SQLiteDialect) InitConn(db *sql.DB) error { return nil }
 

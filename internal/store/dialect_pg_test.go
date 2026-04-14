@@ -103,10 +103,10 @@ func TestPostgreSQLDialect_FTSSearchClause(t *testing.T) {
 	if join != "" {
 		t.Errorf("join = %q, want empty (PostgreSQL needs no JOIN)", join)
 	}
-	if where != "m.search_fts @@ plainto_tsquery('simple', ?)" {
+	if where != "m.search_fts @@ to_tsquery('simple', ?)" {
 		t.Errorf("where = %q, unexpected", where)
 	}
-	if orderBy != "ts_rank(m.search_fts, plainto_tsquery('simple', ?)) DESC" {
+	if orderBy != "ts_rank(m.search_fts, to_tsquery('simple', ?)) DESC" {
 		t.Errorf("orderBy = %q, unexpected", orderBy)
 	}
 	if argCount != 2 {
