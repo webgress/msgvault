@@ -99,27 +99,24 @@ func TestPostgreSQLDialect_InsertOrIgnoreSuffix(t *testing.T) {
 
 func TestPostgreSQLDialect_FTSSearchClause(t *testing.T) {
 	d := &PostgreSQLDialect{}
-	join, where, orderBy := d.FTSSearchClause(1)
+	join, where, orderBy, argCount := d.FTSSearchClause()
 	if join != "" {
 		t.Errorf("join = %q, want empty (PostgreSQL needs no JOIN)", join)
 	}
-	if where != "m.search_fts @@ plainto_tsquery('simple', $1)" {
+	if where != "m.search_fts @@ plainto_tsquery('simple', ?)" {
 		t.Errorf("where = %q, unexpected", where)
 	}
-	if orderBy != "ts_rank(m.search_fts, plainto_tsquery('simple', $1)) DESC" {
+	if orderBy != "ts_rank(m.search_fts, plainto_tsquery('simple', ?)) DESC" {
 		t.Errorf("orderBy = %q, unexpected", orderBy)
 	}
-
-	// Verify paramIndex is respected
-	_, where3, _ := d.FTSSearchClause(3)
-	if want := "m.search_fts @@ plainto_tsquery('simple', $3)"; where3 != want {
-		t.Errorf("where3 = %q, want %q", where3, want)
+	if argCount != 2 {
+		t.Errorf("queryArgCount = %d, want 2", argCount)
 	}
 }
 
 func TestSQLiteDialect_FTSSearchClause(t *testing.T) {
 	d := &SQLiteDialect{}
-	join, where, orderBy := d.FTSSearchClause(1)
+	join, where, orderBy, argCount := d.FTSSearchClause()
 	if join != "JOIN messages_fts fts ON fts.rowid = m.id" {
 		t.Errorf("join = %q, unexpected", join)
 	}
@@ -128,6 +125,9 @@ func TestSQLiteDialect_FTSSearchClause(t *testing.T) {
 	}
 	if orderBy != "rank" {
 		t.Errorf("orderBy = %q, unexpected", orderBy)
+	}
+	if argCount != 1 {
+		t.Errorf("queryArgCount = %d, want 1", argCount)
 	}
 }
 

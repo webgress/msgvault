@@ -177,7 +177,7 @@ func (s *Store) GetMessage(id int64) (*APIMessage, error) {
 
 // SearchMessages searches messages using full-text search, with batch-loaded recipients and labels.
 func (s *Store) SearchMessages(query string, offset, limit int) ([]APIMessage, int64, error) {
-	ftsJoin, ftsWhere, ftsOrder := s.dialect.FTSSearchClause(1)
+	ftsJoin, ftsWhere, ftsOrder, argCount := s.dialect.FTSSearchClause()
 
 	ftsQuery := fmt.Sprintf(`
 		SELECT
@@ -198,7 +198,13 @@ func (s *Store) SearchMessages(query string, offset, limit int) ([]APIMessage, i
 		LIMIT ? OFFSET ?
 	`, ftsJoin, ftsWhere, ftsOrder)
 
-	rows, err := s.query(ftsQuery, query, limit, offset)
+	args := make([]interface{}, 0, argCount+2)
+	for i := 0; i < argCount; i++ {
+		args = append(args, query)
+	}
+	args = append(args, limit, offset)
+
+	rows, err := s.query(ftsQuery, args...)
 	if err != nil {
 		// FTS might not be available, fall back to LIKE search
 		return s.searchMessagesLike(query, offset, limit)
@@ -214,7 +220,8 @@ func (s *Store) SearchMessages(query string, offset, limit int) ([]APIMessage, i
 		return []APIMessage{}, 0, nil
 	}
 
-	// Get total count
+	// Get total count — count query has no ORDER BY, so only WHERE's
+	// query-term arg is needed (always 1).
 	var total int64
 	countQuery := fmt.Sprintf(`
 		SELECT COUNT(*)
@@ -247,10 +254,17 @@ func (s *Store) SearchMessagesQuery(
 
 	// FTS text terms.
 	ftsJoin := ""
+	ftsOrder := ""
+	ftsExpr := ""
+	ftsOrderArgCount := 0
 	if len(q.TextTerms) > 0 {
-		ftsExpr := buildFTSExpression(q.TextTerms)
-		join, where, _ := s.dialect.FTSSearchClause(1)
+		ftsExpr = buildFTSExpression(q.TextTerms)
+		join, where, orderBy, queryArgCount := s.dialect.FTSSearchClause()
 		ftsJoin = join
+		ftsOrder = orderBy
+		// WHERE consumes 1 query-term arg; the rest (queryArgCount-1) are
+		// for ORDER BY ranking (PostgreSQL's ts_rank).
+		ftsOrderArgCount = queryArgCount - 1
 		conditions = append(conditions, where)
 		args = append(args, ftsExpr)
 	}
@@ -372,10 +386,11 @@ func (s *Store) SearchMessagesQuery(
 		return nil, 0, fmt.Errorf("count search results: %w", err)
 	}
 
-	// Results query.
+	// Results query. When FTS is active, prepend the dialect's FTS ordering
+	// (messages_fts's rank for SQLite, ts_rank for PostgreSQL).
 	orderBy := "COALESCE(m.sent_at, m.received_at, m.internal_date) DESC"
-	if ftsJoin != "" {
-		orderBy = "rank, " + orderBy
+	if ftsJoin != "" && ftsOrder != "" {
+		orderBy = ftsOrder + ", " + orderBy
 	}
 	searchSQL := fmt.Sprintf(`
 		SELECT
@@ -399,6 +414,10 @@ func (s *Store) SearchMessagesQuery(
 
 	resultArgs := make([]interface{}, len(args))
 	copy(resultArgs, args)
+	// ORDER BY may reference the search term again (PostgreSQL ts_rank).
+	for i := 0; i < ftsOrderArgCount; i++ {
+		resultArgs = append(resultArgs, ftsExpr)
+	}
 	resultArgs = append(resultArgs, limit, offset)
 	rows, err := s.query(searchSQL, resultArgs...)
 	if err != nil {
