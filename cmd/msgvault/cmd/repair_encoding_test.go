@@ -11,6 +11,7 @@ import (
 // swallowed. We trigger scan errors by recreating the labels table with a
 // TEXT id column and inserting a non-numeric id that can't be scanned into int64.
 func TestRepairOtherStrings_LogsScanErrors(t *testing.T) {
+	testutil.SkipIfPostgres(t, "test uses SQLite PRAGMA and recreates labels with TEXT id")
 	st := testutil.NewTestStore(t)
 	db := st.DB()
 
@@ -54,6 +55,7 @@ func TestRepairOtherStrings_LogsScanErrors(t *testing.T) {
 // repairDisplayNames are counted in stats.skippedRows. We trigger scan errors
 // by recreating the participants table with a TEXT id column.
 func TestRepairDisplayNames_LogsScanErrors(t *testing.T) {
+	testutil.SkipIfPostgres(t, "test uses SQLite PRAGMA and recreates participants with TEXT id")
 	st := testutil.NewTestStore(t)
 	db := st.DB()
 
@@ -117,6 +119,7 @@ func TestRepairEncoding_NoScanErrors(t *testing.T) {
 // TestRepairOtherStrings_FixesNewColumns verifies that repairOtherStrings
 // repairs invalid UTF-8 in source_conversation_id, email_address, and domain.
 func TestRepairOtherStrings_FixesNewColumns(t *testing.T) {
+	testutil.SkipIfPostgres(t, "test inserts invalid UTF-8 bytes and uses datetime(); PostgreSQL TEXT is strict UTF-8")
 	st := testutil.NewTestStore(t)
 	db := st.DB()
 
