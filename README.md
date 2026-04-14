@@ -171,6 +171,11 @@ When `database_url` is set, all CLI commands transparently use PostgreSQL
 way. See [pg_refactor_docs/PG_SETUP.md](pg_refactor_docs/PG_SETUP.md) for
 role creation, connection URL options, and deployment notes.
 
+Already have a populated SQLite archive? Use
+[`msgvault migrate-db`](pg_refactor_docs/PG_MIGRATION.md) to copy every
+row into PostgreSQL with IDs preserved — or to take a SQLite snapshot of
+a PostgreSQL archive for offline use.
+
 ## MCP Server
 
 msgvault includes an MCP server that lets AI assistants search, analyze, and read your archived messages. Connect it to Claude Desktop or any MCP-capable agent and query your full message history conversationally. See the [MCP documentation](https://msgvault.io/usage/chat/) for setup instructions.

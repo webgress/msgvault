@@ -129,6 +129,20 @@ a `*` prefix suffix. PostgreSQL strips tsquery operators
 punctuation, and joins tokens with ` & ` and a `:*` suffix for prefix
 matching.
 
+## Data Migration
+
+A portable, ID-preserving migration between SQLite and PostgreSQL is
+available via `msgvault migrate-db` — see
+[PG_MIGRATION.md](PG_MIGRATION.md). Supported directions:
+
+- SQLite → PostgreSQL (graduate a local archive to a server)
+- PostgreSQL → SQLite (take a portable snapshot)
+- Same-dialect copies (relocation, backup restores)
+
+The migrator is pure-Go, schema-aware, and runs inside a single
+destination transaction so failures leave the destination untouched.
+FTS is rebuilt automatically on the destination.
+
 ## Known Limitations
 
 - **Subset copy (`subset.go`) is SQLite-only.** It uses PRAGMA introspection

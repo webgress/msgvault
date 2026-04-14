@@ -72,6 +72,7 @@ make lint                     # Run linter
 
 # Maintenance
 ./msgvault repair-encoding                            # Fix UTF-8 encoding issues
+./msgvault migrate-db --from <src> --to <dst>         # Copy data SQLite↔PostgreSQL
 ```
 
 ## Key Files
@@ -137,10 +138,11 @@ Schema files in `internal/store/`:
 - `schema_sqlite.sql` - SQLite FTS5 virtual table
 - `schema_pg.sql` - PostgreSQL tsvector column + GIN index (opt-in, scaffold)
 
-**Database backend**: SQLite is the default. PostgreSQL support is
-scaffolded behind a `Dialect` interface (`internal/store/dialect.go`);
-see `pg_refactor_docs/PG_STATUS.md` for the current state and follow-up
-work required to make PostgreSQL functional end-to-end.
+**Database backend**: SQLite is the default. PostgreSQL is a supported
+opt-in backend behind a `Dialect` interface (`internal/store/dialect.go`).
+See `pg_refactor_docs/PG_STATUS.md` for status, `pg_refactor_docs/PG_SETUP.md`
+for setup, and `pg_refactor_docs/PG_MIGRATION.md` for copying data between
+backends with `msgvault migrate-db`.
 
 **Test env**: set `MSGVAULT_TEST_DB=postgres://...` to run the store test
 suite against PostgreSQL instead of SQLite (`make test-pg`). Each test

@@ -104,6 +104,21 @@ msgvault sync-full you@gmail.com --limit 100
 msgvault tui
 ```
 
+## Migrating an existing SQLite archive
+
+If you already have a populated `~/.msgvault/msgvault.db`, you don't
+have to re-sync from Gmail. Use [`msgvault migrate-db`](PG_MIGRATION.md)
+to copy every row — with IDs preserved — into the new PG database:
+
+```bash
+msgvault migrate-db \
+    --from ~/.msgvault/msgvault.db \
+    --to postgres://msgvault:changeme@localhost:5432/msgvault?sslmode=disable
+```
+
+See [PG_MIGRATION.md](PG_MIGRATION.md) for details, including
+reverse (PG → SQLite) migrations, attachment handling, and known limits.
+
 ## Schema isolation (shared server)
 
 If multiple applications share a PostgreSQL instance, put msgvault in its
