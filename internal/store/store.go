@@ -610,7 +610,7 @@ func (s *Store) InitSchema() error {
 	// Probe FTS availability after main schema load. Dialects that integrate
 	// FTS into the main schema (e.g., PostgreSQL's tsvector column) rely on
 	// this probe rather than on a separate FTS schema file.
-	if ftsAvailable, _ := s.dialect.FTSAvailable(s.db); ftsAvailable {
+	if ftsAvailable, _ := s.dialect.FTSAvailable(s.db.DB); ftsAvailable {
 		s.fts5Available = true
 	}
 
@@ -682,7 +682,7 @@ func (s *Store) GetStats() (*Stats, error) {
 
 	// Get database size via the dialect (file size for SQLite,
 	// pg_database_size() for PostgreSQL).
-	if size, err := s.dialect.DatabaseSize(s.db, s.dbPath); err == nil {
+	if size, err := s.dialect.DatabaseSize(s.db.DB, s.dbPath); err == nil {
 		stats.DatabaseSize = size
 	}
 
