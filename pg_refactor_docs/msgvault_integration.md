@@ -74,3 +74,39 @@ These are entirely optional and separable — no changes needed:
 - **HTTP API**: same abstraction path as MCP.
 - **`subset.go`**: heavy PRAGMA introspection, deferred from this work.
   Leave SQLite-only.
+
+## TODO: Post-PR1 Rebase Cascade
+
+After any commit is added to PR1 (`pr1-branch-dialect-extraction`), the
+downstream branches must be rebased to inherit the change:
+
+```
+pr1-branch-dialect-extraction
+  └── pr2-branch-postgresql-dialect
+        └── pr3-branch-postgresql-functional
+              └── feat/postgresql-dialect  (PR4: migrate-db)
+```
+
+Steps:
+```bash
+git checkout pr2-branch-postgresql-dialect
+git rebase pr1-branch-dialect-extraction
+
+git checkout pr3-branch-postgresql-functional
+git rebase pr2-branch-postgresql-dialect
+
+git checkout feat/postgresql-dialect
+git rebase pr3-branch-postgresql-functional
+
+# Then force-push all four branches
+git push --force-with-lease origin pr2-branch-postgresql-dialect pr3-branch-postgresql-functional feat/postgresql-dialect
+```
+
+**Current state (2026-04-17):** PR1 has a fix (`aa6ceab` — loggedDB type
+mismatch) that PR2/PR3/PR4 have NOT yet inherited. The fix passes `s.db.DB`
+instead of `s.db` to Dialect interface methods that expect `*sql.DB`. PR3+
+also has additional `loggedDB` mismatches in `openPostgres`/`openPostgresReadOnly`
+(they assign raw `*sql.DB` to `Store.db` which is now `*loggedDB`) — those
+need fixing during the rebase.
+
+Run `make build && make test` after each rebase to verify.
