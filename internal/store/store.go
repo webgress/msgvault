@@ -138,7 +138,7 @@ func openPostgres(dbURL string) (*Store, error) {
 	}
 
 	return &Store{
-		db:      db,
+		db:      newLoggedDB(db),
 		dbPath:  dbURL,
 		dialect: dialect,
 	}, nil
@@ -222,7 +222,7 @@ func openPostgresReadOnly(dbURL string) (*Store, error) {
 	}
 
 	s := &Store{
-		db:       db,
+		db:       newLoggedDB(db),
 		dbPath:   dbURL,
 		dialect:  dialect,
 		readOnly: true,
