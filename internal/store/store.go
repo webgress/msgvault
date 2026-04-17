@@ -167,7 +167,7 @@ func (s *Store) Close() error {
 // bytes. Returns nil on success; callers may log but should not fail on error.
 // No-op for non-SQLite backends.
 func (s *Store) CheckpointWAL() error {
-	return s.dialect.CheckpointWAL(s.db)
+	return s.dialect.CheckpointWAL(s.db.DB)
 }
 
 // DB returns the underlying *sql.DB for consumers that need to
@@ -424,7 +424,7 @@ func (s *Store) NeedsFTSBackfill() bool {
 	if !s.fts5Available {
 		return false
 	}
-	needs, _ := s.dialect.FTSNeedsBackfill(s.db)
+	needs, _ := s.dialect.FTSNeedsBackfill(s.db.DB)
 	return needs
 }
 
