@@ -70,6 +70,21 @@ func newPostgresTestStore(t *testing.T, dbURL string) *store.Store {
 	}
 	_ = setupDB.Close()
 
+	// Register schema cleanup immediately so that any failure below this
+	// point (store.Open, InitSchema) doesn't leak the schema.
+	var st *store.Store
+	t.Cleanup(func() {
+		if st != nil {
+			_ = st.Close()
+		}
+		cleanupDB, err := sql.Open("pgx", dbURL)
+		if err != nil {
+			return
+		}
+		defer func() { _ = cleanupDB.Close() }()
+		_, _ = cleanupDB.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE", schemaName))
+	})
+
 	// Build a URL that uses the test schema via search_path
 	testURL := dbURL
 	sep := "?"
@@ -78,20 +93,10 @@ func newPostgresTestStore(t *testing.T, dbURL string) *store.Store {
 	}
 	testURL += sep + "search_path=" + schemaName
 
-	st, err := store.Open(testURL)
+	st, err = store.Open(testURL)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-
-	t.Cleanup(func() {
-		_ = st.Close()
-		cleanupDB, err := sql.Open("pgx", dbURL)
-		if err != nil {
-			return
-		}
-		defer func() { _ = cleanupDB.Close() }()
-		_, _ = cleanupDB.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE", schemaName))
-	})
 
 	if err := st.InitSchema(); err != nil {
 		t.Fatalf("init schema: %v", err)
