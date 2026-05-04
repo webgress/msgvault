@@ -58,6 +58,17 @@ test:
 test-v:
 	go test -tags "$(BUILD_TAGS)" -v ./...
 
+# Run tests against PostgreSQL (set MSGVAULT_TEST_DB first).
+# This is scaffolded for the future functional backend; see docs/PG_STATUS.md.
+# Example: MSGVAULT_TEST_DB=postgres://user:pass@localhost:5432/db make test-pg
+test-pg:
+	@if [ -z "$$MSGVAULT_TEST_DB" ]; then \
+		echo "MSGVAULT_TEST_DB must be set, e.g., postgres://user:pass@localhost:5432/db" >&2; \
+		exit 1; \
+	fi
+	@echo "PostgreSQL backend is scaffold-only; this target is expected to fail until docs/PG_STATUS.md blockers are resolved." >&2
+	go test -tags fts5 ./...
+
 # Format code
 fmt:
 	go fmt ./...

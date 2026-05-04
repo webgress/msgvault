@@ -133,8 +133,19 @@ Core tables:
 - `sync_runs` / `sync_checkpoints` - Sync state for resumability
 
 Schema files in `internal/store/`:
-- `schema.sql` - Core SQLite schema
-- `schema_sqlite.sql` - FTS5 virtual table
+- `schema.sql` - Core schema (SQLite; shared structure)
+- `schema_sqlite.sql` - SQLite FTS5 virtual table
+- `schema_pg.sql` - PostgreSQL tsvector column + GIN index (opt-in, scaffold)
+
+**Database backend**: SQLite is the default. PostgreSQL support is
+scaffolded behind a `Dialect` interface (`internal/store/dialect.go`);
+see `docs/PG_STATUS.md` for the current state and follow-up
+work required to make PostgreSQL functional end-to-end.
+
+**Test env**: `MSGVAULT_TEST_DB=postgres://...` is scaffolded for the future
+PostgreSQL store test suite (`make test-pg`). Until the blockers in
+`docs/PG_STATUS.md` are resolved, PostgreSQL tests are expected to fail before
+schema initialization completes.
 
 ## Parquet Analytics
 
@@ -201,7 +212,8 @@ automatically:
 
 ```bash
 make install-hooks             # Install pre-commit hook via prek
-make test                      # Run tests
+make test                      # Run tests (SQLite default)
+make test-pg                   # PostgreSQL scaffold check; expected to fail until PG_STATUS blockers are fixed
 make fmt                       # Format code (go fmt)
 make lint                      # Run linter (auto-fix)
 make lint-ci                   # Run linter (CI, no auto-fix)

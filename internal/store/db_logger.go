@@ -338,7 +338,7 @@ func (r *loggedRows) finalize(closeErr error) {
 	r.finalized = true
 	logErr := closeErr
 	if logErr == nil {
-		logErr = r.Rows.Err()
+		logErr = r.Err()
 	}
 	logStmtWith("query", r.query, r.args, logErr, time.Since(r.start))
 }

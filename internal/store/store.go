@@ -13,10 +13,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/mattn/go-sqlite3"
 )
 
-//go:embed schema.sql schema_sqlite.sql
+//go:embed schema.sql schema_sqlite.sql schema_pg.sql
 var schemaFS embed.FS
 
 // Store provides database operations for msgvault.
@@ -32,6 +34,7 @@ type Store struct {
 	dialect       Dialect
 	readOnly      bool // Opened via OpenReadOnly; skips WAL checkpoint on close
 	fts5Available bool // Whether FTS5 is available for full-text search
+	closeCleanup  func()
 }
 
 const defaultSQLiteParams = "?_journal_mode=WAL&_busy_timeout=30000&_synchronous=NORMAL&_foreign_keys=ON"
@@ -55,14 +58,23 @@ func isSQLiteError(err error, substr string) bool {
 	return false
 }
 
-// Open opens or creates the database at the given path.
-// Currently only SQLite is supported. PostgreSQL URLs will return an error.
-func Open(dbPath string) (*Store, error) {
-	// Check for unsupported database URLs
-	if strings.HasPrefix(dbPath, "postgresql://") || strings.HasPrefix(dbPath, "postgres://") {
-		return nil, fmt.Errorf("PostgreSQL is not yet supported in the Go implementation; use SQLite path instead")
-	}
+// isPostgresURL returns true if the path looks like a PostgreSQL connection URL.
+func isPostgresURL(dbPath string) bool {
+	return strings.HasPrefix(dbPath, "postgresql://") || strings.HasPrefix(dbPath, "postgres://")
+}
 
+// Open opens or creates the database at the given path.
+// If dbPath is a postgres:// or postgresql:// URL, opens a PostgreSQL connection.
+// Otherwise, opens a SQLite database at the file path.
+func Open(dbPath string) (*Store, error) {
+	if isPostgresURL(dbPath) {
+		return openPostgres(dbPath)
+	}
+	return openSQLite(dbPath)
+}
+
+// openSQLite opens a SQLite database at the given file path.
+func openSQLite(dbPath string) (*Store, error) {
 	// Ensure directory exists (skip for in-memory databases)
 	if dbPath != ":memory:" && !strings.Contains(dbPath, ":memory:") {
 		dir := filepath.Dir(dbPath)
@@ -77,7 +89,6 @@ func Open(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
 
-	// Test connection
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping database: %w", err)
@@ -107,11 +118,48 @@ func Open(dbPath string) (*Store, error) {
 	}, nil
 }
 
+// openPostgres opens a PostgreSQL database using the given connection URL.
+func openPostgres(dbURL string) (*Store, error) {
+	db, cleanup, err := openPostgresDB(dbURL, false)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		cleanup()
+		return nil, fmt.Errorf("ping PostgreSQL: %w", err)
+	}
+
+	// PostgreSQL supports full concurrency — use a larger pool than SQLite.
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
+	dialect := &PostgreSQLDialect{}
+	if err := dialect.InitConn(db); err != nil {
+		_ = db.Close()
+		cleanup()
+		return nil, fmt.Errorf("init PostgreSQL connection: %w", err)
+	}
+
+	return &Store{
+		db:           newLoggedDB(db, dialect.Rebind),
+		dbPath:       dbURL,
+		dialect:      dialect,
+		closeCleanup: cleanup,
+	}, nil
+}
+
 // OpenReadOnly opens an existing database in read-only mode. Suitable for
 // query-only workloads (MCP server) where multiple processes access the
 // same database concurrently. Does not create the database, run migrations,
 // or checkpoint WAL on close.
 func OpenReadOnly(dbPath string) (*Store, error) {
+	if isPostgresURL(dbPath) {
+		return openPostgresReadOnly(dbPath)
+	}
+
 	if _, err := os.Stat(dbPath); err != nil {
 		return nil, fmt.Errorf(
 			"database not found: %s "+
@@ -154,6 +202,81 @@ func OpenReadOnly(dbPath string) (*Store, error) {
 	return s, nil
 }
 
+// openPostgresReadOnly opens a PostgreSQL database in read-only mode.
+//
+// Read-only enforcement uses pgx's RuntimeParams so that
+// default_transaction_read_only=on is sent in the startup packet of every
+// connection in the pool, not just the first one. Setting it via
+// `db.Exec("SET ...")` on a pooled *sql.DB only affects whichever connection
+// happened to serve the Exec — subsequent operations on a different pooled
+// connection would run as writable.
+func openPostgresReadOnly(dbURL string) (*Store, error) {
+	db, cleanup, err := openPostgresDB(dbURL, true)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		cleanup()
+		return nil, fmt.Errorf("ping PostgreSQL: %w", err)
+	}
+
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
+	dialect := &PostgreSQLDialect{}
+	if err := dialect.InitConn(db); err != nil {
+		_ = db.Close()
+		cleanup()
+		return nil, fmt.Errorf("init PostgreSQL connection: %w", err)
+	}
+
+	s := &Store{
+		db:           newLoggedDB(db, dialect.Rebind),
+		dbPath:       dbURL,
+		dialect:      dialect,
+		readOnly:     true,
+		closeCleanup: cleanup,
+	}
+
+	s.fts5Available = dialect.FTSAvailable(db)
+
+	return s, nil
+}
+
+func postgresConnConfig(dbURL string, readOnly bool) (*pgx.ConnConfig, error) {
+	connConfig, err := pgx.ParseConfig(dbURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse PostgreSQL URL: %w", err)
+	}
+	if connConfig.RuntimeParams == nil {
+		connConfig.RuntimeParams = map[string]string{}
+	}
+	connConfig.RuntimeParams["statement_timeout"] = "30s"
+	if readOnly {
+		connConfig.RuntimeParams["default_transaction_read_only"] = "on"
+	}
+	return connConfig, nil
+}
+
+func openPostgresDB(dbURL string, readOnly bool) (*sql.DB, func(), error) {
+	connConfig, err := postgresConnConfig(dbURL, readOnly)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	dsn := stdlib.RegisterConnConfig(connConfig)
+	cleanup := func() { stdlib.UnregisterConnConfig(dsn) }
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		cleanup()
+		return nil, nil, fmt.Errorf("open PostgreSQL: %w", err)
+	}
+	return db, cleanup, nil
+}
+
 // Close checkpoints the WAL (unless read-only) and closes the database.
 func (s *Store) Close() error {
 	if !s.readOnly {
@@ -162,7 +285,12 @@ func (s *Store) Close() error {
 		// reduces the risk of corruption from stale WAL entries.
 		_ = s.CheckpointWAL()
 	}
-	return s.db.Close()
+	err := s.db.Close()
+	if s.closeCleanup != nil {
+		s.closeCleanup()
+		s.closeCleanup = nil
+	}
+	return err
 }
 
 // CheckpointWAL forces a WAL checkpoint, folding the WAL back into the main
