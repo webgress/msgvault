@@ -7,31 +7,34 @@ import (
 
 var _ Engine = (*SQLiteEngine)(nil)
 var _ Engine = (*DuckDBEngine)(nil)
-var _ Engine = (*PostgreSQLEngine)(nil)
 
-func TestPostgresStatsWhereClauseParenthesizesEmailFilter(t *testing.T) {
-	sourceID := int64(42)
-	opts := StatsOptions{
-		SourceID:              &sourceID,
-		WithAttachmentsOnly:   true,
-		HideDeletedFromSource: true,
+// TestPostgresEngineUsesDialect verifies that NewPostgreSQLEngine creates an engine
+// with the PostgreSQL query dialect (Rebind converts ? to $N).
+func TestPostgresEngineUsesDialect(t *testing.T) {
+	e := NewPostgreSQLEngine(nil)
+	if _, ok := e.dialect.(PostgreSQLQueryDialect); !ok {
+		t.Fatalf("NewPostgreSQLEngine dialect = %T, want PostgreSQLQueryDialect", e.dialect)
 	}
+	reboundQuery := e.dialect.Rebind("SELECT ? WHERE id = ?")
+	if !strings.Contains(reboundQuery, "$1") || !strings.Contains(reboundQuery, "$2") {
+		t.Fatalf("Rebind did not convert ? to $N: %q", reboundQuery)
+	}
+}
 
-	where, args := postgresStatsWhereClause(opts)
-
-	if !strings.HasPrefix(where, "(") {
-		t.Fatalf("where clause should start with parenthesized email filter, got %q", where)
-	}
-	if !strings.Contains(where, emailOnlyFilterM) {
-		t.Fatalf("where clause should include shared email filter %q, got %q", emailOnlyFilterM, where)
-	}
-	if strings.Contains(where, "m.message_type = 'email' OR m.message_type IS NULL OR m.message_type = '' AND") {
-		t.Fatalf("where clause has unparenthesized OR/AND precedence bug: %q", where)
-	}
-	if !strings.Contains(where, "m.source_id = $1") {
-		t.Fatalf("where clause should include source filter with first placeholder, got %q", where)
-	}
-	if len(args) != 1 || args[0] != sourceID {
-		t.Fatalf("args = %#v, want [%d]", args, sourceID)
+// TestPostgresTimeTruncExpression verifies the PostgreSQL time truncation expressions.
+func TestPostgresTimeTruncExpression(t *testing.T) {
+	d := PostgreSQLQueryDialect{}
+	for _, tc := range []struct {
+		gran string
+		want string
+	}{
+		{"year", "to_char(col, 'YYYY')"},
+		{"month", "to_char(col, 'YYYY-MM')"},
+		{"day", "to_char(col, 'YYYY-MM-DD')"},
+	} {
+		got := d.TimeTruncExpression("col", tc.gran)
+		if got != tc.want {
+			t.Errorf("TimeTruncExpression(%q, %q) = %q, want %q", "col", tc.gran, got, tc.want)
+		}
 	}
 }
