@@ -552,15 +552,6 @@ func (s *Store) SearchMessagesQuery(
 	return messages, total, nil
 }
 
-// buildFTSExpression builds an FTS5 MATCH expression from text terms.
-func buildFTSExpression(terms []string) string {
-	quoted := make([]string, len(terms))
-	for i, t := range terms {
-		quoted[i] = `"` + strings.ReplaceAll(t, `"`, `""`) + `"`
-	}
-	return strings.Join(quoted, " AND ")
-}
-
 // searchMessagesQueryNoFTS is a fallback when FTS5 is unavailable.
 func (s *Store) searchMessagesQueryNoFTS(
 	q *search.Query, offset, limit int,
