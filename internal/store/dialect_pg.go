@@ -78,13 +78,17 @@ func (d *PostgreSQLDialect) JSONPlaceholder() string { return "?::jsonb" }
 // PostgreSQL stores the FTS index inline on `messages.search_fts`, so there
 // is no separate virtual table — the operation is an UPDATE, not an INSERT.
 func (d *PostgreSQLDialect) FTSUpsert(q querier, doc FTSDoc) error {
+	// PostgreSQL's 'simple' tsvector config treats "alice@example.com" as
+	// a single token, so searching for "alice" alone wouldn't match. Pre-
+	// process address fields by replacing @ and . with spaces so the
+	// individual components become searchable.
 	_, err := q.Exec(
 		`UPDATE messages SET search_fts =
 			setweight(to_tsvector('simple', COALESCE($2, '')), 'A') ||
-			setweight(to_tsvector('simple', COALESCE($4, '')), 'B') ||
+			setweight(to_tsvector('simple', REPLACE(REPLACE(COALESCE($4, ''), '@', ' '), '.', ' ')), 'B') ||
 			to_tsvector('simple', COALESCE($3, '')) ||
-			to_tsvector('simple', COALESCE($5, '')) ||
-			to_tsvector('simple', COALESCE($6, ''))
+			to_tsvector('simple', REPLACE(REPLACE(COALESCE($5, ''), '@', ' '), '.', ' ')) ||
+			to_tsvector('simple', REPLACE(REPLACE(COALESCE($6, ''), '@', ' '), '.', ' '))
 		WHERE id = $1`,
 		doc.MessageID, doc.Subject, doc.Body,
 		doc.FromAddr, doc.ToAddrs, doc.CcAddrs,
@@ -96,10 +100,14 @@ func (d *PostgreSQLDialect) FTSUpsert(q querier, doc FTSDoc) error {
 // PostgreSQL stores the tsvector on the messages table — no JOIN needed.
 // Uses `?` placeholders; loggedDB rebinds to `$N` at execution time.
 // ts_rank needs the query term a second time, so orderArgCount is 1.
+//
+// Uses to_tsquery (not plainto_tsquery) because SanitizeFTSQuery emits
+// tsquery operators (`token:*` for prefix matching, ` & ` for AND);
+// plainto_tsquery would strip them.
 func (d *PostgreSQLDialect) FTSSearchClause() (join, where, orderBy string, orderArgCount int) {
 	return "",
-		"m.search_fts @@ plainto_tsquery('simple', ?)",
-		"ts_rank(m.search_fts, plainto_tsquery('simple', ?)) DESC",
+		"m.search_fts @@ to_tsquery('simple', ?)",
+		"ts_rank(m.search_fts, to_tsquery('simple', ?)) DESC",
 		1
 }
 
@@ -108,22 +116,53 @@ func (d *PostgreSQLDialect) FTSDeleteSQL() string {
 	return `UPDATE messages SET search_fts = NULL WHERE source_id = $1`
 }
 
+// SanitizeFTSQuery builds a tsquery arg from a single user string: strips
+// tsquery metacharacters, replaces email/path punctuation with spaces so
+// the components become searchable, splits on whitespace, and joins the
+// tokens with " & ", appending ":*" for prefix matching. Returns "" if
+// nothing of substance remains.
+func (d *PostgreSQLDialect) SanitizeFTSQuery(query string) string {
+	var b strings.Builder
+	for _, r := range query {
+		switch r {
+		case '&', '|', '!', '(', ')', ':', '*', '\\', '\'':
+			continue
+		case '@', '.', '-', '/', ',', ';', '"':
+			b.WriteRune(' ')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	tokens := strings.Fields(b.String())
+	if len(tokens) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(tokens))
+	for _, t := range tokens {
+		parts = append(parts, t+":*")
+	}
+	return strings.Join(parts, " & ")
+}
+
 // FTSBackfillBatchSQL returns the SQL to populate tsvector for a range of message IDs.
 // Parameters: $1=fromID, $2=toID. Uses LEFT JOIN on message_bodies via a subquery
 // so messages without a body row are still indexed (subject + participants).
 func (d *PostgreSQLDialect) FTSBackfillBatchSQL() string {
+	// REPLACE @ and . with spaces on address fields so individual components
+	// are searchable; the 'simple' tsvector config otherwise indexes the full
+	// "alice@example.com" as one token.
 	return `UPDATE messages m SET search_fts =
 		setweight(to_tsvector('simple', COALESCE(m.subject, '')), 'A') ||
 		to_tsvector('simple', COALESCE(src.body_text, '')) ||
-		setweight(to_tsvector('simple', COALESCE(
+		setweight(to_tsvector('simple', REPLACE(REPLACE(COALESCE(
 			CASE WHEN m.message_type != 'email' AND m.message_type IS NOT NULL AND m.message_type != ''
 			     THEN (SELECT COALESCE(p.phone_number, p.email_address) FROM participants p WHERE p.id = m.sender_id)
 			END,
 			(SELECT STRING_AGG(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'from'),
 			''
-		)), 'B') ||
-		to_tsvector('simple', COALESCE((SELECT STRING_AGG(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'to'), '')) ||
-		to_tsvector('simple', COALESCE((SELECT STRING_AGG(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'cc'), ''))
+		), '@', ' '), '.', ' ')), 'B') ||
+		to_tsvector('simple', REPLACE(REPLACE(COALESCE((SELECT STRING_AGG(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'to'), ''), '@', ' '), '.', ' ')) ||
+		to_tsvector('simple', REPLACE(REPLACE(COALESCE((SELECT STRING_AGG(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'cc'), ''), '@', ' '), '.', ' '))
 	FROM (
 		SELECT m2.id, mb.body_text
 		FROM messages m2

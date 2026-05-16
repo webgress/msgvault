@@ -62,6 +62,26 @@ func (d *SQLiteDialect) FTSDeleteSQL() string {
 	)`
 }
 
+// SanitizeFTSQuery strips FTS5 metacharacters and wraps the result in
+// quotes for literal phrase interpretation with prefix match. Returns ""
+// if nothing of substance remains.
+func (d *SQLiteDialect) SanitizeFTSQuery(query string) string {
+	var b strings.Builder
+	for _, r := range query {
+		switch r {
+		case '"', '*', ':', '-', '(', ')', '.':
+			continue
+		default:
+			b.WriteRune(r)
+		}
+	}
+	clean := strings.TrimSpace(b.String())
+	if clean == "" {
+		return ""
+	}
+	return `"` + clean + `"*`
+}
+
 // FTSBackfillBatchSQL returns the SQL to backfill FTS5 for a range of message IDs.
 // Parameters: fromID(?), toID(?)
 func (d *SQLiteDialect) FTSBackfillBatchSQL() string {

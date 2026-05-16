@@ -250,6 +250,21 @@ func (s *Store) GetMessagesSummariesByIDs(ids []int64) ([]APIMessage, error) {
 
 // SearchMessages searches messages using full-text search, with batch-loaded recipients and labels.
 func (s *Store) SearchMessages(query string, offset, limit int) ([]APIMessage, int64, error) {
+	// Fall back to LIKE if FTS isn't usable on this connection — without
+	// a probe the FTS query on PG would error with "column does not exist"
+	// and on SQLite would error with "no such module: fts5".
+	if !s.fts5Available {
+		return s.searchMessagesLike(query, offset, limit)
+	}
+
+	// Per-dialect sanitization: FTS5 and tsquery reject different sets of
+	// metacharacters, and tsquery needs explicit `:*` prefix-match syntax.
+	ftsTerm := s.dialect.SanitizeFTSQuery(query)
+	if ftsTerm == "" {
+		// No usable tokens left — pretend the FTS path returned zero rows.
+		return []APIMessage{}, 0, nil
+	}
+
 	ftsJoin, ftsWhere, ftsOrder, orderArgCount := s.dialect.FTSSearchClause()
 
 	ftsQuery := fmt.Sprintf(`
@@ -274,9 +289,9 @@ func (s *Store) SearchMessages(query string, offset, limit int) ([]APIMessage, i
 	// Bind the search term once for WHERE, plus orderArgCount more times
 	// for any ? placeholders the dialect put in the order-by fragment.
 	searchArgs := make([]interface{}, 0, 3+orderArgCount)
-	searchArgs = append(searchArgs, query)
+	searchArgs = append(searchArgs, ftsTerm)
 	for i := 0; i < orderArgCount; i++ {
-		searchArgs = append(searchArgs, query)
+		searchArgs = append(searchArgs, ftsTerm)
 	}
 	searchArgs = append(searchArgs, limit, offset)
 
@@ -304,7 +319,7 @@ func (s *Store) SearchMessages(query string, offset, limit int) ([]APIMessage, i
 		%s
 		WHERE %s AND %s
 	`, ftsJoin, ftsWhere, LiveMessagesWhere("m", true))
-	if err := s.db.QueryRow(countQuery, query).Scan(&total); err != nil {
+	if err := s.db.QueryRow(countQuery, ftsTerm).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("count FTS results: %w", err)
 	}
 
@@ -329,17 +344,37 @@ func (s *Store) SearchMessagesQuery(
 	// FTS text terms. ftsEnabled is the authoritative signal that FTS is
 	// active — ftsJoin may be empty on dialects (e.g. PostgreSQL) whose
 	// tsvector lives on the main table and needs no extra join.
-	ftsEnabled := len(q.TextTerms) > 0
+	ftsEnabled := len(q.TextTerms) > 0 && s.fts5Available
 	var ftsJoin, ftsOrder, ftsExpr string
 	var ftsOrderArgCount int
 	if ftsEnabled {
-		ftsExpr = buildFTSExpression(q.TextTerms)
-		join, where, orderBy, orderArgCount := s.dialect.FTSSearchClause()
-		ftsJoin = join
-		ftsOrder = orderBy
-		ftsOrderArgCount = orderArgCount
-		conditions = append(conditions, where)
-		args = append(args, ftsExpr)
+		// Each term gets sanitized through the dialect; AND them together.
+		// SQLite emits `"term"*` and we join with " AND "; PostgreSQL emits
+		// `term:*` and we join with " & ". Each dialect's SanitizeFTSQuery
+		// already joins multi-token input — so we just join across terms.
+		var sanitized []string
+		for _, t := range q.TextTerms {
+			s := s.dialect.SanitizeFTSQuery(t)
+			if s != "" {
+				sanitized = append(sanitized, s)
+			}
+		}
+		if len(sanitized) == 0 {
+			// No usable tokens; treat as no-FTS.
+			ftsEnabled = false
+		} else {
+			sep := " AND "
+			if s.dialect.DriverName() == "pgx" {
+				sep = " & "
+			}
+			ftsExpr = strings.Join(sanitized, sep)
+			join, where, orderBy, orderArgCount := s.dialect.FTSSearchClause()
+			ftsJoin = join
+			ftsOrder = orderBy
+			ftsOrderArgCount = orderArgCount
+			conditions = append(conditions, where)
+			args = append(args, ftsExpr)
+		}
 	}
 
 	// from: filter

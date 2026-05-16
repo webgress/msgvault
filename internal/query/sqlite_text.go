@@ -425,6 +425,15 @@ func (e *SQLiteEngine) TextSearch(
 		limit = 50
 	}
 
+	// Per-dialect sanitization: FTS5 MATCH and tsquery reject different
+	// metacharacters. Without this, a user query containing `:`, `*`, `-`,
+	// `|`, or `&` would error out on at least one backend. Empty result
+	// after sanitization → no-match.
+	ftsTerm := e.dialect.SanitizeFTSQuery(query)
+	if ftsTerm == "" {
+		return nil, nil
+	}
+
 	sqlQuery := fmt.Sprintf(`
 		SELECT
 			m.id,
@@ -438,23 +447,23 @@ func (e *SQLiteEngine) TextSearch(
 			COALESCE(p.phone_number, '') AS from_phone,
 			m.sent_at,
 			COALESCE(m.size_estimate, 0) AS size_estimate,
-			COALESCE(m.has_attachments, 0) AS has_attachments,
+			COALESCE(m.has_attachments, FALSE) AS has_attachments,
 			0 AS attachment_count,
 			m.deleted_from_source_at,
 			COALESCE(m.message_type, '') AS message_type,
 			COALESCE(c.title, '') AS conv_title
-		FROM messages_fts fts
-		JOIN messages m ON m.id = fts.rowid
+		FROM messages m
+		%s
 		LEFT JOIN participants p ON p.id = m.sender_id
 		LEFT JOIN conversations c ON c.id = m.conversation_id
-		WHERE fts.messages_fts MATCH ?
+		WHERE %s
 		  AND m.message_type IN ('whatsapp','imessage','sms','google_voice_text')
 		  AND %s
 		ORDER BY m.sent_at DESC
 		LIMIT ? OFFSET ?
-	`, store.LiveMessagesWhere("m", true))
+	`, e.dialect.FTSJoin(), e.dialect.FTSSearchExpression(), store.LiveMessagesWhere("m", true))
 
-	rows, err := e.db.QueryContext(ctx, sqlQuery, query, limit, offset)
+	rows, err := e.queryContext(ctx, sqlQuery, ftsTerm, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("text search: %w", err)
 	}

@@ -83,6 +83,13 @@ type Dialect interface {
 	// a given source. Takes one parameter: source_id.
 	FTSDeleteSQL() string
 
+	// SanitizeFTSQuery converts a raw user search string to a form safe to
+	// pass to the dialect's FTS engine — FTS5 MATCH on SQLite, tsquery on
+	// PostgreSQL. Returns "" if the result is empty after sanitization
+	// (caller treats as no-match). Per-dialect because the FTS engines
+	// reject completely different sets of metacharacters.
+	SanitizeFTSQuery(query string) string
+
 	// FTSBackfillBatchSQL returns the SQL to populate the search index for a range of message IDs.
 	// Uses two ? placeholders for the ID range: WHERE m.id >= ? AND m.id < ?
 	FTSBackfillBatchSQL() string

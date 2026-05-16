@@ -103,10 +103,10 @@ func TestPostgreSQLDialect_FTSSearchClause(t *testing.T) {
 	if join != "" {
 		t.Errorf("join = %q, want empty (PostgreSQL needs no JOIN)", join)
 	}
-	if where != "m.search_fts @@ plainto_tsquery('simple', ?)" {
+	if where != "m.search_fts @@ to_tsquery('simple', ?)" {
 		t.Errorf("where = %q, unexpected", where)
 	}
-	if orderBy != "ts_rank(m.search_fts, plainto_tsquery('simple', ?)) DESC" {
+	if orderBy != "ts_rank(m.search_fts, to_tsquery('simple', ?)) DESC" {
 		t.Errorf("orderBy = %q, unexpected", orderBy)
 	}
 	if orderArgCount != 1 {
@@ -120,5 +120,52 @@ func TestPostgreSQLDialect_InsertOrIgnorePrefix(t *testing.T) {
 	want := "INSERT INTO message_labels (message_id, label_id) VALUES "
 	if got := d.InsertOrIgnorePrefix(in); got != want {
 		t.Errorf("InsertOrIgnorePrefix(%q) = %q, want %q", in, got, want)
+	}
+}
+
+func TestPostgreSQLDialect_JSONPlaceholder(t *testing.T) {
+	d := &PostgreSQLDialect{}
+	if got := d.JSONPlaceholder(); got != "?::jsonb" {
+		t.Errorf("JSONPlaceholder() = %q, want %q", got, "?::jsonb")
+	}
+}
+
+func TestPostgreSQLDialect_SanitizeFTSQuery(t *testing.T) {
+	d := &PostgreSQLDialect{}
+	tests := []struct {
+		name, in, want string
+	}{
+		{"bare word", "hello", "hello:*"},
+		{"two words", "hello world", "hello:* & world:*"},
+		{"email split on @ and .", "alice@example.com", "alice:* & example:* & com:*"},
+		{"strip tsquery operators", "hello & world | foo", "hello:* & world:* & foo:*"},
+		{"empty after sanitization", "&|!", ""},
+		{"prefix glob stripped", "foo*", "foo:*"},
+		{"single quote stripped", "o'brien", "obrien:*"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := d.SanitizeFTSQuery(tc.in); got != tc.want {
+				t.Errorf("SanitizeFTSQuery(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSQLiteDialect_SanitizeFTSQuery(t *testing.T) {
+	d := &SQLiteDialect{}
+	tests := []struct {
+		name, in, want string
+	}{
+		{"bare word", "hello", `"hello"*`},
+		{"strip FTS5 operators", `"hello" * ()`, `"hello"*`},
+		{"empty after strip", `"":-.()`, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := d.SanitizeFTSQuery(tc.in); got != tc.want {
+				t.Errorf("SanitizeFTSQuery(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
 	}
 }
