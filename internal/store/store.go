@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -61,6 +62,33 @@ func isSQLiteError(err error, substr string) bool {
 // isPostgresURL returns true if the path looks like a PostgreSQL connection URL.
 func isPostgresURL(dbPath string) bool {
 	return strings.HasPrefix(dbPath, "postgresql://") || strings.HasPrefix(dbPath, "postgres://")
+}
+
+// RedactPassword returns a version of a database path or URL safe to log or
+// print to stdout. For PostgreSQL URLs with a userinfo:password@ component,
+// the password is replaced with `***`. SQLite paths are returned unchanged.
+//
+// Malformed URLs are returned unchanged rather than failing — this function
+// is for display safety, not validation.
+func RedactPassword(dbPath string) string {
+	if !isPostgresURL(dbPath) {
+		return dbPath
+	}
+	u, err := url.Parse(dbPath)
+	if err != nil || u.User == nil {
+		return dbPath
+	}
+	if _, hasPassword := u.User.Password(); !hasPassword {
+		return dbPath
+	}
+	// url.UserPassword percent-encodes "*" → "%2A%2A%2A"; reconstruct the
+	// userinfo segment by hand to keep the literal "***" in the output.
+	username := u.User.Username()
+	u.User = nil
+	rest := u.String()
+	prefix := u.Scheme + "://"
+	tail := strings.TrimPrefix(rest, prefix)
+	return prefix + username + ":***@" + tail
 }
 
 // Open opens or creates the database at the given path.

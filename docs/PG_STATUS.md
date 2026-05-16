@@ -99,3 +99,35 @@ make test
 Each test creates and drops its own schema (`msgvault_test_<hex>`) for
 isolation. The `testutil.NewTestStore()` helper detects the env var and
 routes accordingly. If `MSGVAULT_TEST_DB` is unset, SQLite is used.
+
+## Full-Text Search
+
+FTS is implemented per-dialect behind a small surface (`Dialect.FTSUpsert`,
+`FTSSearchClause`, `FTSAvailable`, `SanitizeFTSQuery`). The store layer
+calls into these and is otherwise dialect-agnostic.
+
+| Concern | SQLite | PostgreSQL |
+|---|---|---|
+| Index location | `messages_fts` virtual table (FTS5) | `messages.search_fts` tsvector column + GIN index |
+| Search clause | `messages_fts MATCH ?` | `m.search_fts @@ to_tsquery('simple', ?)` |
+| Sanitization | strip `"*:-().`, wrap as `"term"*` | strip tsquery ops; replace `@./-/,;"` with spaces; emit `term:*` joined by ` & ` |
+| Rank | implicit `rank` column | `ts_rank(m.search_fts, to_tsquery('simple', ?))` |
+| Backfill | `INSERT OR REPLACE INTO messages_fts ...` | `UPDATE messages SET search_fts = setweight(...)` |
+
+### Email tokenization on PG
+
+PostgreSQL's 'simple' tsvector config indexes `alice@example.com` as a
+single token, so searching for `alice` alone would miss the row. Both
+`FTSUpsert` and `FTSBackfillBatchSQL` pre-process address fields with
+`REPLACE(@, ' ')` and `REPLACE(., ' ')` so the components become
+individually searchable. The same transformation runs over user input
+inside `SanitizeFTSQuery` so the query and document tokenization stay
+aligned.
+
+### Portable coverage
+
+The store-layer FTS path is exercised through public-API tests that run
+identically against both backends (set `MSGVAULT_TEST_DB` to a PG URL
+to run them on PostgreSQL). These cover upsert, search, replace-on-update,
+backfill, cascade cleanup, and metacharacter handling. SQLite-specific
+tests that inspect `messages_fts` directly are kept and skipped on PG.

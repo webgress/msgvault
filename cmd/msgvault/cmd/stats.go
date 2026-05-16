@@ -133,7 +133,7 @@ Use --local to force local database.`,
 		if IsRemoteMode() {
 			fmt.Printf("Remote: %s\n", cfg.Remote.URL)
 		} else {
-			fmt.Printf("Database: %s\n", cfg.DatabaseDSN())
+			fmt.Printf("Database: %s\n", store.RedactPassword(cfg.DatabaseDSN()))
 		}
 
 		printStats(dbStats)
