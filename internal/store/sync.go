@@ -168,16 +168,17 @@ func (s *Store) StartSync(sourceID int64, syncType string) (int64, error) {
 		return 0, fmt.Errorf("mark old syncs failed: %w", err)
 	}
 
-	// Create new sync run
-	result, err := s.db.Exec(fmt.Sprintf(`
+	// Create new sync run — use RETURNING for portability (pgx has no LastInsertId).
+	var syncRunID int64
+	err = s.db.QueryRow(fmt.Sprintf(`
 		INSERT INTO sync_runs (source_id, started_at, status, messages_processed, messages_added, messages_updated, errors_count)
 		VALUES (?, %s, 'running', 0, 0, 0, 0)
-	`, now), sourceID)
+		RETURNING id
+	`, now), sourceID).Scan(&syncRunID)
 	if err != nil {
 		return 0, fmt.Errorf("insert sync_run: %w", err)
 	}
-
-	return result.LastInsertId()
+	return syncRunID, nil
 }
 
 // UpdateSyncCheckpoint saves progress for resumption.
@@ -328,23 +329,22 @@ func (s *Store) GetOrCreateSource(sourceType, identifier string) (*Source, error
 		return nil, err
 	}
 
-	// Create new
+	// Create new — use RETURNING for portability (pgx has no LastInsertId).
 	now := s.dialect.Now()
-	result, err := s.db.Exec(fmt.Sprintf(`
-		INSERT INTO sources (source_type, identifier, created_at, updated_at)
-		VALUES (?, ?, %s, %s)
-	`, now, now), sourceType, identifier)
-	if err != nil {
-		return nil, fmt.Errorf("insert source: %w", err)
-	}
-
 	newSource := &Source{
 		SourceType: sourceType,
 		Identifier: identifier,
 		CreatedAt:  time.Now(),
 		UpdatedAt:  time.Now(),
 	}
-	newSource.ID, _ = result.LastInsertId()
+	err = s.db.QueryRow(fmt.Sprintf(`
+		INSERT INTO sources (source_type, identifier, created_at, updated_at)
+		VALUES (?, ?, %s, %s)
+		RETURNING id
+	`, now, now), sourceType, identifier).Scan(&newSource.ID)
+	if err != nil {
+		return nil, fmt.Errorf("insert source: %w", err)
+	}
 
 	// Add to the default "All" collection if it exists.
 	//
@@ -357,8 +357,10 @@ func (s *Store) GetOrCreateSource(sourceType, identifier string) (*Source, error
 	// All would miss this source. Acceptable for a single-user tool;
 	// a future refactor can fold this into a withTx.
 	if _, err := s.db.Exec(
-		`INSERT OR IGNORE INTO collection_sources (collection_id, source_id)
-		 SELECT id, ? FROM collections WHERE name = ?`,
+		s.dialect.InsertOrIgnore(
+			`INSERT OR IGNORE INTO collection_sources (collection_id, source_id)
+			 SELECT id, ? FROM collections WHERE name = ?`,
+		),
 		newSource.ID, DefaultCollectionName,
 	); err != nil {
 		slog.Warn("failed to add source to default collection (self-heals on next InitSchema)",

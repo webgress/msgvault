@@ -72,8 +72,10 @@ func (s *Store) EnsureDefaultCollection() error {
 
 	// Add all sources not already in it.
 	if _, err := s.db.Exec(
-		`INSERT OR IGNORE INTO collection_sources (collection_id, source_id)
-		 SELECT ?, id FROM sources`,
+		s.dialect.InsertOrIgnore(
+			`INSERT OR IGNORE INTO collection_sources (collection_id, source_id)
+			 SELECT ?, id FROM sources`,
+		),
 		id,
 	); err != nil {
 		return fmt.Errorf("seed default collection membership: %w", err)
@@ -243,9 +245,11 @@ func (s *Store) AddSourcesToCollection(name string, sourceIDs []int64) error {
 	return s.withTx(func(tx *loggedTx) error {
 		for _, sid := range sourceIDs {
 			if _, err := tx.Exec(
-				`INSERT OR IGNORE INTO collection_sources
-				  (collection_id, source_id)
-				 VALUES (?, ?)`,
+				s.dialect.InsertOrIgnore(
+					`INSERT OR IGNORE INTO collection_sources
+					  (collection_id, source_id)
+					 VALUES (?, ?)`,
+				),
 				collID, sid,
 			); err != nil {
 				return fmt.Errorf("add source %d: %w", sid, err)

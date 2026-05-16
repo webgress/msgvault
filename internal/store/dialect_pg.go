@@ -104,11 +104,12 @@ func (d *PostgreSQLDialect) FTSDeleteSQL() string {
 }
 
 // FTSBackfillBatchSQL returns the SQL to populate tsvector for a range of message IDs.
-// Parameters: $1=fromID, $2=toID
+// Parameters: $1=fromID, $2=toID. Uses LEFT JOIN on message_bodies via a subquery
+// so messages without a body row are still indexed (subject + participants).
 func (d *PostgreSQLDialect) FTSBackfillBatchSQL() string {
 	return `UPDATE messages m SET search_fts =
 		setweight(to_tsvector('simple', COALESCE(m.subject, '')), 'A') ||
-		to_tsvector('simple', COALESCE(mb.body_text, '')) ||
+		to_tsvector('simple', COALESCE(src.body_text, '')) ||
 		setweight(to_tsvector('simple', COALESCE(
 			CASE WHEN m.message_type != 'email' AND m.message_type IS NOT NULL AND m.message_type != ''
 			     THEN (SELECT COALESCE(p.phone_number, p.email_address) FROM participants p WHERE p.id = m.sender_id)
@@ -118,8 +119,13 @@ func (d *PostgreSQLDialect) FTSBackfillBatchSQL() string {
 		)), 'B') ||
 		to_tsvector('simple', COALESCE((SELECT STRING_AGG(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'to'), '')) ||
 		to_tsvector('simple', COALESCE((SELECT STRING_AGG(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'cc'), ''))
-	FROM message_bodies mb
-	WHERE mb.message_id = m.id AND m.id >= $1 AND m.id < $2`
+	FROM (
+		SELECT m2.id, mb.body_text
+		FROM messages m2
+		LEFT JOIN message_bodies mb ON mb.message_id = m2.id
+		WHERE m2.id >= $1 AND m2.id < $2
+	) src
+	WHERE m.id = src.id`
 }
 
 // FTSAvailable reports whether tsvector search is available.
@@ -148,9 +154,10 @@ func (d *PostgreSQLDialect) FTSClearSQL() string {
 	return "UPDATE messages SET search_fts = NULL"
 }
 
-// SchemaFTS returns the embedded filename containing PostgreSQL FTS DDL.
+// SchemaFTS returns "" for PostgreSQL — the tsvector column is part of the
+// main schema_pg.sql, not a separate file.
 func (d *PostgreSQLDialect) SchemaFTS() string {
-	return "schema_pg.sql"
+	return ""
 }
 
 // FTSRebuildSchema is a scaffold for PostgreSQL. The SQLite path drops and
@@ -162,14 +169,32 @@ func (d *PostgreSQLDialect) FTSRebuildSchema(db *sql.DB) error {
 	return fmt.Errorf("FTSRebuildSchema: PostgreSQL FTS rebuild not yet implemented")
 }
 
+// LegacyColumnMigrations returns an empty slice for PostgreSQL. The full
+// schema_pg.sql is always complete and current — fresh PG installs never
+// need ALTER TABLE column migrations.
+func (d *PostgreSQLDialect) LegacyColumnMigrations() []ColumnMigration {
+	return nil
+}
+
+// DatabaseSize queries pg_database_size() for the current database.
+func (d *PostgreSQLDialect) DatabaseSize(db *sql.DB, _ string) (int64, error) {
+	var size int64
+	err := db.QueryRow("SELECT pg_database_size(current_database())").Scan(&size)
+	if err != nil {
+		return 0, fmt.Errorf("pg_database_size: %w", err)
+	}
+	return size, nil
+}
+
 // InitConn performs PostgreSQL-specific connection initialization.
 // Per-connection settings are applied through pgx RuntimeParams during open,
 // so they affect every pooled connection.
 func (d *PostgreSQLDialect) InitConn(db *sql.DB) error { return nil }
 
 // SchemaFiles returns the schema files to execute during InitSchema.
+// For PostgreSQL the full native schema is in schema_pg.sql.
 func (d *PostgreSQLDialect) SchemaFiles() []string {
-	return []string{"schema.sql"}
+	return []string{"schema_pg.sql"}
 }
 
 // CheckpointWAL is a no-op for PostgreSQL (no WAL checkpoint needed).

@@ -13,6 +13,13 @@ type FTSDoc struct {
 	CcAddrs   string
 }
 
+// ColumnMigration is a single ALTER TABLE ADD COLUMN statement used by
+// SQLiteDialect.LegacyColumnMigrations to evolve older SQLite databases.
+type ColumnMigration struct {
+	SQL  string // full ALTER TABLE ... ADD COLUMN statement
+	Desc string // short label for error messages
+}
+
 // Dialect abstracts database-specific SQL generation and behavior.
 // Implementations exist for SQLite (default) and PostgreSQL (opt-in).
 type Dialect interface {
@@ -97,6 +104,20 @@ type Dialect interface {
 	// SQLite: DROP TABLE IF EXISTS messages_fts + re-execute schema_sqlite.sql.
 	// PostgreSQL: TODO (REINDEX / recompute tsvector column).
 	FTSRebuildSchema(db *sql.DB) error
+
+	// LegacyColumnMigrations returns ALTER TABLE ADD COLUMN statements to
+	// bring older databases up to date with schema columns added over time.
+	// For SQLite: returns the full list of idempotent ADD COLUMN statements
+	// (IsDuplicateColumnError silences already-applied ones). For PostgreSQL:
+	// returns an empty slice because schema_pg.sql is always the complete,
+	// current schema — fresh installs never need ALTER TABLE.
+	LegacyColumnMigrations() []ColumnMigration
+
+	// DatabaseSize returns the on-disk or logical size of the database in
+	// bytes. For SQLite: file size at dbPath. For PostgreSQL: queries
+	// pg_database_size(). Returns 0 if the size cannot be determined;
+	// an error only for genuine failures (not missing files).
+	DatabaseSize(db *sql.DB, dbPath string) (int64, error)
 
 	// Connection lifecycle
 
