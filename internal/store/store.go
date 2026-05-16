@@ -143,12 +143,20 @@ func openPostgres(dbURL string) (*Store, error) {
 		return nil, fmt.Errorf("init PostgreSQL connection: %w", err)
 	}
 
-	return &Store{
+	s := &Store{
 		db:           newLoggedDB(db, dialect.Rebind),
 		dbPath:       dbURL,
 		dialect:      dialect,
 		closeCleanup: cleanup,
-	}, nil
+	}
+
+	// Probe FTS availability so the SearchMessages / FTS upsert paths know
+	// the column exists once the schema is initialized. If the schema hasn't
+	// been loaded yet the probe returns false; InitSchema's own probe will
+	// flip the flag once schema_pg.sql is loaded.
+	s.fts5Available = dialect.FTSAvailable(db)
+
+	return s, nil
 }
 
 // OpenReadOnly opens an existing database in read-only mode. Suitable for
@@ -315,6 +323,30 @@ func (s *Store) DB() *sql.DB {
 // query paths.
 func (s *Store) IsPostgreSQL() bool {
 	return s.dialect.DriverName() == "pgx"
+}
+
+// Exec runs a write through the store's loggedDB so placeholders are
+// rebound for the active dialect. Use this from external packages
+// (sync, whatsapp, etc.) instead of `s.DB().Exec(...)`, which bypasses
+// the rebind and breaks on PostgreSQL.
+func (s *Store) Exec(query string, args ...any) (sql.Result, error) {
+	return s.db.Exec(query, args...)
+}
+
+// QueryRow runs a single-row read through the store's loggedDB.
+// See Exec for why external packages should prefer this to `s.DB().QueryRow`.
+func (s *Store) QueryRow(query string, args ...any) *sql.Row {
+	return s.db.QueryRow(query, args...)
+}
+
+// Query runs a multi-row read through the store's loggedDB.
+// See Exec for why external packages should prefer this to `s.DB().Query`.
+func (s *Store) Query(query string, args ...any) (*sql.Rows, error) {
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return rows.Rows, nil
 }
 
 // WithExclusiveLock executes fn while holding an exclusive write lock on the

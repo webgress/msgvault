@@ -222,7 +222,7 @@ func optsToFilterConditions(opts AggregateOptions, prefix string) ([]string, []i
 		args = append(args, opts.Before.Format("2006-01-02 15:04:05"))
 	}
 	if opts.WithAttachmentsOnly {
-		conditions = append(conditions, prefix+"has_attachments = 1")
+		conditions = append(conditions, prefix+"has_attachments")
 	}
 
 	return conditions, args
@@ -298,7 +298,7 @@ func (e *SQLiteEngine) buildFilterJoinsAndConditions(filter MessageFilter, table
 	}
 
 	if filter.WithAttachmentsOnly {
-		conditions = append(conditions, prefix+"has_attachments = 1")
+		conditions = append(conditions, prefix+"has_attachments")
 	}
 
 	// Sender filter - check both message_recipients (email) and direct sender_id (WhatsApp/chat)
@@ -919,7 +919,7 @@ func (e *SQLiteEngine) GetTotalStats(ctx context.Context, opts StatsOptions) (*T
 		conditions, args, "m.", opts.SourceID, opts.SourceIDs,
 	)
 	if opts.WithAttachmentsOnly {
-		conditions = append(conditions, "m.has_attachments = 1")
+		conditions = append(conditions, "m.has_attachments")
 	}
 	// Merge search conditions
 	conditions = append(conditions, searchConditions...)
@@ -1313,7 +1313,7 @@ func (e *SQLiteEngine) buildSearchQueryParts(ctx context.Context, q *search.Quer
 
 	// Has attachment filter
 	if q.HasAttachment != nil && *q.HasAttachment {
-		conditions = append(conditions, "m.has_attachments = 1")
+		conditions = append(conditions, "m.has_attachments")
 	}
 
 	// Date range filters

@@ -69,6 +69,11 @@ func (d *PostgreSQLDialect) InsertOrIgnoreSuffix() string {
 	return " ON CONFLICT DO NOTHING"
 }
 
+// JSONPlaceholder returns "?::jsonb" so a Go string can be bound to a JSONB
+// column. Without the cast pgx raises "column of type jsonb but expression
+// is of type text".
+func (d *PostgreSQLDialect) JSONPlaceholder() string { return "?::jsonb" }
+
 // FTSUpsert updates the tsvector column on messages for a single message.
 // PostgreSQL stores the FTS index inline on `messages.search_fts`, so there
 // is no separate virtual table — the operation is an UPDATE, not an INSERT.

@@ -56,6 +56,12 @@ type Dialect interface {
 	// PostgreSQL: " ON CONFLICT DO NOTHING"
 	InsertOrIgnoreSuffix() string
 
+	// JSONPlaceholder returns the placeholder to use when binding a JSON
+	// string value to a JSON / JSONB column. SQLite has no JSON type, so the
+	// plain "?" suffices; PostgreSQL's JSONB column rejects a text binding
+	// without an explicit cast, so this returns "?::jsonb".
+	JSONPlaceholder() string
+
 	// Full-text search
 
 	// FTSUpsert inserts or updates the search index for a single message.

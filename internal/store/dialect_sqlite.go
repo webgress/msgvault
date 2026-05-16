@@ -30,6 +30,9 @@ func (d *SQLiteDialect) InsertOrIgnorePrefix(sql string) string { return sql }
 // InsertOrIgnoreSuffix returns "" for SQLite — OR IGNORE is in the statement prefix.
 func (d *SQLiteDialect) InsertOrIgnoreSuffix() string { return "" }
 
+// JSONPlaceholder returns "?" — SQLite has no JSON column type.
+func (d *SQLiteDialect) JSONPlaceholder() string { return "?" }
+
 // FTSUpsert inserts or replaces an FTS5 row. FTS5 requires rowid to be
 // specified explicitly so the virtual table's rowid matches messages.id;
 // the dialect owns this detail so callers don't pass messageID twice.
