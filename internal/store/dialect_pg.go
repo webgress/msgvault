@@ -41,21 +41,19 @@ func (d *PostgreSQLDialect) Rebind(query string) string {
 // Now returns the PostgreSQL expression for the current timestamp.
 func (d *PostgreSQLDialect) Now() string { return "NOW()" }
 
-// InsertOrIgnore rewrites INSERT OR IGNORE INTO to INSERT INTO and, if the
-// statement appears complete (ends with ")" after VALUES), appends
-// " ON CONFLICT DO NOTHING". Prefix-only strings (ending with "VALUES ")
-// do not get the suffix here — callers use InsertOrIgnoreSuffix() instead,
-// to be appended after the VALUES tuples are assembled.
+// InsertOrIgnore rewrites INSERT OR IGNORE INTO to INSERT INTO and appends
+// " ON CONFLICT DO NOTHING" for complete statements. A statement is treated
+// as a prefix (caller will append VALUES tuples + InsertOrIgnoreSuffix) only
+// when it ends with the bare "VALUES" keyword; otherwise the rewrite assumes
+// the input is a complete statement (VALUES-tuple, INSERT...SELECT, etc.)
+// and appends the conflict clause.
 func (d *PostgreSQLDialect) InsertOrIgnore(sql string) string {
 	s := strings.Replace(sql, "INSERT OR IGNORE INTO", "INSERT INTO", 1)
-	// If the input is a complete statement (ends with ")" — i.e., VALUES tuples
-	// already closed), append the conflict clause. If it ends with "VALUES "
-	// (prefix form used by insertInChunks), leave the suffix to the caller.
 	trimmed := strings.TrimRight(s, " \t\n\r")
-	if strings.HasSuffix(trimmed, ")") {
-		return trimmed + " ON CONFLICT DO NOTHING"
+	if strings.HasSuffix(strings.ToUpper(trimmed), "VALUES") {
+		return s
 	}
-	return s
+	return trimmed + " ON CONFLICT DO NOTHING"
 }
 
 // InsertOrIgnorePrefix strips "OR IGNORE" from a chunked insert prefix —
