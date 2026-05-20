@@ -1,6 +1,9 @@
 package store
 
-import "database/sql"
+import (
+	"context"
+	"database/sql"
+)
 
 // FTSDoc is the set of fields the dialect needs to upsert a message into
 // the full-text search index.
@@ -163,4 +166,15 @@ type Dialect interface {
 	// (SQLITE_LOCKED). Used to surface actionable errors from maintenance
 	// commands that need exclusive access.
 	IsBusyError(err error) bool
+
+	// BeginExclusive opens a transaction on conn that blocks concurrent
+	// writers to the tables sync code touches (sync_runs in particular,
+	// so StartSync's INSERT cannot run until COMMIT/ROLLBACK). Readers
+	// may proceed.
+	// SQLite: a single "BEGIN EXCLUSIVE" statement (WAL mode allows
+	// concurrent reads while blocking writers).
+	// PostgreSQL: "BEGIN" followed by LOCK TABLE sync_runs IN EXCLUSIVE
+	// MODE, which conflicts with the ROW EXCLUSIVE lock INSERT acquires
+	// but does not block ACCESS SHARE (reads).
+	BeginExclusive(ctx context.Context, conn *sql.Conn) error
 }

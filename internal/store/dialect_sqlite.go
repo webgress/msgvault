@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -227,6 +228,13 @@ func (d *SQLiteDialect) IsReturningError(err error) bool {
 // the result code is more robust than substring matching: BUSY surfaces as
 // "database is locked" but LOCKED surfaces as "database table is locked",
 // so a single substring cannot catch both.
+// BeginExclusive opens a SQLite "BEGIN EXCLUSIVE" transaction on conn.
+// In WAL mode this blocks concurrent writers while readers can proceed.
+func (d *SQLiteDialect) BeginExclusive(ctx context.Context, conn *sql.Conn) error {
+	_, err := conn.ExecContext(ctx, "BEGIN EXCLUSIVE")
+	return err
+}
+
 func (d *SQLiteDialect) IsBusyError(err error) bool {
 	if err == nil {
 		return false

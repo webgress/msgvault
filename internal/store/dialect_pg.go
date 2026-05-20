@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -236,6 +237,21 @@ func (d *PostgreSQLDialect) IsReturningError(err error) bool { return false }
 // for deadlocks; both mean "retry later."
 func (d *PostgreSQLDialect) IsBusyError(err error) bool {
 	return isPgError(err, "55P03") || isPgError(err, "40P01")
+}
+
+// BeginExclusive opens a transaction on conn and locks sync_runs in
+// EXCLUSIVE mode. EXCLUSIVE conflicts with the ROW EXCLUSIVE lock that
+// INSERT acquires, so concurrent StartSync calls block until the caller
+// commits or rolls back. ACCESS SHARE (reads) is still permitted.
+func (d *PostgreSQLDialect) BeginExclusive(ctx context.Context, conn *sql.Conn) error {
+	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "LOCK TABLE sync_runs IN EXCLUSIVE MODE"); err != nil {
+		_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		return err
+	}
+	return nil
 }
 
 // isPgError checks if err is a pgconn.PgError with the given SQLSTATE code.
