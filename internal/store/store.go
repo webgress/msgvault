@@ -331,7 +331,7 @@ func (s *Store) WithExclusiveLock(ctx context.Context, fn func() error) error {
 	}
 	defer func() { _ = conn.Close() }()
 
-	if _, err := conn.ExecContext(ctx, "BEGIN EXCLUSIVE"); err != nil {
+	if err := s.dialect.BeginExclusive(ctx, conn); err != nil {
 		return fmt.Errorf("begin exclusive: %w", err)
 	}
 
