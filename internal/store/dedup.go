@@ -82,7 +82,7 @@ func (s *Store) FindDuplicatesByRFC822ID(sourceIDs ...int64) ([]DuplicateGroupKe
 	}
 	query += `
 		GROUP BY rfc822_message_id
-		HAVING cnt > 1`
+		HAVING COUNT(*) > 1`
 
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
