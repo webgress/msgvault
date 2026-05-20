@@ -114,11 +114,13 @@ func (s *Store) CreateCollection(
 
 	var created *Collection
 	err := s.withTx(func(tx *loggedTx) error {
-		res, err := tx.Exec(
+		var id int64
+		err := tx.QueryRow(
 			`INSERT INTO collections (name, description)
-			 VALUES (?, ?)`,
+			 VALUES (?, ?)
+			 RETURNING id`,
 			name, description,
-		)
+		).Scan(&id)
 		if err != nil {
 			if isSQLiteError(err, "UNIQUE constraint failed") {
 				return fmt.Errorf(
@@ -126,10 +128,6 @@ func (s *Store) CreateCollection(
 				)
 			}
 			return fmt.Errorf("insert collection: %w", err)
-		}
-		id, err := res.LastInsertId()
-		if err != nil {
-			return fmt.Errorf("last insert id: %w", err)
 		}
 
 		for _, sid := range unique {
