@@ -291,6 +291,26 @@ CREATE TABLE IF NOT EXISTS collection_sources (
     PRIMARY KEY (collection_id, source_id)
 );
 
+-- Confirmed per-account "me" identities used by sent-message detection
+-- in dedup. Identity is account-scoped: an address confirmed for one
+-- source does not imply it is "me" in any other source.
+CREATE TABLE IF NOT EXISTS account_identities (
+    source_id     BIGINT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    address       TEXT NOT NULL,
+    source_signal TEXT NOT NULL DEFAULT '',
+    confirmed_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (source_id, address)
+);
+
+-- Marks one-time data migrations that have already run. Schema DDL is
+-- idempotent via IF NOT EXISTS; this table is for *data* migrations
+-- (e.g. moving legacy config into per-account records) that must run
+-- exactly once.
+CREATE TABLE IF NOT EXISTS applied_migrations (
+    name       TEXT PRIMARY KEY,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 -- ============================================================================
 -- INDEXES
 -- ============================================================================
@@ -334,3 +354,6 @@ CREATE INDEX IF NOT EXISTS idx_labels_source ON labels(source_id);
 CREATE INDEX IF NOT EXISTS idx_message_labels_label ON message_labels(label_id);
 
 CREATE INDEX IF NOT EXISTS idx_sync_runs_source ON sync_runs(source_id, started_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_account_identities_address
+    ON account_identities(address);
