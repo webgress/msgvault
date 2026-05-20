@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+werboard_project: msgvault
+
 ## General Workflow
 
 When a task involves multiple steps (e.g., implement + commit + PR), complete ALL steps in sequence without stopping. If creating a branch, committing, and opening a PR, finish the entire chain.
