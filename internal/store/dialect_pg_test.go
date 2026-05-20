@@ -79,6 +79,11 @@ func TestPostgreSQLDialect_InsertOrIgnore(t *testing.T) {
 			in:   "INSERT OR IGNORE INTO message_labels (message_id, label_id) VALUES ",
 			want: "INSERT INTO message_labels (message_id, label_id) VALUES ",
 		},
+		{
+			name: "INSERT ... SELECT gets ON CONFLICT DO NOTHING",
+			in:   "INSERT OR IGNORE INTO collection_sources (collection_id, source_id) SELECT ?, id FROM sources",
+			want: "INSERT INTO collection_sources (collection_id, source_id) SELECT ?, id FROM sources ON CONFLICT DO NOTHING",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
