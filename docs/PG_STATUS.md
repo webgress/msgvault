@@ -27,9 +27,10 @@ attachment storage on PG, and end-to-end coverage under
   (including quoted-string safety)
 - `PostgreSQLDialect.Now()`, `InsertOrIgnore()` (complete + prefix),
   `InsertOrIgnoreSuffix()`, `FTSSearchClause()`, `UpdateOrIgnore()`
-- `PostgreSQLDialect.LegacyColumnMigrations()` returns the empty list — the
-  PostgreSQL schema is always shipped complete via `schema_pg.sql`, so no
-  legacy `ALTER TABLE` migration loop is needed
+- `PostgreSQLDialect.LegacyColumnMigrations()` returns the same logical list
+  as SQLite, translated to PG types (`JSONB`, `TIMESTAMPTZ`, `BIGINT`) and
+  using `ADD COLUMN IF NOT EXISTS` for idempotency. Existing PG databases
+  pick up newly added columns on the next `InitSchema()` call
 - `PostgreSQLDialect.DatabaseSize()` reports `pg_database_size(...)`
 - `PostgreSQLDialect` error-code classification (23505, 42701, 42P01)
 - `Open("postgres://...")` establishes a connection with pool settings
@@ -75,6 +76,7 @@ attachment storage on PG, and end-to-end coverage under
 | 8 | `GetStats` for PostgreSQL | `dialect.DatabaseSize()` |
 | 9 | `PostgreSQLEngine` method implementations | Dialect-parameterized `SQLiteEngine` |
 | 10 | `PostgreSQLEngine` wired to factory | `query.NewEngine(db, isPostgres)` in cmd/ |
+| 11 | Legacy column migrations on PG | `LegacyColumnMigrations()` returns the SQLite list translated to PG types, using `ADD COLUMN IF NOT EXISTS` for idempotency |
 
 ## Remaining for PR4
 

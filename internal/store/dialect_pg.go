@@ -168,11 +168,30 @@ func (d *PostgreSQLDialect) FTSRebuildSchema(db *sql.DB) error {
 	return fmt.Errorf("FTSRebuildSchema: PostgreSQL FTS rebuild not yet implemented")
 }
 
-// LegacyColumnMigrations returns an empty slice for PostgreSQL. The full
-// schema_pg.sql is always complete and current — fresh PG installs never
-// need ALTER TABLE column migrations.
+// LegacyColumnMigrations returns the ALTER TABLE ADD COLUMN statements that
+// bring older PostgreSQL databases up to the current schema. PostgreSQL has
+// supported `ADD COLUMN IF NOT EXISTS` since 9.6, so each statement is
+// idempotent on its own; IsDuplicateColumnError remains as a safety net.
+// Types are translated from the SQLite list:
+//
+//	INTEGER (id ref) → BIGINT, INTEGER (counter) → INTEGER,
+//	TEXT → TEXT, DATETIME → TIMESTAMPTZ, JSON → JSONB.
 func (d *PostgreSQLDialect) LegacyColumnMigrations() []ColumnMigration {
-	return nil
+	return []ColumnMigration{
+		{`ALTER TABLE sources ADD COLUMN IF NOT EXISTS sync_config JSONB`, "sync_config"},
+		{`ALTER TABLE messages ADD COLUMN IF NOT EXISTS rfc822_message_id TEXT`, "rfc822_message_id"},
+		{`ALTER TABLE sources ADD COLUMN IF NOT EXISTS oauth_app TEXT`, "oauth_app"},
+		{`ALTER TABLE participants ADD COLUMN IF NOT EXISTS phone_number TEXT`, "phone_number"},
+		{`ALTER TABLE participants ADD COLUMN IF NOT EXISTS canonical_id TEXT`, "canonical_id"},
+		{`ALTER TABLE messages ADD COLUMN IF NOT EXISTS sender_id BIGINT REFERENCES participants(id)`, "sender_id"},
+		{`ALTER TABLE messages ADD COLUMN IF NOT EXISTS message_type TEXT NOT NULL DEFAULT 'email'`, "message_type"},
+		{`ALTER TABLE messages ADD COLUMN IF NOT EXISTS attachment_count INTEGER DEFAULT 0`, "attachment_count"},
+		{`ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_from_source_at TIMESTAMPTZ`, "deleted_from_source_at"},
+		{`ALTER TABLE messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`, "deleted_at"},
+		{`ALTER TABLE messages ADD COLUMN IF NOT EXISTS delete_batch_id TEXT`, "delete_batch_id"},
+		{`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title TEXT`, "title"},
+		{`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS conversation_type TEXT NOT NULL DEFAULT 'email_thread'`, "conversation_type"},
+	}
 }
 
 // DatabaseSize queries pg_database_size() for the current database.

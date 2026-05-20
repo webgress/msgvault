@@ -110,10 +110,11 @@ type Dialect interface {
 
 	// LegacyColumnMigrations returns ALTER TABLE ADD COLUMN statements to
 	// bring older databases up to date with schema columns added over time.
-	// For SQLite: returns the full list of idempotent ADD COLUMN statements
-	// (IsDuplicateColumnError silences already-applied ones). For PostgreSQL:
-	// returns an empty slice because schema_pg.sql is always the complete,
-	// current schema — fresh installs never need ALTER TABLE.
+	// Both dialects return the same logical list, translated to the
+	// dialect's column-type spellings. Statements are idempotent
+	// (`IF NOT EXISTS` on PG; IsDuplicateColumnError silences re-runs on
+	// SQLite). Fresh installs see no-op ALTERs because the columns are
+	// already present in schema.sql / schema_pg.sql.
 	LegacyColumnMigrations() []ColumnMigration
 
 	// DatabaseSize returns the on-disk or logical size of the database in
