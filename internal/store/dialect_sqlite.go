@@ -25,6 +25,19 @@ func (d *SQLiteDialect) Now() string { return "datetime('now')" }
 // InsertOrIgnore is a no-op for SQLite — the syntax is native.
 func (d *SQLiteDialect) InsertOrIgnore(sql string) string { return sql }
 
+// BoolTrueExpr returns "col = 1" — SQLite stores booleans as 0/1 INTEGER.
+func (d *SQLiteDialect) BoolTrueExpr(col string) string { return col + " = 1" }
+
+// BuildFTSArg formats search terms as an FTS5 MATCH argument:
+// each term double-quote-escaped and joined by AND.
+func (d *SQLiteDialect) BuildFTSArg(terms []string) string {
+	quoted := make([]string, len(terms))
+	for i, t := range terms {
+		quoted[i] = `"` + strings.ReplaceAll(t, `"`, `""`) + `"`
+	}
+	return strings.Join(quoted, " AND ")
+}
+
 // InsertOrIgnorePrefix is a no-op for SQLite — OR IGNORE stays in the prefix.
 func (d *SQLiteDialect) InsertOrIgnorePrefix(sql string) string { return sql }
 

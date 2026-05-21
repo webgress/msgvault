@@ -168,6 +168,20 @@ type Dialect interface {
 	// commands that need exclusive access.
 	IsBusyError(err error) bool
 
+	// BoolTrueExpr returns a SQL boolean expression that evaluates to true
+	// when col holds a "true" value. SQLite stores booleans as 0/1 INTEGER
+	// (emit "col = 1"); PostgreSQL has a real BOOLEAN type and rejects
+	// integer comparisons against it, so the bare column name is correct.
+	BoolTrueExpr(col string) string
+
+	// BuildFTSArg formats a slice of user-supplied search terms into the
+	// single string argument that FTSSearchClause's WHERE fragment binds
+	// against the dialect's FTS function. SQLite returns FTS5 syntax
+	// (quoted terms joined by AND); PostgreSQL returns plain
+	// space-separated terms because plainto_tsquery handles AND natively
+	// and treats the literal `AND` token as a stopword/phrase fragment.
+	BuildFTSArg(terms []string) string
+
 	// BeginExclusive opens a transaction on conn that blocks concurrent
 	// writers to the tables sync code touches (sync_runs in particular,
 	// so StartSync's INSERT cannot run until COMMIT/ROLLBACK). Readers

@@ -113,21 +113,20 @@ func (s *Store) GetMessage(id int64) (*APIMessage, error) {
 	`
 
 	var m APIMessage
-	var sentAtStr sql.NullString
-	var deletedAtStr sql.NullString
-	err := s.db.QueryRow(query, id).Scan(&m.ID, &m.ConversationID, &m.Subject, &m.From, &sentAtStr, &m.Snippet, &m.HasAttachments, &m.SizeEstimate, &deletedAtStr)
+	var sentAt, deletedAt sql.NullTime
+	err := s.db.QueryRow(query, id).Scan(&m.ID, &m.ConversationID, &m.Subject, &m.From, &sentAt, &m.Snippet, &m.HasAttachments, &m.SizeEstimate, &deletedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	if sentAtStr.Valid && sentAtStr.String != "" {
-		m.SentAt = parseSQLiteTime(sentAtStr.String)
+	if sentAt.Valid {
+		m.SentAt = sentAt.Time
 	}
-	if deletedAtStr.Valid && deletedAtStr.String != "" {
-		deletedAt := parseSQLiteTime(deletedAtStr.String)
-		m.DeletedAt = &deletedAt
+	if deletedAt.Valid {
+		t := deletedAt.Time
+		m.DeletedAt = &t
 	}
 
 	// Get recipients (single message, per-row is fine)
@@ -333,7 +332,7 @@ func (s *Store) SearchMessagesQuery(
 	var ftsJoin, ftsOrder, ftsExpr string
 	var ftsOrderArgCount int
 	if ftsEnabled {
-		ftsExpr = buildFTSExpression(q.TextTerms)
+		ftsExpr = s.dialect.BuildFTSArg(q.TextTerms)
 		join, where, orderBy, orderArgCount := s.dialect.FTSSearchClause()
 		ftsJoin = join
 		ftsOrder = orderBy
@@ -416,7 +415,7 @@ func (s *Store) SearchMessagesQuery(
 	// has:attachment
 	if q.HasAttachment != nil && *q.HasAttachment {
 		conditions = append(conditions,
-			"m.has_attachments = 1")
+			s.dialect.BoolTrueExpr("m.has_attachments"))
 	}
 
 	// larger: / smaller:
@@ -517,15 +516,6 @@ func (s *Store) SearchMessagesQuery(
 	return messages, total, nil
 }
 
-// buildFTSExpression builds an FTS5 MATCH expression from text terms.
-func buildFTSExpression(terms []string) string {
-	quoted := make([]string, len(terms))
-	for i, t := range terms {
-		quoted[i] = `"` + strings.ReplaceAll(t, `"`, `""`) + `"`
-	}
-	return strings.Join(quoted, " AND ")
-}
-
 // searchMessagesQueryNoFTS is a fallback when FTS5 is unavailable.
 func (s *Store) searchMessagesQueryNoFTS(
 	q *search.Query, offset, limit int,
@@ -601,20 +591,23 @@ func (s *Store) searchMessagesLike(query string, offset, limit int) ([]APIMessag
 	return messages, total, nil
 }
 
-// scanMessageRows scans the standard 8-column message row set.
-// Uses string scanning for dates to handle all SQLite datetime formats robustly.
+// scanMessageRows scans the standard 8-column message row set. Timestamps
+// are scanned into sql.NullTime so the pgx/v5 stdlib driver (which
+// decodes TIMESTAMP/TIMESTAMPTZ as time.Time and refuses to convert to
+// *string) and go-sqlite3 (which accepts time.Time destinations and
+// parses its own stored formats) share a single typed path.
 func scanMessageRows(rows *loggedRows) ([]APIMessage, []int64, error) {
 	var messages []APIMessage
 	var ids []int64
 	for rows.Next() {
 		var m APIMessage
-		var sentAtStr sql.NullString
-		err := rows.Scan(&m.ID, &m.ConversationID, &m.Subject, &m.From, &sentAtStr, &m.Snippet, &m.HasAttachments, &m.SizeEstimate)
+		var sentAt sql.NullTime
+		err := rows.Scan(&m.ID, &m.ConversationID, &m.Subject, &m.From, &sentAt, &m.Snippet, &m.HasAttachments, &m.SizeEstimate)
 		if err != nil {
 			return nil, nil, err
 		}
-		if sentAtStr.Valid && sentAtStr.String != "" {
-			m.SentAt = parseSQLiteTime(sentAtStr.String)
+		if sentAt.Valid {
+			m.SentAt = sentAt.Time
 		}
 		messages = append(messages, m)
 		ids = append(ids, m.ID)

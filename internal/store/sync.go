@@ -48,82 +48,64 @@ func parseDBTime(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("unrecognized timestamp format %q", s)
 }
 
-func parseNullTime(ns sql.NullString) (sql.NullTime, error) {
-	if !ns.Valid {
-		return sql.NullTime{}, nil
-	}
-	t, err := parseDBTime(ns.String)
-	if err != nil {
-		return sql.NullTime{}, err
-	}
-	return sql.NullTime{Time: t, Valid: true}, nil
-}
-
-// parseRequiredTime parses a timestamp that must not be NULL.
-// Use this for required fields like created_at/updated_at.
-func parseRequiredTime(ns sql.NullString, field string) (time.Time, error) {
-	if !ns.Valid {
+// requireNullTime extracts a non-NULL time.Time from a sql.NullTime, with
+// a clear error mentioning the field name. Required timestamps
+// (created_at, updated_at, started_at) violate a schema invariant if NULL,
+// so this surfaces the violation rather than silently zero-valuing.
+func requireNullTime(nt sql.NullTime, field string) (time.Time, error) {
+	if !nt.Valid {
 		return time.Time{}, fmt.Errorf("%s: required timestamp is NULL", field)
 	}
-	t, err := parseDBTime(ns.String)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("%s: %w", field, err)
-	}
-	return t, nil
+	return nt.Time, nil
 }
 
 func scanSource(sc scanner) (*Source, error) {
+	// Scan timestamps into sql.NullTime / time.Time. The pgx/v5 stdlib
+	// driver decodes TIMESTAMP/TIMESTAMPTZ as time.Time at the driver
+	// level and refuses to convert that to *string; go-sqlite3 also
+	// accepts time.Time destinations and parses its stored formats
+	// internally, so a single typed scan path works for both backends.
+	// Required fields are scanned through sql.NullTime so a NULL value
+	// (a schema invariant violation) is reported with field context
+	// rather than the driver's opaque "unsupported Scan" error.
 	var source Source
-	var lastSyncAt, createdAt, updatedAt sql.NullString
-
+	var createdAt, updatedAt sql.NullTime
 	err := sc.Scan(
 		&source.ID, &source.SourceType, &source.Identifier, &source.DisplayName,
-		&source.GoogleUserID, &lastSyncAt, &source.SyncCursor, &source.SyncConfig,
+		&source.GoogleUserID, &source.LastSyncAt, &source.SyncCursor, &source.SyncConfig,
 		&source.OAuthApp, &createdAt, &updatedAt,
 	)
 	if err != nil {
 		return nil, err
 	}
-
-	source.LastSyncAt, err = parseNullTime(lastSyncAt)
-	if err != nil {
-		return nil, fmt.Errorf("source %d: last_sync_at: %w", source.ID, err)
-	}
-	source.CreatedAt, err = parseRequiredTime(createdAt, "created_at")
+	source.CreatedAt, err = requireNullTime(createdAt, "created_at")
 	if err != nil {
 		return nil, fmt.Errorf("source %d: %w", source.ID, err)
 	}
-	source.UpdatedAt, err = parseRequiredTime(updatedAt, "updated_at")
+	source.UpdatedAt, err = requireNullTime(updatedAt, "updated_at")
 	if err != nil {
 		return nil, fmt.Errorf("source %d: %w", source.ID, err)
 	}
-
 	return &source, nil
 }
 
 func scanSyncRun(sc scanner) (*SyncRun, error) {
+	// Scan timestamps into typed columns — see scanSource for the
+	// dialect-portability rationale.
 	var run SyncRun
-	var startedAt string
-	var completedAt sql.NullString
-
+	var startedAt sql.NullTime
 	err := sc.Scan(
-		&run.ID, &run.SourceID, &startedAt, &completedAt, &run.Status,
+		&run.ID, &run.SourceID, &startedAt, &run.CompletedAt, &run.Status,
 		&run.MessagesProcessed, &run.MessagesAdded, &run.MessagesUpdated, &run.ErrorsCount,
 		&run.ErrorMessage, &run.CursorBefore, &run.CursorAfter,
 	)
 	if err != nil {
 		return nil, err
 	}
-
-	run.StartedAt, err = parseDBTime(startedAt)
+	run.StartedAt, err = requireNullTime(startedAt, "started_at")
 	if err != nil {
-		return nil, fmt.Errorf("sync_run %d: parse started_at %q: %w", run.ID, startedAt, err)
+		return nil, fmt.Errorf("sync_run %d: %w", run.ID, err)
 	}
-	run.CompletedAt, err = parseNullTime(completedAt)
-	if err != nil {
-		return nil, fmt.Errorf("sync_run %d: completed_at: %w", run.ID, err)
-	}
-
 	return &run, nil
 }
 

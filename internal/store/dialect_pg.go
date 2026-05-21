@@ -41,6 +41,18 @@ func (d *PostgreSQLDialect) Rebind(query string) string {
 // Now returns the PostgreSQL expression for the current timestamp.
 func (d *PostgreSQLDialect) Now() string { return "NOW()" }
 
+// BoolTrueExpr returns the bare column name. PostgreSQL has a real BOOLEAN
+// type and rejects integer comparisons (`col = 1`) against boolean columns.
+func (d *PostgreSQLDialect) BoolTrueExpr(col string) string { return col }
+
+// BuildFTSArg formats search terms for plainto_tsquery: a plain
+// space-separated string. plainto_tsquery handles AND logic natively and
+// treats meta tokens like quotes/AND as literal stopwords or fragments,
+// so we must NOT emit FTS5 syntax here.
+func (d *PostgreSQLDialect) BuildFTSArg(terms []string) string {
+	return strings.Join(terms, " ")
+}
+
 // InsertOrIgnore rewrites INSERT OR IGNORE INTO to INSERT INTO and appends
 // " ON CONFLICT DO NOTHING" for complete statements. A statement is treated
 // as a prefix (caller will append VALUES tuples + InsertOrIgnoreSuffix) only

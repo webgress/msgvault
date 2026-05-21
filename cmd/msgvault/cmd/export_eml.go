@@ -44,7 +44,7 @@ type resolvedMessage struct {
 	SourceMessageID string
 }
 
-func resolveMessage(engine *query.SQLiteEngine, cmd *cobra.Command, messageRef string) (resolvedMessage, error) {
+func resolveMessage(engine query.Engine, cmd *cobra.Command, messageRef string) (resolvedMessage, error) {
 	if id, err := strconv.ParseInt(messageRef, 10, 64); err == nil {
 		msg, err := engine.GetMessage(cmd.Context(), id)
 		if err != nil {

@@ -51,12 +51,20 @@ type Dialect interface {
 	// pass to FTSSearchExpression. Returns "" if the result is empty after
 	// sanitization (caller should treat as no-match).
 	SanitizeFTSQuery(query string) string
+
+	// BoolTrueExpr returns a SQL boolean expression that is true when col
+	// holds a "true" value. SQLite stores booleans as 0/1 INTEGER so we
+	// must emit "col = 1"; PostgreSQL has a real BOOLEAN type and rejects
+	// integer comparisons, so the bare column name is the right form.
+	BoolTrueExpr(col string) string
 }
 
 // SQLiteQueryDialect implements Dialect for SQLite.
 type SQLiteQueryDialect struct{}
 
 func (SQLiteQueryDialect) Rebind(query string) string { return query }
+
+func (SQLiteQueryDialect) BoolTrueExpr(col string) string { return col + " = 1" }
 
 func (SQLiteQueryDialect) TimeTruncExpression(column string, granularity string) string {
 	switch granularity {
@@ -138,6 +146,8 @@ func (PostgreSQLQueryDialect) Rebind(query string) string {
 	}
 	return b.String()
 }
+
+func (PostgreSQLQueryDialect) BoolTrueExpr(col string) string { return col }
 
 func (PostgreSQLQueryDialect) TimeTruncExpression(column string, granularity string) string {
 	switch granularity {

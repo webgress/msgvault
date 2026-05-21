@@ -202,7 +202,7 @@ func buildAggregateSQL(dim aggDimension, filterJoins string, filterWhere string,
 }
 
 // optsToFilterConditions converts AggregateOptions into WHERE conditions and args.
-func optsToFilterConditions(opts AggregateOptions, prefix string) ([]string, []interface{}) {
+func optsToFilterConditions(d Dialect, opts AggregateOptions, prefix string) ([]string, []interface{}) {
 	var conditions []string
 	var args []interface{}
 
@@ -222,7 +222,7 @@ func optsToFilterConditions(opts AggregateOptions, prefix string) ([]string, []i
 		args = append(args, opts.Before.Format("2006-01-02 15:04:05"))
 	}
 	if opts.WithAttachmentsOnly {
-		conditions = append(conditions, prefix+"has_attachments = 1")
+		conditions = append(conditions, d.BoolTrueExpr(prefix+"has_attachments"))
 	}
 
 	return conditions, args
@@ -298,7 +298,7 @@ func (e *SQLiteEngine) buildFilterJoinsAndConditions(filter MessageFilter, table
 	}
 
 	if filter.WithAttachmentsOnly {
-		conditions = append(conditions, prefix+"has_attachments = 1")
+		conditions = append(conditions, e.dialect.BoolTrueExpr(prefix+"has_attachments"))
 	}
 
 	// Sender filter - check both message_recipients (email) and direct sender_id (WhatsApp/chat)
@@ -478,7 +478,7 @@ func (e *SQLiteEngine) SubAggregate(ctx context.Context, filter MessageFilter, g
 	// caller below, which doesn't go through buildFilterJoinsAndConditions).
 	// In SubAggregate this means both filter-side and opts-side helpers
 	// emit the same clause, producing a redundant-but-correct AND chain.
-	optsConds, optsArgs := optsToFilterConditions(opts, "m.")
+	optsConds, optsArgs := optsToFilterConditions(e.dialect, opts, "m.")
 	filterConditions = append(filterConditions, optsConds...)
 	args = append(args, optsArgs...)
 
@@ -495,7 +495,7 @@ func (e *SQLiteEngine) SubAggregate(ctx context.Context, filter MessageFilter, g
 
 // Aggregate performs grouping based on the provided ViewType.
 func (e *SQLiteEngine) Aggregate(ctx context.Context, groupBy ViewType, opts AggregateOptions) ([]AggregateRow, error) {
-	conditions, args := optsToFilterConditions(opts, "m.")
+	conditions, args := optsToFilterConditions(e.dialect, opts, "m.")
 
 	searchJoins, searchConds, searchArgs :=
 		e.buildAggregateSearchParts(ctx, opts.SearchQuery, groupBy)
@@ -919,7 +919,7 @@ func (e *SQLiteEngine) GetTotalStats(ctx context.Context, opts StatsOptions) (*T
 		conditions, args, "m.", opts.SourceID, opts.SourceIDs,
 	)
 	if opts.WithAttachmentsOnly {
-		conditions = append(conditions, "m.has_attachments = 1")
+		conditions = append(conditions, e.dialect.BoolTrueExpr("m.has_attachments"))
 	}
 	// Merge search conditions
 	conditions = append(conditions, searchConditions...)
@@ -1313,7 +1313,7 @@ func (e *SQLiteEngine) buildSearchQueryParts(ctx context.Context, q *search.Quer
 
 	// Has attachment filter
 	if q.HasAttachment != nil && *q.HasAttachment {
-		conditions = append(conditions, "m.has_attachments = 1")
+		conditions = append(conditions, e.dialect.BoolTrueExpr("m.has_attachments"))
 	}
 
 	// Date range filters
