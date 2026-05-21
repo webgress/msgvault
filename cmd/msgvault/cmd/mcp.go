@@ -114,6 +114,7 @@ Add to Claude Desktop config:
 			Engine:         engine,
 			AttachmentsDir: cfg.AttachmentsDir(),
 			DataDir:        cfg.Data.DataDir,
+			ReadOnly:       s.IsReadOnly(),
 		}
 		if vf != nil {
 			opts.HybridEngine = vf.HybridEngine
