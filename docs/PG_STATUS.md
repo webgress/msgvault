@@ -112,6 +112,9 @@ branch:
 | # | Item | Resolution |
 |---|------|-----------|
 | 1 | Vector backend on PostgreSQL | `internal/vector/pgvector/` implements `vector.Backend` against pgvector. Selection at runtime in `serve_vector.go` and `embed_vector.go` via `Store.IsPostgreSQL()` / DSN prefix. Build with `-tags "fts5 sqlite_vec pgvector"` to enable. |
+| 2 | FTS weight parity (SQLite ↔ PG) | `SQLiteDialect.FTSSearchClause()` now orders by `bm25(messages_fts, 1.0, 10.0, 1.0, 4.0, 1.0, 1.0)` — weights are positional over every declared FTS5 column (the leading 1.0 is the slot for `message_id UNINDEXED`; the rest map to subject, body, from, to, cc). The 10:4:1 ratio across subject/sender/body mirrors PostgreSQL's `setweight 'A'=1.0 / 'B'=0.4 / 'D'=0.1`, so subject-only matches outrank sender-only, which outrank body-only on both backends. Verified by `TestFTSRankWeightsAcrossBackends` (runs on both SQLite and PG via `MSGVAULT_TEST_DB`). |
+| 3 | Deletion execution path on PostgreSQL | `internal/deletion/executor_e2e_test.go` exercises the full staged-deletion → mock Gmail → store pipeline on a multi-source, multi-attachment corpus. Covered: trash-mode soft delete (`deleted_from_source_at` set, source isolation), permanent-mode row deletion with `ON DELETE CASCADE` of attachment rows, batch-mode cross-source `IN (...)` UPDATEs (`MarkMessagesDeletedByGmailIDBatch`), and post-delete `AttachmentPathsUniqueToSource` consistency. Runs unchanged on both backends via `MSGVAULT_TEST_DB`. |
+| 4 | Attachment storage paths on PostgreSQL | `internal/store/attachment_e2e_test.go` exercises the multi-message / multi-source attachment lifecycle: intra-source dedup (idempotent `UpsertAttachment`), `ON DELETE CASCADE` from `messages` to `attachments`, cross-source `AttachmentPathsUniqueToSource` promotion when one source is removed, the full orphan-cleanup pipeline (`AttachmentPathsUniqueToSource` → `RemoveSourceSerialized` → `IsAttachmentPathReferenced`), and exclusion of NULL-hash / empty-path rows. The query helpers route through `Store.Rebind` so `?` placeholders are translated for PG. |
 
 The pgvector backend covers `CreateGeneration`, `ActivateGeneration`,
 `RetireGeneration`, `Active/BuildingGeneration`, `Upsert`, `Search`,
@@ -138,26 +141,6 @@ Not yet handled by PR4a:
 
 ## Remaining for PR4
 
-- **FTS rank ordering (partially resolved)**:
-  `SQLiteDialect.FTSSearchClause()` now orders by
-  `bm25(messages_fts, 1.0, 10.0, 1.0, 4.0, 1.0, 1.0)` — weights are
-  positional over every declared FTS5 column (the leading 1.0 is the
-  slot for `message_id UNINDEXED`; the rest map to subject, body,
-  from, to, cc). The 10:4:1 ratio across subject/sender/body mirrors
-  PostgreSQL's `setweight 'A'=1.0 / 'B'=0.4 / 'D'=0.1`, so
-  subject-only matches outrank sender-only, which outrank body-only
-  on both backends. Verified by `TestFTSRankWeightsAcrossBackends`.
-  Note: bm25 (Okapi BM25) and `ts_rank` (cover-density) remain
-  different scorer functions, so intra-class tie-breaking (e.g. two
-  body-only matches) can still diverge. Top-N ordering is consistent
-  for most queries; expect occasional reorderings deep in the result
-  list.
-- **Deletion execution path on PostgreSQL**: end-to-end testing of
-  staged-deletion → Gmail delete → archive update.
-- **Attachment storage paths** under PostgreSQL — content-hash dedup
-  and orphan-cleanup paths haven't been exercised end-to-end yet.
-- **CI coverage** under `MSGVAULT_TEST_DB=postgres://...`: the harness
-  exists and tests are portable, but no upstream CI lane runs it yet.
 - **embed.Queue portability** (see PR4a notes above).
 
 ## Running Tests Against PostgreSQL
