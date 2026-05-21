@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/embed"
 	"go.kenn.io/msgvault/internal/vector/hybrid"
@@ -36,6 +37,7 @@ func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string) (
 		backend   vector.Backend
 		vectorsDB *sql.DB
 		closeFn   func() error
+		rebind    func(string) string
 	)
 	if isPostgresDSN(mainPath) {
 		// Same database handle as the main store: pgvector embeddings
@@ -50,6 +52,7 @@ func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string) (
 		backend = pgb
 		vectorsDB = pgb.DB()
 		closeFn = pgb.Close
+		rebind = (&store.PostgreSQLDialect{}).Rebind
 	} else {
 		if err := sqlitevec.RegisterExtension(); err != nil {
 			return nil, fmt.Errorf("register sqlite-vec: %w", err)
@@ -94,6 +97,7 @@ func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string) (
 		BatchSize:       cfg.Vector.Embeddings.BatchSize,
 		EmbedTimeout:    cfg.Vector.Embeddings.Timeout,
 		EmbedMaxRetries: cfg.Vector.Embeddings.MaxRetries,
+		Rebind:          rebind,
 		Log:             logger,
 	})
 

@@ -50,7 +50,12 @@ type WorkerDeps struct {
 	// and returns an error. A successful batch resets the counter.
 	// Default 5.
 	MaxConsecutiveFailures int
-	Log                    *slog.Logger
+	// Rebind translates ?-placeholders to the driver's native form.
+	// nil is treated as the identity (used by SQLite); pgvector callers
+	// must wire in (&store.PostgreSQLDialect{}).Rebind so the queue's
+	// IN-clause and UPDATE statements run on pgx.
+	Rebind func(string) string
+	Log    *slog.Logger
 	// TotalPending is the queue depth at run start, used by a Progress
 	// callback (if any) to report percent done and ETA. Zero disables
 	// the denominator — Progress still fires but leaves ETA empty.
@@ -103,7 +108,7 @@ func NewWorker(d WorkerDeps) *Worker {
 	if d.MaxConsecutiveFailures == 0 {
 		d.MaxConsecutiveFailures = 5
 	}
-	return &Worker{deps: d, q: NewQueue(d.VectorsDB)}
+	return &Worker{deps: d, q: NewQueue(d.VectorsDB, d.Rebind)}
 }
 
 // derivedStaleThreshold picks a default StaleThreshold from the

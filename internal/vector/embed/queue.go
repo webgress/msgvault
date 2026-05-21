@@ -5,9 +5,9 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"go.kenn.io/msgvault/internal/vector"
@@ -20,12 +20,20 @@ import (
 // than a configurable cutoff can be reclaimed via ReclaimStale, so a
 // crashed worker does not strand pending work.
 type Queue struct {
-	db *sql.DB
+	db     *sql.DB
+	rebind func(string) string
 }
 
 // NewQueue returns a Queue bound to db. The caller retains ownership of
-// db; Queue does not close it.
-func NewQueue(db *sql.DB) *Queue { return &Queue{db: db} }
+// db; Queue does not close it. rebind translates ?-placeholders to the
+// driver's native form; pass an identity function for SQLite and the
+// PostgreSQL dialect's Rebind for pgx.
+func NewQueue(db *sql.DB, rebind func(string) string) *Queue {
+	if rebind == nil {
+		rebind = func(q string) string { return q }
+	}
+	return &Queue{db: db, rebind: rebind}
+}
 
 // Claim marks up to batch pending rows for gen as claimed by a fresh
 // token, returning the message IDs in ascending order alongside the
@@ -50,7 +58,7 @@ func (q *Queue) Claim(ctx context.Context, gen vector.GenerationID, batch int) (
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	rows, err := tx.QueryContext(ctx, `
+	rows, err := tx.QueryContext(ctx, q.rebind(`
         UPDATE pending_embeddings
            SET claimed_at = ?, claim_token = ?
          WHERE (generation_id, message_id) IN (
@@ -60,7 +68,7 @@ func (q *Queue) Claim(ctx context.Context, gen vector.GenerationID, batch int) (
                   AND claimed_at IS NULL
                 ORDER BY message_id
                 LIMIT ?)
-        RETURNING message_id`,
+        RETURNING message_id`),
 		now, token, int64(gen), batch)
 	if err != nil {
 		return nil, "", fmt.Errorf("claim query: %w", err)
@@ -88,10 +96,10 @@ func (q *Queue) Claim(ctx context.Context, gen vector.GenerationID, batch int) (
 		return nil, "", nil
 	}
 	// The subquery's ORDER BY decides WHICH rows get claimed, but
-	// SQLite does not guarantee RETURNING yields them in that order.
-	// Sort explicitly so callers can rely on ascending ids (matters
-	// for deterministic test assertions and for pairing ids with
-	// fetched message bodies by position).
+	// RETURNING does not guarantee order. Sort explicitly so callers
+	// can rely on ascending ids (matters for deterministic test
+	// assertions and for pairing ids with fetched message bodies by
+	// position).
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	return ids, token, nil
 }
@@ -104,16 +112,18 @@ func (q *Queue) Complete(ctx context.Context, gen vector.GenerationID, token str
 	if len(ids) == 0 {
 		return nil
 	}
-	blob, err := json.Marshal(ids)
-	if err != nil {
-		return fmt.Errorf("encode ids: %w", err)
+	in := inPlaceholders(len(ids))
+	args := make([]interface{}, 0, 2+len(ids))
+	args = append(args, int64(gen), token)
+	for _, id := range ids {
+		args = append(args, id)
 	}
-	if _, err := q.db.ExecContext(ctx, `
+	query := q.rebind(fmt.Sprintf(`
         DELETE FROM pending_embeddings
          WHERE generation_id = ?
            AND claim_token   = ?
-           AND message_id IN (SELECT value FROM json_each(?))`,
-		int64(gen), token, string(blob)); err != nil {
+           AND message_id IN %s`, in))
+	if _, err := q.db.ExecContext(ctx, query, args...); err != nil {
 		return fmt.Errorf("delete pending: %w", err)
 	}
 	return nil
@@ -126,17 +136,19 @@ func (q *Queue) Release(ctx context.Context, gen vector.GenerationID, token stri
 	if len(ids) == 0 {
 		return nil
 	}
-	blob, err := json.Marshal(ids)
-	if err != nil {
-		return fmt.Errorf("encode ids: %w", err)
+	in := inPlaceholders(len(ids))
+	args := make([]interface{}, 0, 2+len(ids))
+	args = append(args, int64(gen), token)
+	for _, id := range ids {
+		args = append(args, id)
 	}
-	if _, err := q.db.ExecContext(ctx, `
+	query := q.rebind(fmt.Sprintf(`
         UPDATE pending_embeddings
            SET claimed_at = NULL, claim_token = NULL
          WHERE generation_id = ?
            AND claim_token   = ?
-           AND message_id IN (SELECT value FROM json_each(?))`,
-		int64(gen), token, string(blob)); err != nil {
+           AND message_id IN %s`, in))
+	if _, err := q.db.ExecContext(ctx, query, args...); err != nil {
 		return fmt.Errorf("release: %w", err)
 	}
 	return nil
@@ -146,10 +158,10 @@ func (q *Queue) Release(ctx context.Context, gen vector.GenerationID, token stri
 // older than olderThan. Returns the number of rows reclaimed.
 func (q *Queue) ReclaimStale(ctx context.Context, olderThan time.Duration) (int, error) {
 	cutoff := time.Now().Add(-olderThan).Unix()
-	res, err := q.db.ExecContext(ctx, `
+	res, err := q.db.ExecContext(ctx, q.rebind(`
         UPDATE pending_embeddings
            SET claimed_at = NULL, claim_token = NULL
-         WHERE claimed_at IS NOT NULL AND claimed_at < ?`, cutoff)
+         WHERE claimed_at IS NOT NULL AND claimed_at < ?`), cutoff)
 	if err != nil {
 		return 0, fmt.Errorf("reclaim stale: %w", err)
 	}
@@ -158,6 +170,17 @@ func (q *Queue) ReclaimStale(ctx context.Context, olderThan time.Duration) (int,
 		return 0, fmt.Errorf("rows affected: %w", err)
 	}
 	return int(n), nil
+}
+
+// inPlaceholders returns "(?,?,...)" with n placeholders, for building
+// IN clauses dynamically. The output uses ? regardless of dialect; the
+// caller is expected to run the surrounding query through rebind.
+func inPlaceholders(n int) string {
+	ph := make([]string, n)
+	for i := range ph {
+		ph[i] = "?"
+	}
+	return "(" + strings.Join(ph, ",") + ")"
 }
 
 // newToken returns 16 hex characters backed by 8 bytes of crypto/rand.

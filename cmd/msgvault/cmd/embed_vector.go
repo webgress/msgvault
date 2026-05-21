@@ -32,6 +32,7 @@ func runEmbed(ctx context.Context) error {
 		backend   vector.Backend
 		vectorsDB *sql.DB
 		closeFn   func() error
+		rebind    func(string) string
 	)
 	if s.IsPostgreSQL() {
 		// pgvector embeddings live in the same Postgres database as
@@ -46,6 +47,7 @@ func runEmbed(ctx context.Context) error {
 		backend = pgb
 		vectorsDB = pgb.DB()
 		closeFn = pgb.Close
+		rebind = (&store.PostgreSQLDialect{}).Rebind
 	} else {
 		if err := sqlitevec.RegisterExtension(); err != nil {
 			return fmt.Errorf("register sqlite-vec: %w", err)
@@ -110,6 +112,7 @@ func runEmbed(ctx context.Context) error {
 		BatchSize:       cfg.Vector.Embeddings.BatchSize,
 		EmbedTimeout:    cfg.Vector.Embeddings.Timeout,
 		EmbedMaxRetries: cfg.Vector.Embeddings.MaxRetries,
+		Rebind:          rebind,
 		TotalPending:    totalPending,
 		Progress:        newProgressPrinter(os.Stderr, totalPending, cfg.Vector.Embeddings.ETAWindow),
 	})
