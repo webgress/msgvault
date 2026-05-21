@@ -17,9 +17,10 @@ A PostgreSQL connection can now initialize the schema, insert rows, run FTS
 queries, and serve the TUI / HTTP / MCP aggregate paths. The SQLite path is
 unchanged.
 
-PR4 (future) will address remaining functional gaps in deletion execution,
-attachment storage on PG, and end-to-end coverage under
-`MSGVAULT_TEST_DB=postgres://...`.
+PR4 (in progress on `pr4-upstream`) addresses remaining functional gaps in
+deletion execution, attachment storage on PG, and end-to-end coverage under
+`MSGVAULT_TEST_DB=postgres://...`. The first PR4 item to land is the
+pgvector backend (`pr4a-vector`); see "Resolved in PR4" below.
 
 ## What Works
 
@@ -78,6 +79,35 @@ attachment storage on PG, and end-to-end coverage under
 | 10 | `PostgreSQLEngine` wired to factory | `query.NewEngine(db, isPostgres)` in cmd/ |
 | 11 | Legacy column migrations on PG | `LegacyColumnMigrations()` returns the SQLite list translated to PG types, using `ADD COLUMN IF NOT EXISTS` for idempotency |
 
+## Resolved in PR4 (so far)
+
+| # | Item | Resolution |
+|---|------|-----------|
+| 1 | Vector backend on PostgreSQL | `internal/vector/pgvector/` implements `vector.Backend` against pgvector. Selection at runtime in `serve_vector.go` and `embed_vector.go` via `Store.IsPostgreSQL()` / DSN prefix. Build with `-tags "fts5 sqlite_vec pgvector"` to enable. |
+
+The pgvector backend covers `CreateGeneration`, `ActivateGeneration`,
+`RetireGeneration`, `Active/BuildingGeneration`, `Upsert`, `Search`,
+`Delete`, `Stats`, `EnsureSeeded`, `LoadVector`, and `Close`. Embeddings
+live in the same Postgres database as messages (no separate `vectors.db`).
+The per-dimension HNSW cosine index is created lazily by
+`pgvector.EnsureVectorIndex(db, dim)` with a partial `WHERE dimension = N`
+guard so generations of different dimensions can coexist in the same
+`embeddings` table.
+
+Not yet handled by PR4a:
+
+- **embed.Queue portability**: `internal/vector/embed/queue.go` still uses
+  SQLite-only constructs (`json_each(?)`, `?` placeholders). Until that is
+  ported, the full embed pipeline (worker loop, claim/complete) on
+  PostgreSQL is not yet functional even though the backend interface is.
+  The pgvector `Backend` itself is fully usable in tests and in any code
+  path that bypasses the embed.Queue.
+- **FusedSearch on pgvector**: `hybrid.NewEngine` checks for the optional
+  `vector.FusingBackend`; pgvector currently implements only `Backend`,
+  so PostgreSQL hybrid search falls back to the two-query path (BM25 +
+  ANN run separately). A native fused CTE that combines `ts_rank_cd` and
+  `embedding <=> $query` in one statement is a follow-up.
+
 ## Remaining for PR4
 
 - **FTS weight differences**: PostgreSQL applies `setweight('A')` to the
@@ -89,6 +119,7 @@ attachment storage on PG, and end-to-end coverage under
   and orphan-cleanup paths haven't been exercised end-to-end yet.
 - **CI coverage** under `MSGVAULT_TEST_DB=postgres://...`: the harness
   exists and tests are portable, but no upstream CI lane runs it yet.
+- **embed.Queue portability** (see PR4a notes above).
 
 ## Running Tests Against PostgreSQL
 
