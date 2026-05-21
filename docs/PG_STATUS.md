@@ -84,6 +84,7 @@ pgvector backend (`pr4a-vector`); see "Resolved in PR4" below.
 | # | Item | Resolution |
 |---|------|-----------|
 | 1 | Vector backend on PostgreSQL | `internal/vector/pgvector/` implements `vector.Backend` against pgvector. Selection at runtime in `serve_vector.go` and `embed_vector.go` via `Store.IsPostgreSQL()` / DSN prefix. Build with `-tags "fts5 sqlite_vec pgvector"` to enable. |
+| 2 | FTS weight parity (SQLite ↔ PG) | `SQLiteDialect.FTSSearchClause()` now orders by `bm25(messages_fts, 1.0, 10.0, 1.0, 4.0, 1.0, 1.0)` — weights are positional over every declared FTS5 column (the leading 1.0 is the slot for `message_id UNINDEXED`; the rest map to subject, body, from, to, cc). The 10:4:1 ratio across subject/sender/body mirrors PostgreSQL's `setweight 'A'=1.0 / 'B'=0.4 / 'D'=0.1`, so subject-only matches outrank sender-only, which outrank body-only on both backends. Verified by `TestFTSRankWeightsAcrossBackends` (runs on both SQLite and PG via `MSGVAULT_TEST_DB`). |
 
 The pgvector backend covers `CreateGeneration`, `ActivateGeneration`,
 `RetireGeneration`, `Active/BuildingGeneration`, `Upsert`, `Search`,
@@ -108,11 +109,19 @@ Not yet handled by PR4a:
   ANN run separately). A native fused CTE that combines `ts_rank_cd` and
   `embedding <=> $query` in one statement is a follow-up.
 
+## Known differences
+
+- **FTS scorer math**: SQLite uses bm25 (Okapi BM25), PostgreSQL uses
+  `ts_rank` (cover-density variant). Per-column weights are aligned so
+  subject > sender > body holds on both, but intra-class tie-breaking
+  (e.g. ordering two body-only matches against each other) can still
+  diverge because the underlying score functions weight term frequency
+  and document length differently. The user-visible top-N ordering for
+  most queries is consistent; expect occasional reorderings deep in the
+  result list.
+
 ## Remaining for PR4
 
-- **FTS weight differences**: PostgreSQL applies `setweight('A')` to the
-  subject and `'B'` to the sender; SQLite FTS5 has no weighting. Ranking
-  results will still differ between backends.
 - **Deletion execution path on PostgreSQL**: end-to-end testing of
   staged-deletion → Gmail delete → archive update.
 - **Attachment storage paths** under PostgreSQL — content-hash dedup
