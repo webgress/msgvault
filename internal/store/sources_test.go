@@ -3,7 +3,6 @@ package store_test
 import (
 	"context"
 	"database/sql"
-	"path/filepath"
 	"testing"
 
 	"github.com/wesm/msgvault/internal/store"
@@ -368,166 +367,11 @@ func TestStore_IsAttachmentPathReferenced(t *testing.T) {
 	}
 }
 
-func TestInitSchema_MigratesOAuthAppColumn(t *testing.T) {
-	// Simulate a pre-migration database that lacks the oauth_app column.
-	dbPath := filepath.Join(t.TempDir(), "legacy.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-
-	// Create the sources table WITHOUT the oauth_app column,
-	// matching the schema as it existed before this feature.
-	_, err = st.DB().Exec(`
-		CREATE TABLE IF NOT EXISTS sources (
-			id INTEGER PRIMARY KEY,
-			source_type TEXT NOT NULL,
-			identifier TEXT NOT NULL,
-			display_name TEXT,
-			google_user_id TEXT UNIQUE,
-			last_sync_at DATETIME,
-			sync_cursor TEXT,
-			sync_config JSON,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-			UNIQUE(source_type, identifier)
-		)
-	`)
-	if err != nil {
-		t.Fatalf("create legacy sources table: %v", err)
-	}
-
-	// Insert a row into the legacy table.
-	_, err = st.DB().Exec(`
-		INSERT INTO sources (source_type, identifier, display_name)
-		VALUES ('gmail', 'legacy@example.com', 'Legacy User')
-	`)
-	if err != nil {
-		t.Fatalf("insert legacy source: %v", err)
-	}
-
-	// Run InitSchema — this should migrate the table by adding oauth_app.
-	if err := st.InitSchema(); err != nil {
-		t.Fatalf("InitSchema on legacy DB: %v", err)
-	}
-
-	// Verify GetSourcesByIdentifier works (reads oauth_app column).
-	sources, err := st.GetSourcesByIdentifier("legacy@example.com")
-	if err != nil {
-		t.Fatalf("GetSourcesByIdentifier after migration: %v", err)
-	}
-	if len(sources) != 1 {
-		t.Fatalf("got %d sources, want 1", len(sources))
-	}
-	if sources[0].OAuthApp.Valid {
-		t.Errorf("OAuthApp should be NULL for legacy row, got %q", sources[0].OAuthApp.String)
-	}
-
-	// Verify GetSourcesByDisplayName works (also reads oauth_app column).
-	sources, err = st.GetSourcesByDisplayName("Legacy User")
-	if err != nil {
-		t.Fatalf("GetSourcesByDisplayName after migration: %v", err)
-	}
-	if len(sources) != 1 {
-		t.Fatalf("got %d sources, want 1", len(sources))
-	}
-
-	// Verify oauth_app can be written and read back.
-	_, err = st.DB().Exec(
-		st.Rebind(`UPDATE sources SET oauth_app = ? WHERE identifier = ?`),
-		"acme", "legacy@example.com",
-	)
-	if err != nil {
-		t.Fatalf("update oauth_app: %v", err)
-	}
-
-	sources, err = st.GetSourcesByIdentifier("legacy@example.com")
-	if err != nil {
-		t.Fatalf("GetSourcesByIdentifier after update: %v", err)
-	}
-	if !sources[0].OAuthApp.Valid || sources[0].OAuthApp.String != "acme" {
-		t.Errorf("OAuthApp = %v, want {acme true}", sources[0].OAuthApp)
-	}
-}
-
-// TestInitSchema_AddsDeletedAtToLegacyMessagesTable verifies the
-// upgrade-path migration: a database whose `messages` table already has
-// every other column the embedded schema indexes reference, but is
-// missing the dedup-hide column `deleted_at`, gets the column added by
-// InitSchema. Without the ALTER, every read path that references
-// `deleted_at` (LiveMessagesWhere, the dedup engine, the cache
-// staleness check) fails on upgraded databases with "no such column".
-func TestInitSchema_AddsDeletedAtToLegacyMessagesTable(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "legacy.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-
-	// Build a messages table that has every column the embedded
-	// schema's CREATE INDEX statements reference (sender_id,
-	// deleted_from_source_at, message_type, …) but DOES NOT have the
-	// new dedup-hide columns (`deleted_at`, `delete_batch_id`).
-	// Approximates a legacy DB just before this branch landed.
-	if _, err := st.DB().Exec(`
-		CREATE TABLE messages (
-			id INTEGER PRIMARY KEY,
-			source_id INTEGER NOT NULL,
-			source_message_id TEXT,
-			conversation_id INTEGER,
-			subject TEXT,
-			snippet TEXT,
-			sent_at DATETIME,
-			received_at DATETIME,
-			internal_date DATETIME,
-			size_estimate INTEGER,
-			has_attachments BOOLEAN,
-			is_from_me BOOLEAN,
-			archived_at DATETIME,
-			rfc822_message_id TEXT,
-			sender_id INTEGER,
-			message_type TEXT NOT NULL DEFAULT 'email',
-			attachment_count INTEGER DEFAULT 0,
-			deleted_from_source_at DATETIME
-		)
-	`); err != nil {
-		t.Fatalf("create legacy messages table: %v", err)
-	}
-
-	if _, err := st.DB().Exec(`
-		INSERT INTO messages (id, source_id, source_message_id, sent_at)
-		VALUES (1, 1, 'msg1', datetime('now'))
-	`); err != nil {
-		t.Fatalf("insert legacy message: %v", err)
-	}
-
-	// Run InitSchema — should add deleted_at and delete_batch_id via
-	// ALTER TABLE migrations (and silently no-op the columns that
-	// already exist, like deleted_from_source_at).
-	if err := st.InitSchema(); err != nil {
-		t.Fatalf("InitSchema on legacy DB: %v", err)
-	}
-
-	// Confirm the canonical live-messages predicate runs without
-	// "no such column": this is the failure mode codex flagged. The
-	// query uses both deleted_at and deleted_from_source_at.
-	var n int
-	if err := st.DB().QueryRow(
-		"SELECT COUNT(*) FROM messages WHERE " + store.LiveMessagesWhere("", true),
-	).Scan(&n); err != nil {
-		t.Fatalf("post-migration live count: %v", err)
-	}
-	if n != 1 {
-		t.Errorf("post-migration live count = %d, want 1", n)
-	}
-
-	// Confirm delete_batch_id is also queryable post-migration so
-	// DeleteAllDeduped's distinct-batch count works on upgraded DBs.
-	if _, err := st.DB().Exec(
-		"SELECT COUNT(DISTINCT delete_batch_id) FROM messages",
-	); err != nil {
-		t.Fatalf("post-migration delete_batch_id query: %v", err)
-	}
-}
+// The legacy column-add tests TestInitSchema_MigratesOAuthAppColumn and
+// TestInitSchema_AddsDeletedAtToLegacyMessagesTable were retired here. They
+// exercised the pre-goose LegacyColumnMigrations path, which has been
+// replaced by goose-managed migrations rooted in
+// internal/store/migrations/. Pre-goose databases were already evolved up
+// to the current schema by that removed path, so the goose bootstrap simply
+// records them as the version-1 baseline and any future versioned
+// migrations apply on top — see runMigrations and TestMigration_ExistingDB.

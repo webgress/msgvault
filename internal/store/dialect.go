@@ -16,13 +16,6 @@ type FTSDoc struct {
 	CcAddrs   string
 }
 
-// ColumnMigration is a single ALTER TABLE ADD COLUMN statement used by
-// SQLiteDialect.LegacyColumnMigrations to evolve older SQLite databases.
-type ColumnMigration struct {
-	SQL  string // full ALTER TABLE ... ADD COLUMN statement
-	Desc string // short label for error messages
-}
-
 // Dialect abstracts database-specific SQL generation and behavior.
 // Implementations exist for SQLite (default) and PostgreSQL (opt-in).
 type Dialect interface {
@@ -108,15 +101,6 @@ type Dialect interface {
 	// PostgreSQL: TODO (REINDEX / recompute tsvector column).
 	FTSRebuildSchema(db *sql.DB) error
 
-	// LegacyColumnMigrations returns ALTER TABLE ADD COLUMN statements to
-	// bring older databases up to date with schema columns added over time.
-	// Both dialects return the same logical list, translated to the
-	// dialect's column-type spellings. Statements are idempotent
-	// (`IF NOT EXISTS` on PG; IsDuplicateColumnError silences re-runs on
-	// SQLite). Fresh installs see no-op ALTERs because the columns are
-	// already present in schema.sql / schema_pg.sql.
-	LegacyColumnMigrations() []ColumnMigration
-
 	// DatabaseSize returns the on-disk or logical size of the database in
 	// bytes. For SQLite: file size at dbPath. For PostgreSQL: queries
 	// pg_database_size(). Returns 0 if the size cannot be determined;
@@ -129,9 +113,6 @@ type Dialect interface {
 	// Called after opening a connection. For SQLite: no-op (PRAGMAs are set via
 	// DSN parameters). For PostgreSQL: SET search_path, statement_timeout, etc.
 	InitConn(db *sql.DB) error
-
-	// SchemaFiles returns the filenames of embedded schema files to execute during InitSchema.
-	SchemaFiles() []string
 
 	// CheckpointWAL checkpoints the WAL (SQLite) or is a no-op (PostgreSQL).
 	CheckpointWAL(db *sql.DB) error

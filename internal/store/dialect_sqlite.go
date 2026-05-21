@@ -148,27 +148,6 @@ func (d *SQLiteDialect) FTSRebuildSchema(db *sql.DB) error {
 	return nil
 }
 
-// LegacyColumnMigrations returns the ALTER TABLE ADD COLUMN statements that
-// bring older SQLite databases up to the current schema. IsDuplicateColumnError
-// silences these when the column already exists (idempotent migrations).
-func (d *SQLiteDialect) LegacyColumnMigrations() []ColumnMigration {
-	return []ColumnMigration{
-		{`ALTER TABLE sources ADD COLUMN sync_config JSON`, "sync_config"},
-		{`ALTER TABLE messages ADD COLUMN rfc822_message_id TEXT`, "rfc822_message_id"},
-		{`ALTER TABLE sources ADD COLUMN oauth_app TEXT`, "oauth_app"},
-		{`ALTER TABLE participants ADD COLUMN phone_number TEXT`, "phone_number"},
-		{`ALTER TABLE participants ADD COLUMN canonical_id TEXT`, "canonical_id"},
-		{`ALTER TABLE messages ADD COLUMN sender_id INTEGER REFERENCES participants(id)`, "sender_id"},
-		{`ALTER TABLE messages ADD COLUMN message_type TEXT NOT NULL DEFAULT 'email'`, "message_type"},
-		{`ALTER TABLE messages ADD COLUMN attachment_count INTEGER DEFAULT 0`, "attachment_count"},
-		{`ALTER TABLE messages ADD COLUMN deleted_from_source_at DATETIME`, "deleted_from_source_at"},
-		{`ALTER TABLE messages ADD COLUMN deleted_at DATETIME`, "deleted_at"},
-		{`ALTER TABLE messages ADD COLUMN delete_batch_id TEXT`, "delete_batch_id"},
-		{`ALTER TABLE conversations ADD COLUMN title TEXT`, "title"},
-		{`ALTER TABLE conversations ADD COLUMN conversation_type TEXT NOT NULL DEFAULT 'email_thread'`, "conversation_type"},
-	}
-}
-
 // DatabaseSize returns the on-disk size of the SQLite database file.
 // Returns (0, nil) for in-memory databases or when the file cannot be stat'd.
 func (d *SQLiteDialect) DatabaseSize(_ *sql.DB, dbPath string) (int64, error) {
@@ -184,11 +163,6 @@ func (d *SQLiteDialect) DatabaseSize(_ *sql.DB, dbPath string) (int64, error) {
 
 // InitConn is a no-op for SQLite — PRAGMAs are set via DSN parameters.
 func (d *SQLiteDialect) InitConn(db *sql.DB) error { return nil }
-
-// SchemaFiles returns the schema files to execute during InitSchema.
-func (d *SQLiteDialect) SchemaFiles() []string {
-	return []string{"schema.sql"}
-}
 
 // CheckpointWAL forces a WAL checkpoint using TRUNCATE mode.
 func (d *SQLiteDialect) CheckpointWAL(db *sql.DB) error {

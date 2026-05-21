@@ -21,6 +21,9 @@ import (
 //go:embed schema.sql schema_sqlite.sql schema_pg.sql
 var schemaFS embed.FS
 
+//go:embed migrations/sqlite migrations/postgres
+var migrationsFS embed.FS
+
 // Store provides database operations for msgvault.
 //
 // The db field wraps a *sql.DB with a thin logging adapter that
@@ -551,29 +554,18 @@ func (s *Store) SchemaStale() (bool, string, error) {
 // InitSchema initializes the database schema.
 // This creates all tables if they don't exist.
 func (s *Store) InitSchema() error {
-	// Load and execute schema files provided by the dialect.
-	for _, filename := range s.dialect.SchemaFiles() {
-		schema, err := schemaFS.ReadFile(filename)
-		if err != nil {
-			return fmt.Errorf("read %s: %w", filename, err)
-		}
-		if _, err := s.db.Exec(string(schema)); err != nil {
-			return fmt.Errorf("execute %s: %w", filename, err)
-		}
-	}
-
-	// Migrations: add columns for databases created before these features.
-	// The dialect determines the list (SQLite: full ALTER TABLE list;
-	// PostgreSQL: empty — schema_pg.sql is always complete).
-	for _, m := range s.dialect.LegacyColumnMigrations() {
-		if _, err := s.db.Exec(m.SQL); err != nil {
-			if !s.dialect.IsDuplicateColumnError(err) {
-				return fmt.Errorf("migrate schema (%s): %w", m.Desc, err)
-			}
-		}
+	// Apply versioned goose migrations. For pre-goose databases this also
+	// seeds goose_db_version so the existing schema is recorded as the
+	// baseline.
+	if err := s.runMigrations(context.Background()); err != nil {
+		return err
 	}
 
 	// Load the optional FTS schema, if the dialect keeps one separate.
+	// FTS5 is an optional SQLite module and stays outside goose so that
+	// "no such module: fts5" can be swallowed gracefully on builds without
+	// the fts5 build tag — goose's transactional run would otherwise abort
+	// the whole migration.
 	// PostgreSQL returns "" here because its tsvector lives in the main schema.
 	if ftsFile := s.dialect.SchemaFTS(); ftsFile != "" {
 		ftsSchema, err := schemaFS.ReadFile(ftsFile)
