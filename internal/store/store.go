@@ -233,6 +233,23 @@ func openPostgresReadOnly(dbURL string) (*Store, error) {
 		return nil, fmt.Errorf("init PostgreSQL connection: %w", err)
 	}
 
+	// Verify the read-only flag actually took effect. If pgx's
+	// RuntimeParams were not honoured (e.g. driver upgrade regression,
+	// pool churn that bypassed the startup packet), surface the
+	// misconfiguration here rather than silently allowing writes.
+	var readOnly string
+	if err := db.QueryRowContext(context.Background(),
+		"SELECT current_setting('transaction_read_only')").Scan(&readOnly); err != nil {
+		_ = db.Close()
+		cleanup()
+		return nil, fmt.Errorf("verify read-only setting: %w", err)
+	}
+	if readOnly != "on" {
+		_ = db.Close()
+		cleanup()
+		return nil, fmt.Errorf("PostgreSQL connection is not read-only (transaction_read_only=%q); RuntimeParams may not have applied", readOnly)
+	}
+
 	s := &Store{
 		db:           newLoggedDB(db, dialect.Rebind),
 		dbPath:       dbURL,
@@ -308,6 +325,13 @@ func (s *Store) CheckpointWAL() error {
 // at a different abstraction layer.
 func (s *Store) DB() *sql.DB {
 	return s.db.DB
+}
+
+// IsReadOnly reports whether this store was opened via OpenReadOnly.
+// Used by callers (e.g. the MCP server) to log read-only confirmation
+// and to gate features that require write access.
+func (s *Store) IsReadOnly() bool {
+	return s.readOnly
 }
 
 // IsPostgreSQL reports whether this store is backed by PostgreSQL.

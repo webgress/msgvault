@@ -83,6 +83,11 @@ type ServeOptions struct {
 	// Backend is optional. When nil, find_similar_messages rejects all
 	// calls with a vector_not_enabled error.
 	Backend vector.Backend
+
+	// ReadOnly indicates the underlying store was opened read-only.
+	// When true, the server logs a confirmation line at startup so
+	// operators can see the guarantee in their session logs.
+	ReadOnly bool
 }
 
 // newMCPServer builds an MCP server with all tools registered from opts.
@@ -101,6 +106,10 @@ func newMCPServer(opts ServeOptions) *server.MCPServer {
 		hybridEngine:   opts.HybridEngine,
 		vectorCfg:      opts.VectorCfg,
 		backend:        opts.Backend,
+	}
+
+	if opts.ReadOnly {
+		fmt.Fprintln(os.Stderr, "MCP server: database opened read-only")
 	}
 
 	vectorAvailable := opts.HybridEngine != nil
