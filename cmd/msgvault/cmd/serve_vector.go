@@ -7,9 +7,12 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"strings"
 
+	"github.com/wesm/msgvault/internal/vector"
 	"github.com/wesm/msgvault/internal/vector/embed"
 	"github.com/wesm/msgvault/internal/vector/hybrid"
+	"github.com/wesm/msgvault/internal/vector/pgvector"
 	"github.com/wesm/msgvault/internal/vector/sqlitevec"
 )
 
@@ -28,22 +31,45 @@ func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string) (
 	if err := cfg.Vector.Validate(); err != nil {
 		return nil, fmt.Errorf("vector config: %w", err)
 	}
-	if err := sqlitevec.RegisterExtension(); err != nil {
-		return nil, fmt.Errorf("register sqlite-vec: %w", err)
-	}
 
-	vecPath := cfg.Vector.DBPath
-	if vecPath == "" {
-		vecPath = filepath.Join(cfg.Data.DataDir, "vectors.db")
-	}
-	backend, err := sqlitevec.Open(ctx, sqlitevec.Options{
-		Path:      vecPath,
-		MainPath:  mainPath,
-		Dimension: cfg.Vector.Embeddings.Dimension,
-		MainDB:    mainDB,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("open vectors.db: %w", err)
+	var (
+		backend   vector.Backend
+		vectorsDB *sql.DB
+		closeFn   func() error
+	)
+	if isPostgresDSN(mainPath) {
+		// Same database handle as the main store: pgvector embeddings
+		// live alongside messages, so there is no separate vectors.db.
+		pgb, err := pgvector.Open(ctx, pgvector.Options{
+			DB:        mainDB,
+			Dimension: cfg.Vector.Embeddings.Dimension,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("open pgvector backend: %w", err)
+		}
+		backend = pgb
+		vectorsDB = pgb.DB()
+		closeFn = pgb.Close
+	} else {
+		if err := sqlitevec.RegisterExtension(); err != nil {
+			return nil, fmt.Errorf("register sqlite-vec: %w", err)
+		}
+		vecPath := cfg.Vector.DBPath
+		if vecPath == "" {
+			vecPath = filepath.Join(cfg.Data.DataDir, "vectors.db")
+		}
+		sb, err := sqlitevec.Open(ctx, sqlitevec.Options{
+			Path:      vecPath,
+			MainPath:  mainPath,
+			Dimension: cfg.Vector.Embeddings.Dimension,
+			MainDB:    mainDB,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("open vectors.db: %w", err)
+		}
+		backend = sb
+		vectorsDB = sb.DB()
+		closeFn = sb.Close
 	}
 
 	client := embed.NewClient(embed.Config{
@@ -57,7 +83,7 @@ func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string) (
 
 	worker := embed.NewWorker(embed.WorkerDeps{
 		Backend:   backend,
-		VectorsDB: backend.DB(),
+		VectorsDB: vectorsDB,
 		MainDB:    mainDB,
 		Client:    client,
 		Preprocess: embed.PreprocessConfig{
@@ -78,7 +104,7 @@ func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string) (
 		SubjectBoost:        cfg.Vector.Search.SubjectBoost,
 	})
 
-	enqueuer := embed.NewEnqueuer(backend.DB())
+	enqueuer := embed.NewEnqueuer(vectorsDB)
 
 	return &vectorFeatures{
 		Backend:      backend,
@@ -86,7 +112,16 @@ func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string) (
 		Enqueuer:     enqueuer,
 		Worker:       worker,
 		Cfg:          cfg.Vector,
-		VectorsDB:    backend.DB(),
-		Close:        backend.Close,
+		VectorsDB:    vectorsDB,
+		Close:        closeFn,
 	}, nil
+}
+
+// isPostgresDSN returns true when dsn looks like a PostgreSQL
+// connection string. The serve path receives the dsn used to open the
+// main store; we re-detect it here rather than threading a *store.Store
+// through this layer because it's the cleanest seam — the main DB
+// handle is already opened by the caller.
+func isPostgresDSN(dsn string) bool {
+	return strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://")
 }
