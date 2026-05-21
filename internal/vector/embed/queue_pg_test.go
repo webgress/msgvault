@@ -1,18 +1,107 @@
-//go:build sqlite_vec
+//go:build pgvector
 
 package embed
 
 import (
 	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"fmt"
+	"os"
 	"sort"
+	"strings"
 	"testing"
 	"time"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/wesm/msgvault/internal/store"
+	"github.com/wesm/msgvault/internal/vector/pgvector"
 )
 
-func TestQueue_ClaimReleaseComplete(t *testing.T) {
+func openPGQueueDB(t *testing.T, n int) *sql.DB {
+	t.Helper()
+	url := os.Getenv("MSGVAULT_TEST_DB")
+	if !(strings.HasPrefix(url, "postgres://") || strings.HasPrefix(url, "postgresql://")) {
+		t.Skip("pgvector queue tests require MSGVAULT_TEST_DB to point at a PostgreSQL DSN")
+	}
+
+	buf := make([]byte, 8)
+	if _, err := rand.Read(buf); err != nil {
+		t.Fatalf("random schema name: %v", err)
+	}
+	schemaName := "embed_q_test_" + hex.EncodeToString(buf)
+
+	setup, err := sql.Open("pgx", url)
+	if err != nil {
+		t.Fatalf("open setup: %v", err)
+	}
+	defer func() { _ = setup.Close() }()
+	if _, err := setup.Exec(fmt.Sprintf("CREATE SCHEMA %s", schemaName)); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+
+	testURL := url
+	sep := "?"
+	if strings.Contains(url, "?") {
+		sep = "&"
+	}
+	testURL += sep + "search_path=" + schemaName + ",public"
+
+	db, err := sql.Open("pgx", testURL)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+		cleanup, err := sql.Open("pgx", url)
+		if err != nil {
+			return
+		}
+		defer func() { _ = cleanup.Close() }()
+		_, _ = cleanup.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE", schemaName))
+	})
+
 	ctx := context.Background()
-	db := openVectorsDBWithPending(t, 5)
-	q := NewQueue(db, nil)
+	if err := pgvector.Migrate(ctx, db, 0); err != nil {
+		t.Fatalf("pgvector.Migrate: %v", err)
+	}
+
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO index_generations (id, model, dimension, fingerprint, started_at, state)
+		OVERRIDING SYSTEM VALUE
+		VALUES (1, 'm', 768, 'm:768', 0, 'building')`); err != nil {
+		t.Fatalf("insert generation: %v", err)
+	}
+	for i := 1; i <= n; i++ {
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO pending_embeddings (generation_id, message_id, enqueued_at) VALUES (1, $1, 0)`,
+			i); err != nil {
+			t.Fatalf("insert pending: %v", err)
+		}
+	}
+	return db
+}
+
+func pgCountAvailable(t *testing.T, db *sql.DB, gen int64) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM pending_embeddings WHERE generation_id = $1 AND claimed_at IS NULL`,
+		gen).Scan(&n); err != nil {
+		t.Fatalf("countAvailable: %v", err)
+	}
+	return n
+}
+
+func pgRebind() func(string) string {
+	return (&store.PostgreSQLDialect{}).Rebind
+}
+
+func TestQueuePG_ClaimReleaseComplete(t *testing.T) {
+	ctx := context.Background()
+	db := openPGQueueDB(t, 5)
+	q := NewQueue(db, pgRebind())
 
 	ids, token, err := q.Claim(ctx, 1, 3)
 	if err != nil {
@@ -22,7 +111,6 @@ func TestQueue_ClaimReleaseComplete(t *testing.T) {
 		t.Fatalf("claimed ids=%v token=%q, want 3 ids and non-empty token", ids, token)
 	}
 
-	// Second claim sees only 2 available.
 	more, token2, err := q.Claim(ctx, 1, 10)
 	if err != nil {
 		t.Fatal(err)
@@ -34,11 +122,10 @@ func TestQueue_ClaimReleaseComplete(t *testing.T) {
 	if err := q.Release(ctx, 1, token, ids); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
-	if got := countAvailable(t, db, 1); got != 3 {
+	if got := pgCountAvailable(t, db, 1); got != 3 {
 		t.Errorf("available after release = %d, want 3", got)
 	}
 
-	// Now complete the second batch; pending count should drop by 2.
 	if err := q.Complete(ctx, 1, token2, more); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
@@ -51,10 +138,10 @@ func TestQueue_ClaimReleaseComplete(t *testing.T) {
 	}
 }
 
-func TestQueue_Claim_EmptyBatchIsNoop(t *testing.T) {
+func TestQueuePG_Claim_EmptyBatchIsNoop(t *testing.T) {
 	ctx := context.Background()
-	db := openVectorsDBWithPending(t, 1)
-	q := NewQueue(db, nil)
+	db := openPGQueueDB(t, 1)
+	q := NewQueue(db, pgRebind())
 	ids, token, err := q.Claim(ctx, 1, 0)
 	if err != nil {
 		t.Fatalf("Claim(0): %v", err)
@@ -64,10 +151,10 @@ func TestQueue_Claim_EmptyBatchIsNoop(t *testing.T) {
 	}
 }
 
-func TestQueue_Claim_NoAvailableReturnsEmpty(t *testing.T) {
+func TestQueuePG_Claim_NoAvailableReturnsEmpty(t *testing.T) {
 	ctx := context.Background()
-	db := openVectorsDBWithPending(t, 0)
-	q := NewQueue(db, nil)
+	db := openPGQueueDB(t, 0)
+	q := NewQueue(db, pgRebind())
 	ids, token, err := q.Claim(ctx, 1, 10)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
@@ -77,15 +164,14 @@ func TestQueue_Claim_NoAvailableReturnsEmpty(t *testing.T) {
 	}
 }
 
-func TestQueue_Complete_WrongTokenNoop(t *testing.T) {
+func TestQueuePG_Complete_WrongTokenNoop(t *testing.T) {
 	ctx := context.Background()
-	db := openVectorsDBWithPending(t, 2)
-	q := NewQueue(db, nil)
+	db := openPGQueueDB(t, 2)
+	q := NewQueue(db, pgRebind())
 	ids, _, err := q.Claim(ctx, 1, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Wrong token — rows should remain.
 	if err := q.Complete(ctx, 1, "deadbeef", ids); err != nil {
 		t.Fatalf("Complete with wrong token: %v", err)
 	}
@@ -98,10 +184,10 @@ func TestQueue_Complete_WrongTokenNoop(t *testing.T) {
 	}
 }
 
-func TestQueue_Release_WrongTokenNoop(t *testing.T) {
+func TestQueuePG_Release_WrongTokenNoop(t *testing.T) {
 	ctx := context.Background()
-	db := openVectorsDBWithPending(t, 2)
-	q := NewQueue(db, nil)
+	db := openPGQueueDB(t, 2)
+	q := NewQueue(db, pgRebind())
 	ids, _, err := q.Claim(ctx, 1, 2)
 	if err != nil {
 		t.Fatal(err)
@@ -109,22 +195,21 @@ func TestQueue_Release_WrongTokenNoop(t *testing.T) {
 	if err := q.Release(ctx, 1, "deadbeef", ids); err != nil {
 		t.Fatalf("Release with wrong token: %v", err)
 	}
-	if got := countAvailable(t, db, 1); got != 0 {
+	if got := pgCountAvailable(t, db, 1); got != 0 {
 		t.Errorf("available after wrong-token release = %d, want 0 (still claimed)", got)
 	}
 }
 
-func TestQueue_ReclaimStale(t *testing.T) {
+func TestQueuePG_ReclaimStale(t *testing.T) {
 	ctx := context.Background()
-	db := openVectorsDBWithPending(t, 2)
-	q := NewQueue(db, nil)
+	db := openPGQueueDB(t, 2)
+	q := NewQueue(db, pgRebind())
 	_, _, err := q.Claim(ctx, 1, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Back-date the claim past the threshold.
 	if _, err := db.ExecContext(ctx,
-		`UPDATE pending_embeddings SET claimed_at = ? WHERE generation_id = 1`,
+		`UPDATE pending_embeddings SET claimed_at = $1 WHERE generation_id = 1`,
 		time.Now().Add(-20*time.Minute).Unix()); err != nil {
 		t.Fatal(err)
 	}
@@ -135,29 +220,24 @@ func TestQueue_ReclaimStale(t *testing.T) {
 	if n != 2 {
 		t.Errorf("reclaimed %d, want 2", n)
 	}
-	if got := countAvailable(t, db, 1); got != 2 {
+	if got := pgCountAvailable(t, db, 1); got != 2 {
 		t.Errorf("available after reclaim = %d, want 2", got)
 	}
 }
 
-func TestQueue_Complete_EmptyIDsIsNoop(t *testing.T) {
+func TestQueuePG_Complete_EmptyIDsIsNoop(t *testing.T) {
 	ctx := context.Background()
-	db := openVectorsDBWithPending(t, 1)
-	q := NewQueue(db, nil)
+	db := openPGQueueDB(t, 1)
+	q := NewQueue(db, pgRebind())
 	if err := q.Complete(ctx, 1, "token", nil); err != nil {
 		t.Errorf("Complete(nil): %v", err)
 	}
 }
 
-// TestQueue_Claim_ReturnsIDsAscending verifies that Claim's returned
-// slice is sorted ascending regardless of the order SQLite's
-// UPDATE...RETURNING clause produces rows. Callers (the Worker) pair
-// ids with fetched message rows by position, so a non-deterministic
-// order would cause silent vector↔message mixups.
-func TestQueue_Claim_ReturnsIDsAscending(t *testing.T) {
+func TestQueuePG_Claim_ReturnsIDsAscending(t *testing.T) {
 	ctx := context.Background()
-	db := openVectorsDBWithPending(t, 10)
-	q := NewQueue(db, nil)
+	db := openPGQueueDB(t, 10)
+	q := NewQueue(db, pgRebind())
 
 	ids, _, err := q.Claim(ctx, 1, 10)
 	if err != nil {
@@ -171,16 +251,10 @@ func TestQueue_Claim_ReturnsIDsAscending(t *testing.T) {
 	}
 }
 
-// TestQueue_Complete_AfterReclaim_PreservesNewClaim simulates the
-// stale-worker-completing-late race: worker A claims rows, stalls
-// long enough for ReclaimStale to clear the claim, worker B
-// re-claims the same rows, then worker A finally finishes and calls
-// Complete with its old token. The token check must prevent A from
-// deleting B's row.
-func TestQueue_Complete_AfterReclaim_PreservesNewClaim(t *testing.T) {
+func TestQueuePG_Complete_AfterReclaim_PreservesNewClaim(t *testing.T) {
 	ctx := context.Background()
-	db := openVectorsDBWithPending(t, 2)
-	q := NewQueue(db, nil)
+	db := openPGQueueDB(t, 2)
+	q := NewQueue(db, pgRebind())
 
 	idsA, tokenA, err := q.Claim(ctx, 1, 2)
 	if err != nil {
@@ -190,9 +264,8 @@ func TestQueue_Complete_AfterReclaim_PreservesNewClaim(t *testing.T) {
 		t.Fatalf("Claim A ids=%v, want 2", idsA)
 	}
 
-	// Back-date A's claim past the threshold, then reclaim.
 	if _, err := db.ExecContext(ctx,
-		`UPDATE pending_embeddings SET claimed_at = ? WHERE generation_id = 1`,
+		`UPDATE pending_embeddings SET claimed_at = $1 WHERE generation_id = 1`,
 		time.Now().Add(-20*time.Minute).Unix()); err != nil {
 		t.Fatal(err)
 	}
@@ -208,8 +281,6 @@ func TestQueue_Complete_AfterReclaim_PreservesNewClaim(t *testing.T) {
 		t.Fatalf("Claim B ids=%v token=%q (A=%q)", idsB, tokenB, tokenA)
 	}
 
-	// Stale worker A finishes and calls Complete with its dead token.
-	// The token check must keep B's rows intact.
 	if err := q.Complete(ctx, 1, tokenA, idsA); err != nil {
 		t.Fatalf("Complete(stale tokenA): %v", err)
 	}
@@ -221,17 +292,15 @@ func TestQueue_Complete_AfterReclaim_PreservesNewClaim(t *testing.T) {
 		t.Fatalf("pending rows after stale Complete = %d, want 2 (stale token must not delete)", remaining)
 	}
 
-	// B's claim should still be intact (claim_token matches tokenB).
 	var claimed int
 	if err := db.QueryRow(
-		`SELECT COUNT(*) FROM pending_embeddings WHERE claim_token = ?`, tokenB).Scan(&claimed); err != nil {
+		`SELECT COUNT(*) FROM pending_embeddings WHERE claim_token = $1`, tokenB).Scan(&claimed); err != nil {
 		t.Fatal(err)
 	}
 	if claimed != 2 {
 		t.Errorf("rows still holding B's token = %d, want 2", claimed)
 	}
 
-	// B can now legitimately Complete.
 	if err := q.Complete(ctx, 1, tokenB, idsB); err != nil {
 		t.Fatalf("Complete(tokenB): %v", err)
 	}
