@@ -10,7 +10,7 @@ import (
 	"database/sql"
 	"errors"
 
-	"github.com/wesm/msgvault/internal/vector"
+	"go.kenn.io/msgvault/internal/vector"
 )
 
 // ErrNotBuilt is returned when pgvector features are used in a build

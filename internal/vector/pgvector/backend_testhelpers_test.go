@@ -14,7 +14,7 @@ import (
 	"testing"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/wesm/msgvault/internal/vector"
+	"go.kenn.io/msgvault/internal/vector"
 )
 
 // testDBURL returns the value of MSGVAULT_TEST_DB if it names a

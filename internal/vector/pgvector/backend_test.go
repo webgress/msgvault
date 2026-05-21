@@ -8,7 +8,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/wesm/msgvault/internal/vector"
+	"go.kenn.io/msgvault/internal/vector"
 )
 
 // TestBackend_CreateActivateRetire exercises the full lifecycle of one

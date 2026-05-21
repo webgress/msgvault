@@ -15,6 +15,7 @@ import (
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/embed"
+	"go.kenn.io/msgvault/internal/vector/pgvector"
 	"go.kenn.io/msgvault/internal/vector/sqlitevec"
 )
 
@@ -28,24 +29,46 @@ func runEmbed(cmd *cobra.Command) error {
 	}
 	defer func() { _ = s.Close() }()
 
-	if err := sqlitevec.RegisterExtension(); err != nil {
-		return fmt.Errorf("register sqlite-vec: %w", err)
+	var (
+		backend   vector.Backend
+		vectorsDB *sql.DB
+		closeFn   func() error
+	)
+	if s.IsPostgreSQL() {
+		// pgvector embeddings live in the same Postgres database as
+		// messages — no separate vectors.db.
+		pgb, err := pgvector.Open(ctx, pgvector.Options{
+			DB:        s.DB(),
+			Dimension: cfg.Vector.Embeddings.Dimension,
+		})
+		if err != nil {
+			return fmt.Errorf("open pgvector backend: %w", err)
+		}
+		backend = pgb
+		vectorsDB = pgb.DB()
+		closeFn = pgb.Close
+	} else {
+		if err := sqlitevec.RegisterExtension(); err != nil {
+			return fmt.Errorf("register sqlite-vec: %w", err)
+		}
+		vecPath := cfg.Vector.DBPath
+		if vecPath == "" {
+			vecPath = filepath.Join(cfg.Data.DataDir, "vectors.db")
+		}
+		sb, err := sqlitevec.Open(ctx, sqlitevec.Options{
+			Path:      vecPath,
+			MainPath:  cfg.DatabaseDSN(),
+			Dimension: cfg.Vector.Embeddings.Dimension,
+			MainDB:    s.DB(),
+		})
+		if err != nil {
+			return fmt.Errorf("open vectors.db: %w", err)
+		}
+		backend = sb
+		vectorsDB = sb.DB()
+		closeFn = sb.Close
 	}
-
-	vecPath := cfg.Vector.DBPath
-	if vecPath == "" {
-		vecPath = filepath.Join(cfg.Data.DataDir, "vectors.db")
-	}
-	backend, err := sqlitevec.Open(ctx, sqlitevec.Options{
-		Path:      vecPath,
-		MainPath:  cfg.DatabaseDSN(),
-		Dimension: cfg.Vector.Embeddings.Dimension,
-		MainDB:    s.DB(),
-	})
-	if err != nil {
-		return fmt.Errorf("open vectors.db: %w", err)
-	}
-	defer func() { _ = backend.Close() }()
+	defer func() { _ = closeFn() }()
 
 	gen, rebuildInProgress, err := pickEmbedGeneration(ctx, backend, embedGenerationOpts{
 		FullRebuild: embedFullRebuild,
@@ -70,14 +93,14 @@ func runEmbed(cmd *cobra.Command) error {
 		Timeout:    cfg.Vector.Embeddings.Timeout,
 		MaxRetries: cfg.Vector.Embeddings.MaxRetries,
 	})
-	totalPending, err := pendingCount(ctx, backend.DB(), gen)
+	totalPending, err := pendingCount(ctx, vectorsDB, gen)
 	if err != nil {
 		return fmt.Errorf("count pending: %w", err)
 	}
 
 	worker := embed.NewWorker(embed.WorkerDeps{
 		Backend:   backend,
-		VectorsDB: backend.DB(),
+		VectorsDB: vectorsDB,
 		MainDB:    s.DB(),
 		Client:    client,
 		Preprocess: embed.PreprocessConfig{
@@ -114,7 +137,7 @@ func runEmbed(cmd *cobra.Command) error {
 	// worker later recovers from must not block activation, and an
 	// active generation must not be re-activated.
 	if rebuildInProgress {
-		remaining, err := pendingCount(ctx, backend.DB(), gen)
+		remaining, err := pendingCount(ctx, vectorsDB, gen)
 		if err != nil {
 			return fmt.Errorf("count pending: %w", err)
 		}
