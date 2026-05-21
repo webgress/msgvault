@@ -268,15 +268,22 @@ func (d *PostgreSQLDialect) IsBusyError(err error) bool {
 	return isPgError(err, "55P03") || isPgError(err, "40P01")
 }
 
-// BeginExclusive opens a transaction on conn and locks sync_runs in
-// EXCLUSIVE mode. EXCLUSIVE conflicts with the ROW EXCLUSIVE lock that
-// INSERT acquires, so concurrent StartSync calls block until the caller
-// commits or rolls back. ACCESS SHARE (reads) is still permitted.
+// BeginExclusive opens a transaction on conn and locks every table a
+// sync writes to in EXCLUSIVE mode. SQLite's BEGIN EXCLUSIVE blocks all
+// writers database-wide, so the PG counterpart must cover the full set
+// of tables a sync touches — not just sync_runs — for callers like
+// RemoveSourceSerialized to safely cascade-delete a source without
+// racing a concurrent sync that keeps inserting messages, attachments,
+// labels, recipients, or participants. EXCLUSIVE conflicts with the
+// ROW EXCLUSIVE lock that INSERT/UPDATE/DELETE acquire; ACCESS SHARE
+// (reads) is still permitted.
 func (d *PostgreSQLDialect) BeginExclusive(ctx context.Context, conn *sql.Conn) error {
 	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
 		return err
 	}
-	if _, err := conn.ExecContext(ctx, "LOCK TABLE sync_runs IN EXCLUSIVE MODE"); err != nil {
+	if _, err := conn.ExecContext(ctx,
+		"LOCK TABLE sync_runs, messages, attachments, message_labels, message_recipients, participants IN EXCLUSIVE MODE",
+	); err != nil {
 		_, _ = conn.ExecContext(ctx, "ROLLBACK")
 		return err
 	}

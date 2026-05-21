@@ -825,7 +825,7 @@ func (e *SQLiteEngine) GetMessageSummariesByIDs(ctx context.Context, ids []int64
 }
 
 func (e *SQLiteEngine) fetchLabelsForMessages(ctx context.Context, messages []MessageSummary) error {
-	return fetchLabelsForMessageList(ctx, e.db, "", messages)
+	return fetchLabelsForMessageList(ctx, e.db, e.dialect.Rebind, "", messages)
 }
 
 // GetMessage retrieves a full message by internal ID.
@@ -843,7 +843,7 @@ func (e *SQLiteEngine) GetMessageBySourceID(ctx context.Context, sourceMessageID
 }
 
 func (e *SQLiteEngine) getMessageByQuery(ctx context.Context, whereClause string, args ...interface{}) (*MessageDetail, error) {
-	return getMessageByQueryShared(ctx, e.db, "", whereClause, args...)
+	return getMessageByQueryShared(ctx, e.db, e.dialect.Rebind, "", whereClause, args...)
 }
 
 // GetAttachment retrieves attachment metadata by ID.
@@ -865,7 +865,7 @@ func (e *SQLiteEngine) GetAttachment(ctx context.Context, id int64) (*Attachment
 
 // GetMessageRaw returns the decompressed raw MIME data for a message.
 func (e *SQLiteEngine) GetMessageRaw(ctx context.Context, id int64) ([]byte, error) {
-	return getMessageRawShared(ctx, e.db, "", id)
+	return getMessageRawShared(ctx, e.db, e.dialect.Rebind, "", id)
 }
 
 // ListAccounts returns all source accounts.

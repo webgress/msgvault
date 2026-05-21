@@ -122,7 +122,7 @@ func (s *Store) CreateCollection(
 			name, description,
 		).Scan(&id)
 		if err != nil {
-			if isSQLiteError(err, "UNIQUE constraint failed") {
+			if s.dialect.IsConflictError(err) {
 				return fmt.Errorf(
 					"collection %q already exists", name,
 				)
