@@ -45,12 +45,43 @@ func (d *PostgreSQLDialect) Now() string { return "NOW()" }
 // type and rejects integer comparisons (`col = 1`) against boolean columns.
 func (d *PostgreSQLDialect) BoolTrueExpr(col string) string { return col }
 
-// BuildFTSArg formats search terms for plainto_tsquery: a plain
-// space-separated string. plainto_tsquery handles AND logic natively and
-// treats meta tokens like quotes/AND as literal stopwords or fragments,
-// so we must NOT emit FTS5 syntax here.
+// BuildFTSArg formats search terms for to_tsquery: each term is stripped
+// of tsquery metacharacters, suffixed with ":*" for prefix matching, and
+// AND'd together with " & ". This matches the format emitted by the
+// query package's PostgreSQLQueryDialect.BuildFTSTerm so the API search
+// path (plainto_tsquery had no prefix match) and the engine deep-search
+// path return the same hits for the same input — searching "invo" must
+// match "invoice" everywhere, not only in the engine path.
 func (d *PostgreSQLDialect) BuildFTSArg(terms []string) string {
-	return strings.Join(terms, " ")
+	out := make([]string, 0, len(terms))
+	for _, t := range terms {
+		clean := pgTsqueryEscape(t)
+		if clean == "" {
+			continue
+		}
+		out = append(out, clean+":*")
+	}
+	return strings.Join(out, " & ")
+}
+
+// pgTsqueryEscape removes tsquery metacharacters and whitespace,
+// leaving a single alphanumeric+unicode token. Mirrors the helper in
+// internal/query/dialect.go so both packages produce the same shape
+// without taking a cross-package dependency.
+func pgTsqueryEscape(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '&', '|', '!', '(', ')', ':', '*', '\\', '\'':
+			// skip
+		default:
+			if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+				continue
+			}
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // InsertOrIgnore rewrites INSERT OR IGNORE INTO to INSERT INTO and appends
@@ -100,12 +131,15 @@ func (d *PostgreSQLDialect) FTSUpsert(q querier, doc FTSDoc) error {
 
 // FTSSearchClause returns SQL fragments for tsvector full-text search.
 // PostgreSQL stores the tsvector on the messages table — no JOIN needed.
-// Uses `?` placeholders; loggedDB rebinds to `$N` at execution time.
-// ts_rank needs the query term a second time, so orderArgCount is 1.
+// Uses to_tsquery (not plainto_tsquery) so the bound argument can carry
+// prefix-match operators ("invo:*" matches "invoice"); BuildFTSArg
+// produces the matching shape. Uses `?` placeholders; loggedDB rebinds
+// to `$N` at execution time. ts_rank needs the query term a second time,
+// so orderArgCount is 1.
 func (d *PostgreSQLDialect) FTSSearchClause() (join, where, orderBy string, orderArgCount int) {
 	return "",
-		"m.search_fts @@ plainto_tsquery('simple', ?)",
-		"ts_rank(m.search_fts, plainto_tsquery('simple', ?)) DESC",
+		"m.search_fts @@ to_tsquery('simple', ?)",
+		"ts_rank(m.search_fts, to_tsquery('simple', ?)) DESC",
 		1
 }
 
@@ -268,21 +302,28 @@ func (d *PostgreSQLDialect) IsBusyError(err error) bool {
 	return isPgError(err, "55P03") || isPgError(err, "40P01")
 }
 
-// BeginExclusive opens a transaction on conn and locks every table a
-// sync writes to in EXCLUSIVE mode. SQLite's BEGIN EXCLUSIVE blocks all
-// writers database-wide, so the PG counterpart must cover the full set
-// of tables a sync touches — not just sync_runs — for callers like
+// BeginExclusive opens a transaction on conn and locks every table the
+// sync path writes to in EXCLUSIVE mode. SQLite's BEGIN EXCLUSIVE blocks
+// all writers database-wide, so the PG counterpart must cover the full
+// set of tables a sync touches — not just sync_runs — for callers like
 // RemoveSourceSerialized to safely cascade-delete a source without
-// racing a concurrent sync that keeps inserting messages, attachments,
-// labels, recipients, or participants. EXCLUSIVE conflicts with the
-// ROW EXCLUSIVE lock that INSERT/UPDATE/DELETE acquire; ACCESS SHARE
-// (reads) is still permitted.
+// racing a concurrent sync. EXCLUSIVE conflicts with the ROW EXCLUSIVE
+// lock that INSERT/UPDATE/DELETE acquire; ACCESS SHARE (reads) is still
+// permitted.
+//
+// The table list mirrors every INSERT/UPDATE/DELETE the sync pipeline
+// emits (verified against internal/store/messages.go,
+// internal/store/sync.go, and internal/sync/*.go): sources is included
+// because UpdateSourceSyncCursor stamps last_sync_at on every sync.
 func (d *PostgreSQLDialect) BeginExclusive(ctx context.Context, conn *sql.Conn) error {
 	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
 		return err
 	}
 	if _, err := conn.ExecContext(ctx,
-		"LOCK TABLE sync_runs, messages, attachments, message_labels, message_recipients, participants IN EXCLUSIVE MODE",
+		"LOCK TABLE sync_runs, sources, conversations, conversation_participants, "+
+			"messages, message_recipients, message_labels, message_bodies, message_raw, "+
+			"attachments, labels, participants, participant_identifiers, reactions "+
+			"IN EXCLUSIVE MODE",
 	); err != nil {
 		_, _ = conn.ExecContext(ctx, "ROLLBACK")
 		return err

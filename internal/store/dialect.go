@@ -177,9 +177,10 @@ type Dialect interface {
 	// BuildFTSArg formats a slice of user-supplied search terms into the
 	// single string argument that FTSSearchClause's WHERE fragment binds
 	// against the dialect's FTS function. SQLite returns FTS5 syntax
-	// (quoted terms joined by AND); PostgreSQL returns plain
-	// space-separated terms because plainto_tsquery handles AND natively
-	// and treats the literal `AND` token as a stopword/phrase fragment.
+	// (quoted terms joined by AND); PostgreSQL returns to_tsquery syntax
+	// (each term suffixed with ":*" for prefix match, joined by " & "),
+	// matching the format emitted by the query engine's PostgreSQL
+	// dialect so both code paths produce equivalent hits.
 	BuildFTSArg(terms []string) string
 
 	// BeginExclusive opens a transaction on conn that blocks concurrent

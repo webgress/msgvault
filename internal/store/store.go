@@ -58,8 +58,10 @@ func isSQLiteError(err error, substr string) bool {
 	return false
 }
 
-// isPostgresURL returns true if the path looks like a PostgreSQL connection URL.
-func isPostgresURL(dbPath string) bool {
+// IsPostgresURL returns true if the path looks like a PostgreSQL connection URL.
+// Exported so cmd-side helpers can decide whether to skip SQLite-only code
+// paths (e.g., the Parquet analytics cache) without first opening a Store.
+func IsPostgresURL(dbPath string) bool {
 	return strings.HasPrefix(dbPath, "postgresql://") || strings.HasPrefix(dbPath, "postgres://")
 }
 
@@ -67,7 +69,7 @@ func isPostgresURL(dbPath string) bool {
 // If dbPath is a postgres:// or postgresql:// URL, opens a PostgreSQL connection.
 // Otherwise, opens a SQLite database at the file path.
 func Open(dbPath string) (*Store, error) {
-	if isPostgresURL(dbPath) {
+	if IsPostgresURL(dbPath) {
 		return openPostgres(dbPath)
 	}
 	return openSQLite(dbPath)
@@ -156,7 +158,7 @@ func openPostgres(dbURL string) (*Store, error) {
 // same database concurrently. Does not create the database, run migrations,
 // or checkpoint WAL on close.
 func OpenReadOnly(dbPath string) (*Store, error) {
-	if isPostgresURL(dbPath) {
+	if IsPostgresURL(dbPath) {
 		return openPostgresReadOnly(dbPath)
 	}
 
