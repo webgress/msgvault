@@ -162,8 +162,15 @@ func (PostgreSQLQueryDialect) TimeTruncExpression(column string, granularity str
 	}
 }
 
+// FTSSearchExpression uses to_tsquery (not plainto_tsquery) so the
+// bound argument can carry prefix-match operators ("invo:*" matches
+// "invoice"); BuildFTSTerm and SanitizeFTSQuery both emit arguments in
+// that shape, and the store dialect's FTSSearchClause does the same.
+// Keeping all three aligned prevents the next caller from binding a
+// :*-shaped argument into plainto_tsquery and silently getting a
+// literal-phrase match.
 func (PostgreSQLQueryDialect) FTSSearchExpression() string {
-	return "m.search_fts @@ plainto_tsquery('simple', ?)"
+	return "m.search_fts @@ to_tsquery('simple', ?)"
 }
 
 func (PostgreSQLQueryDialect) HasFTSTableSQL() string {

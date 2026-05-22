@@ -28,14 +28,22 @@ func (d *SQLiteDialect) InsertOrIgnore(sql string) string { return sql }
 // BoolTrueExpr returns "col = 1" — SQLite stores booleans as 0/1 INTEGER.
 func (d *SQLiteDialect) BoolTrueExpr(col string) string { return col + " = 1" }
 
-// BuildFTSArg formats search terms as an FTS5 MATCH argument:
-// each term double-quote-escaped and joined by AND.
+// BuildFTSArg formats search terms as an FTS5 MATCH argument: each
+// term double-quote-escaped, suffixed with "*" for prefix match, and
+// space-joined (FTS5 treats space as implicit AND). Embedded "*" is
+// stripped first so user input cannot break the trailing prefix
+// operator. Matches the shape produced by the query package's
+// SQLiteQueryDialect.BuildFTSTerm so the API search path and the
+// engine deep-search path return the same hits for the same input —
+// searching "invo" must match "invoice" in both paths.
 func (d *SQLiteDialect) BuildFTSArg(terms []string) string {
 	quoted := make([]string, len(terms))
 	for i, t := range terms {
-		quoted[i] = `"` + strings.ReplaceAll(t, `"`, `""`) + `"`
+		t = strings.ReplaceAll(t, `"`, `""`)
+		t = strings.ReplaceAll(t, "*", "")
+		quoted[i] = `"` + t + `"*`
 	}
-	return strings.Join(quoted, " AND ")
+	return strings.Join(quoted, " ")
 }
 
 // InsertOrIgnorePrefix is a no-op for SQLite — OR IGNORE stays in the prefix.
