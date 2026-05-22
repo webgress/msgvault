@@ -47,11 +47,13 @@ func (d *PostgreSQLDialect) BoolTrueExpr(col string) string { return col }
 
 // BuildFTSArg formats search terms for to_tsquery: each term is stripped
 // of tsquery metacharacters, suffixed with ":*" for prefix matching, and
-// AND'd together with " & ". This matches the format emitted by the
-// query package's PostgreSQLQueryDialect.BuildFTSTerm so the API search
-// path (plainto_tsquery had no prefix match) and the engine deep-search
-// path return the same hits for the same input — searching "invo" must
-// match "invoice" everywhere, not only in the engine path.
+// joined with " & ". Matches the shape emitted by the query package's
+// PostgreSQLQueryDialect.BuildFTSTerm so the API search and engine
+// deep-search return the same hits — "invo" matches "invoice" in both.
+// Terms that reduce to an empty escape are dropped; if all drop, returns
+// "" so the caller can substitute a FALSE predicate rather than feed
+// to_tsquery an empty argument ("text-search query doesn't contain
+// lexemes").
 func (d *PostgreSQLDialect) BuildFTSArg(terms []string) string {
 	out := make([]string, 0, len(terms))
 	for _, t := range terms {

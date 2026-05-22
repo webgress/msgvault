@@ -247,72 +247,28 @@ func (s *Store) GetMessagesSummariesByIDs(ids []int64) ([]APIMessage, error) {
 	return ordered, nil
 }
 
-// SearchMessages searches messages using full-text search, with batch-loaded recipients and labels.
+// SearchMessages searches messages using full-text search, with
+// batch-loaded recipients and labels. The raw query string is split on
+// whitespace into TextTerms and the work is delegated to
+// SearchMessagesQuery so both call sites share one FTS-argument
+// pipeline. Previously this function bound the raw user string straight
+// into FTSSearchClause's placeholder, which on PostgreSQL fed
+// to_tsquery un-escaped input (whitespace and metacharacters in user
+// queries broke the parser) and on SQLite let FTS5 metacharacters
+// reach the MATCH parser. Routing through BuildFTSArg sanitizes per
+// dialect and reuses the FALSE fallback for tokenless inputs.
 func (s *Store) SearchMessages(query string, offset, limit int) ([]APIMessage, int64, error) {
-	ftsJoin, ftsWhere, ftsOrder, orderArgCount := s.dialect.FTSSearchClause()
-
-	ftsQuery := fmt.Sprintf(`
-		SELECT
-			m.id,
-			COALESCE(m.conversation_id, 0) as conversation_id,
-			COALESCE(m.subject, '') as subject,
-			COALESCE(p.email_address, '') as from_email,
-			COALESCE(m.sent_at, m.received_at, m.internal_date) as sent_at,
-			COALESCE(m.snippet, '') as snippet,
-			m.has_attachments,
-			m.size_estimate
-		FROM messages m
-		%s
-		LEFT JOIN message_recipients mr ON mr.message_id = m.id AND mr.recipient_type = 'from'
-		LEFT JOIN participants p ON p.id = mr.participant_id
-		WHERE %s AND %s
-		ORDER BY %s
-		LIMIT ? OFFSET ?
-	`, ftsJoin, ftsWhere, LiveMessagesWhere("m", true), ftsOrder)
-
-	// Bind the search term once for WHERE, plus orderArgCount more times
-	// for any ? placeholders the dialect put in the order-by fragment.
-	searchArgs := make([]interface{}, 0, 3+orderArgCount)
-	searchArgs = append(searchArgs, query)
-	for i := 0; i < orderArgCount; i++ {
-		searchArgs = append(searchArgs, query)
-	}
-	searchArgs = append(searchArgs, limit, offset)
-
-	rows, err := s.db.Query(ftsQuery, searchArgs...)
-	if err != nil {
-		// FTS might not be available, fall back to LIKE search
-		return s.searchMessagesLike(query, offset, limit)
-	}
-	defer func() { _ = rows.Close() }()
-
-	messages, ids, err := scanMessageRows(rows)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	if len(ids) == 0 {
+	terms := strings.Fields(query)
+	if len(terms) == 0 {
+		// Whitespace-only / empty input: no search performed. Returning
+		// every row (the "no FTS filter applied" interpretation) would
+		// be a startling UX change vs. the prior behavior, where empty
+		// queries errored at the FTS parser. Treat as "no matches".
 		return []APIMessage{}, 0, nil
 	}
-
-	// Get total count
-	var total int64
-	countQuery := fmt.Sprintf(`
-		SELECT COUNT(*)
-		FROM messages m
-		%s
-		WHERE %s AND %s
-	`, ftsJoin, ftsWhere, LiveMessagesWhere("m", true))
-	if err := s.db.QueryRow(countQuery, query).Scan(&total); err != nil {
-		return nil, 0, fmt.Errorf("count FTS results: %w", err)
-	}
-
-	// Batch-load recipients and labels
-	if err := s.batchPopulate(messages, ids); err != nil {
-		return nil, 0, err
-	}
-
-	return messages, total, nil
+	return s.SearchMessagesQuery(
+		&search.Query{TextTerms: terms}, offset, limit,
+	)
 }
 
 // SearchMessagesQuery searches messages using a parsed query with
