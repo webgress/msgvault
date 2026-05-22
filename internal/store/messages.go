@@ -648,8 +648,15 @@ func (s *Store) EnsureLabelsBatch(
 	err := s.withTx(func(tx *loggedTx) error {
 		// Phase 1: Move all renamed labels to temporary names so
 		// that cross-renames don't cause one label to incorrectly
-		// merge the other. Temp names use the row PK (unique by
-		// construction) with a prefix that can't be a real label.
+		// merge the other. Temp names embed the row PK (unique by
+		// construction within this source_id) and a SOH (U+0001)
+		// prefix that real Gmail label names cannot contain — Gmail's
+		// UI rejects control characters, so the temp name cannot
+		// collide with any real label name in the same source. The
+		// SQLite-only X'00' hex literal that previously played this
+		// role is not portable: PostgreSQL doesn't parse X'00' and
+		// PG TEXT rejects embedded NUL bytes outright, so we build
+		// the sentinel in Go and bind it as a parameter.
 		for sourceLabelID, info := range labels {
 			var id int64
 			var curName string
@@ -665,10 +672,10 @@ func (s *Store) EnsureLabelsBatch(
 					"check label %s: %w", sourceLabelID, err,
 				)
 			}
+			tempName := fmt.Sprintf("\x01__msgvault_pending_rename__%d", id)
 			if _, err = tx.Exec(`
-				UPDATE labels SET name = CAST(id AS TEXT) || X'00'
-				WHERE id = ?
-			`, id); err != nil {
+				UPDATE labels SET name = ? WHERE id = ?
+			`, tempName, id); err != nil {
 				return fmt.Errorf(
 					"clear name for label %s: %w", sourceLabelID, err,
 				)
