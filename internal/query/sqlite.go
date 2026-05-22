@@ -176,6 +176,9 @@ func buildAggregateSQL(dim aggDimension, filterJoins string, filterWhere string,
 		allWhere += " AND " + dim.whereExpr
 	}
 
+	// The outer derived table needs an explicit alias — PostgreSQL
+	// rejects subqueries in FROM without one ("syntax error at or near
+	// ')'"); SQLite tolerates either form, so `AS agg` is portable.
 	return fmt.Sprintf(`
 		SELECT key, count, total_size, attachment_size, attachment_count, total_unique
 		FROM (
@@ -195,7 +198,7 @@ func buildAggregateSQL(dim aggDimension, filterJoins string, filterWhere string,
 			) att ON att.message_id = m.id
 			WHERE %s
 			GROUP BY key
-		)
+		) AS agg
 		%s
 		LIMIT ?
 	`, dim.keyExpr, allJoins, allWhere, sort)
@@ -612,15 +615,20 @@ func (e *SQLiteEngine) executeAggregateQuery(ctx context.Context, query string, 
 func (e *SQLiteEngine) ListMessages(ctx context.Context, filter MessageFilter) ([]MessageSummary, error) {
 	filterJoins, conditions, args := e.buildFilterJoinsAndConditions(filter, "m")
 
-	// Build ORDER BY with validation
+	// Build ORDER BY with validation. PostgreSQL requires every
+	// ORDER BY expression under SELECT DISTINCT to match an expression
+	// in the SELECT list (textually equivalent or by position) — so the
+	// size and subject sorts must reference the same COALESCE wrapper
+	// used in the SELECT, not the raw column. Raw m.sent_at is already
+	// in the SELECT for the date sort.
 	var orderBy string
 	switch filter.Sorting.Field {
 	case MessageSortByDate:
 		orderBy = "m.sent_at"
 	case MessageSortBySize:
-		orderBy = "m.size_estimate"
+		orderBy = "COALESCE(m.size_estimate, 0)"
 	case MessageSortBySubject:
-		orderBy = "m.subject"
+		orderBy = "COALESCE(m.subject, '')"
 	default:
 		return nil, fmt.Errorf("unsupported message sort field: %d", filter.Sorting.Field)
 	}
@@ -1024,6 +1032,15 @@ func (e *SQLiteEngine) GetTotalStats(ctx context.Context, opts StatsOptions) (*T
 
 // GetGmailIDsByFilter returns Gmail message IDs (source_message_id) matching a filter.
 // This is more efficient than ListMessages when you only need the IDs.
+//
+// All filter predicates that would otherwise need 1:N joins
+// (recipients, labels) are expressed as EXISTS subqueries so messages
+// can never appear in the result set more than once. Without that, we
+// would need SELECT DISTINCT — and PostgreSQL rejects SELECT DISTINCT
+// when ORDER BY references columns not in the SELECT list, breaking
+// the "most recent first" ordering callers (MCP, TUI) depend on under
+// Pagination.Limit. The EXISTS form also matches the SQL guidance in
+// CLAUDE.md ("Never use SELECT DISTINCT with JOINs — use EXISTS").
 func (e *SQLiteEngine) GetGmailIDsByFilter(ctx context.Context, filter MessageFilter) ([]string, error) {
 	var conditions []string
 	var args []interface{}
@@ -1035,78 +1052,84 @@ func (e *SQLiteEngine) GetGmailIDsByFilter(ctx context.Context, filter MessageFi
 
 	conditions, args = appendSourceFilter(conditions, args, "m.", filter.SourceID, filter.SourceIDs)
 
-	// Build JOIN clauses based on filter type
-	var joins []string
-
-	// Scope to Gmail sources only — this function is used for Gmail-specific
-	// deletion/staging workflows and must not return WhatsApp or other source IDs.
-	joins = append(joins, `JOIN sources s_gmail ON s_gmail.id = m.source_id AND s_gmail.source_type = 'gmail'`)
+	// Scope to Gmail sources only — this function is used for
+	// Gmail-specific deletion/staging workflows and must not return
+	// WhatsApp or other source IDs. 1:1 with messages, so kept as a
+	// JOIN; the other filter predicates below use EXISTS to stay
+	// non-multiplicative.
+	joins := []string{`JOIN sources s_gmail ON s_gmail.id = m.source_id AND s_gmail.source_type = 'gmail'`}
 
 	if filter.Sender != "" {
-		joins = append(joins, `
-			LEFT JOIN message_recipients mr_from ON mr_from.message_id = m.id AND mr_from.recipient_type = 'from'
-			LEFT JOIN participants p_from ON p_from.id = mr_from.participant_id
-			LEFT JOIN participants p_ds ON p_ds.id = m.sender_id
-		`)
-		conditions = append(conditions, "(p_from.email_address = ? OR p_from.phone_number = ? OR p_ds.email_address = ? OR p_ds.phone_number = ?)")
+		conditions = append(conditions, `(
+			EXISTS (
+				SELECT 1 FROM message_recipients mr_from
+				JOIN participants p_from ON p_from.id = mr_from.participant_id
+				WHERE mr_from.message_id = m.id AND mr_from.recipient_type = 'from'
+				  AND (p_from.email_address = ? OR p_from.phone_number = ?)
+			)
+			OR EXISTS (
+				SELECT 1 FROM participants p_ds
+				WHERE p_ds.id = m.sender_id
+				  AND (p_ds.email_address = ? OR p_ds.phone_number = ?)
+			)
+		)`)
 		args = append(args, filter.Sender, filter.Sender, filter.Sender, filter.Sender)
 	}
 
 	if filter.SenderName != "" {
-		if filter.Sender == "" {
-			joins = append(joins, `
-				LEFT JOIN message_recipients mr_from ON mr_from.message_id = m.id AND mr_from.recipient_type = 'from'
-				LEFT JOIN participants p_from ON p_from.id = mr_from.participant_id
-				LEFT JOIN participants p_ds ON p_ds.id = m.sender_id
-			`)
-		}
 		conditions = append(conditions, fmt.Sprintf(`(
-			%s = ?
-			OR %s = ?
+			EXISTS (
+				SELECT 1 FROM message_recipients mr_from
+				JOIN participants p_from ON p_from.id = mr_from.participant_id
+				WHERE mr_from.message_id = m.id AND mr_from.recipient_type = 'from'
+				  AND %s = ?
+			)
+			OR EXISTS (
+				SELECT 1 FROM participants p_ds
+				WHERE p_ds.id = m.sender_id AND %s = ?
+			)
 		)`, participantNameExpr("p_from"), participantNameExpr("p_ds")))
 		args = append(args, filter.SenderName, filter.SenderName)
 	}
 
 	if filter.Recipient != "" {
-		joins = append(joins, `
-			JOIN message_recipients mr_to ON mr_to.message_id = m.id AND mr_to.recipient_type IN ('to', 'cc', 'bcc')
+		conditions = append(conditions, `EXISTS (
+			SELECT 1 FROM message_recipients mr_to
 			JOIN participants p_to ON p_to.id = mr_to.participant_id
-		`)
-		conditions = append(conditions, "p_to.email_address = ?")
+			WHERE mr_to.message_id = m.id
+			  AND mr_to.recipient_type IN ('to', 'cc', 'bcc')
+			  AND p_to.email_address = ?
+		)`)
 		args = append(args, filter.Recipient)
 	}
 
 	if filter.RecipientName != "" {
-		if filter.Recipient == "" {
-			// Always add the full join chain — GetGmailIDsByFilter does not
-			// have a standalone MatchEmptyRecipient handler, so mr_to may
-			// not exist yet.
-			joins = append(joins, `
-				JOIN message_recipients mr_to ON mr_to.message_id = m.id AND mr_to.recipient_type IN ('to', 'cc', 'bcc')
-				JOIN participants p_to ON p_to.id = mr_to.participant_id
-			`)
-		}
-		conditions = append(conditions, participantNameExpr("p_to")+" = ?")
+		conditions = append(conditions, fmt.Sprintf(`EXISTS (
+			SELECT 1 FROM message_recipients mr_to
+			JOIN participants p_to ON p_to.id = mr_to.participant_id
+			WHERE mr_to.message_id = m.id
+			  AND mr_to.recipient_type IN ('to', 'cc', 'bcc')
+			  AND %s = ?
+		)`, participantNameExpr("p_to")))
 		args = append(args, filter.RecipientName)
 	}
 
 	if filter.Domain != "" {
-		if filter.Sender == "" && filter.SenderName == "" { // Don't duplicate the join
-			joins = append(joins, `
-				JOIN message_recipients mr_from ON mr_from.message_id = m.id AND mr_from.recipient_type = 'from'
-				JOIN participants p_from ON p_from.id = mr_from.participant_id
-			`)
-		}
-		conditions = append(conditions, "p_from.domain = ?")
+		conditions = append(conditions, `EXISTS (
+			SELECT 1 FROM message_recipients mr_from
+			JOIN participants p_from ON p_from.id = mr_from.participant_id
+			WHERE mr_from.message_id = m.id AND mr_from.recipient_type = 'from'
+			  AND p_from.domain = ?
+		)`)
 		args = append(args, filter.Domain)
 	}
 
 	if filter.Label != "" {
-		joins = append(joins, `
-			JOIN message_labels ml ON ml.message_id = m.id
+		conditions = append(conditions, `EXISTS (
+			SELECT 1 FROM message_labels ml
 			JOIN labels l ON l.id = ml.label_id
-		`)
-		conditions = append(conditions, "LOWER(l.name) = LOWER(?)")
+			WHERE ml.message_id = m.id AND LOWER(l.name) = LOWER(?)
+		)`)
 		args = append(args, filter.Label)
 	}
 
@@ -1138,9 +1161,12 @@ func (e *SQLiteEngine) GetGmailIDsByFilter(ctx context.Context, filter MessageFi
 		args = append(args, filter.TimeRange.Period)
 	}
 
-	// Build query - only add LIMIT if explicitly set
+	// Build query - only add LIMIT if explicitly set. DISTINCT is not
+	// needed because every multiplicative filter is now an EXISTS
+	// subquery; messages.id is PK so each row contributes exactly one
+	// source_message_id.
 	query := fmt.Sprintf(`
-		SELECT DISTINCT m.source_message_id
+		SELECT m.source_message_id
 		FROM messages m
 		%s
 		WHERE %s
