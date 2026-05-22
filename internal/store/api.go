@@ -333,12 +333,25 @@ func (s *Store) SearchMessagesQuery(
 	var ftsOrderArgCount int
 	if ftsEnabled {
 		ftsExpr = s.dialect.BuildFTSArg(q.TextTerms)
-		join, where, orderBy, orderArgCount := s.dialect.FTSSearchClause()
-		ftsJoin = join
-		ftsOrder = orderBy
-		ftsOrderArgCount = orderArgCount
-		conditions = append(conditions, where)
-		args = append(args, ftsExpr)
+		if ftsExpr == "" {
+			// Every text term reduced to nothing usable (punctuation-
+			// only input like "!!!" or "---"). Dispatching the dialect's
+			// FTS WHERE here would feed PG's to_tsquery an empty string
+			// ("text-search query doesn't contain lexemes") and SQLite's
+			// FTS5 MATCH a syntax error. Substitute FALSE so the query
+			// returns zero rows without ever touching the FTS function,
+			// matching the (expr="FALSE", arg="") fallback that the
+			// query package's BuildFTSTerm uses for the same input.
+			conditions = append(conditions, "FALSE")
+			ftsEnabled = false
+		} else {
+			join, where, orderBy, orderArgCount := s.dialect.FTSSearchClause()
+			ftsJoin = join
+			ftsOrder = orderBy
+			ftsOrderArgCount = orderArgCount
+			conditions = append(conditions, where)
+			args = append(args, ftsExpr)
+		}
 	}
 
 	// from: filter

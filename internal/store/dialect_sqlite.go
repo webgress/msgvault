@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"unicode"
 
 	"github.com/mattn/go-sqlite3"
 )
@@ -36,14 +37,37 @@ func (d *SQLiteDialect) BoolTrueExpr(col string) string { return col + " = 1" }
 // SQLiteQueryDialect.BuildFTSTerm so the API search path and the
 // engine deep-search path return the same hits for the same input —
 // searching "invo" must match "invoice" in both paths.
+//
+// Terms that would tokenize to nothing under the default FTS5
+// tokenizer (no Unicode letter or digit — e.g. "!!!", "---", "") are
+// dropped. If all terms drop, returns "" so the caller can
+// short-circuit instead of dispatching a malformed FTS5 MATCH that
+// errors at the driver. Mirrors the empty-fallback shape in
+// PostgreSQLDialect.BuildFTSArg.
 func (d *SQLiteDialect) BuildFTSArg(terms []string) string {
-	quoted := make([]string, len(terms))
-	for i, t := range terms {
+	quoted := make([]string, 0, len(terms))
+	for _, t := range terms {
+		if !hasFTSToken(t) {
+			continue
+		}
 		t = strings.ReplaceAll(t, `"`, `""`)
 		t = strings.ReplaceAll(t, "*", "")
-		quoted[i] = `"` + t + `"*`
+		quoted = append(quoted, `"`+t+`"*`)
 	}
 	return strings.Join(quoted, " ")
+}
+
+// hasFTSToken reports whether s contains at least one rune that the
+// default FTS5 tokenizer (unicode61) would emit as part of a token —
+// i.e., a Unicode letter or digit. Punctuation-only strings tokenize
+// to nothing, so a MATCH built from them is a syntax error.
+func hasFTSToken(s string) bool {
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return true
+		}
+	}
+	return false
 }
 
 // InsertOrIgnorePrefix is a no-op for SQLite — OR IGNORE stays in the prefix.
