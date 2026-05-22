@@ -349,6 +349,7 @@ CREATE INDEX IF NOT EXISTS idx_reactions_message ON reactions(message_id);
 
 CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_hash ON attachments(content_hash);
+CREATE INDEX IF NOT EXISTS idx_attachments_storage_path ON attachments(storage_path);
 
 CREATE INDEX IF NOT EXISTS idx_labels_source ON labels(source_id);
 CREATE INDEX IF NOT EXISTS idx_message_labels_label ON message_labels(label_id);
@@ -357,3 +358,6 @@ CREATE INDEX IF NOT EXISTS idx_sync_runs_source ON sync_runs(source_id, started_
 
 CREATE INDEX IF NOT EXISTS idx_account_identities_address
     ON account_identities(address);
+
+CREATE INDEX IF NOT EXISTS idx_collection_sources_source_id
+    ON collection_sources(source_id);

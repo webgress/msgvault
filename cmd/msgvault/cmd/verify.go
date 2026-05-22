@@ -60,9 +60,11 @@ Examples:
 
 		// Run SQLite integrity check before any Gmail work. Users with a
 		// corrupt database should see the repair hint even if their OAuth
-		// token is expired or the network is down.
+		// token is expired or the network is down. PostgreSQL has no
+		// in-engine integrity_check; runIntegrityCheck returns (nil, nil)
+		// there and we surface that the check was skipped.
 		var dbCorrupt bool
-		if !verifySkipDBCheck {
+		if !verifySkipDBCheck && !s.IsPostgreSQL() {
 			fmt.Println("Running database integrity check...")
 			integrityErrors, err := runIntegrityCheck(s)
 			if err != nil {
@@ -277,7 +279,16 @@ Examples:
 
 // runIntegrityCheck runs PRAGMA integrity_check on the database and returns
 // any error strings. An empty slice means the database is healthy.
+//
+// PostgreSQL has no in-engine analogue; its corruption checks live in
+// external admin tooling (pg_amcheck, pg_dump --section=data) that
+// require server-side privileges this CLI does not assume. On PG we
+// return no errors so the rest of `verify` (Gmail message round-trip)
+// still runs — the user is expected to monitor PG health separately.
 func runIntegrityCheck(s *store.Store) ([]string, error) {
+	if s.IsPostgreSQL() {
+		return nil, nil
+	}
 	rows, err := s.DB().Query("PRAGMA integrity_check(100)")
 	if err != nil {
 		return nil, err
