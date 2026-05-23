@@ -13,6 +13,7 @@ package sqldialect
 import (
 	"fmt"
 	"strings"
+	"unicode"
 )
 
 // RebindPostgreSQL converts `?` placeholders in query to PostgreSQL
@@ -39,21 +40,37 @@ func RebindPostgreSQL(query string) string {
 	return b.String()
 }
 
-// EscapeTSQueryTerm removes PostgreSQL `to_tsquery` metacharacters and
-// whitespace from a single term, returning a token safe to suffix with
-// `:*` for prefix matching. Returns "" when the input collapses to
-// nothing usable.
-func EscapeTSQueryTerm(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		switch r {
-		case '&', '|', '!', '(', ')', ':', '*', '\\', '\'':
-			continue
+// EscapeTSQueryTerm tokenizes a single user-supplied search term into
+// PostgreSQL `to_tsquery`-safe lexemes. The input is split on every
+// rune that isn't a Unicode letter or digit, so inputs that previously
+// produced invalid tsquery fragments — `---` (parse error), `foo-bar`
+// (the `-` is the NOT operator), `user@example.com`, `a.b.c` — now
+// decompose into their component lexemes that to_tsquery accepts.
+//
+// Returns an empty slice when the input collapses to nothing usable
+// (whitespace-only, all punctuation, or all metacharacters). Each
+// returned lexeme is safe to suffix with `:*` for prefix matching and
+// join with ` & `.
+//
+// This logic intentionally mirrors the broader punctuation-splitting
+// behavior of query.PostgreSQLQueryDialect.SanitizeFTSQuery so the two
+// PG FTS code paths produce the same lexeme set for the same input.
+func EscapeTSQueryTerm(s string) []string {
+	var lexemes []string
+	var cur strings.Builder
+	flush := func() {
+		if cur.Len() > 0 {
+			lexemes = append(lexemes, cur.String())
+			cur.Reset()
 		}
-		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
-			continue
-		}
-		b.WriteRune(r)
 	}
-	return b.String()
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			cur.WriteRune(r)
+		} else {
+			flush()
+		}
+	}
+	flush()
+	return lexemes
 }

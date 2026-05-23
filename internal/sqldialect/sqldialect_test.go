@@ -1,6 +1,9 @@
 package sqldialect
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 func TestRebindPostgreSQL(t *testing.T) {
 	tests := []struct {
@@ -26,18 +29,34 @@ func TestRebindPostgreSQL(t *testing.T) {
 
 func TestEscapeTSQueryTerm(t *testing.T) {
 	tests := []struct {
-		name, in, want string
+		name string
+		in   string
+		want []string
 	}{
-		{"plain", "invoice", "invoice"},
-		{"unicode_kept", "café", "café"},
-		{"strip_meta", "in&voice|!", "invoice"},
-		{"strip_whitespace", "hello world", "helloworld"},
-		{"all_meta_empty", "&|!():*\\'", ""},
-		{"colon_stripped", "user:foo", "userfoo"},
+		{"plain", "invoice", []string{"invoice"}},
+		{"unicode_kept", "café", []string{"café"}},
+		{"strip_meta_inline", "in&voice|!", []string{"in", "voice"}},
+		{"whitespace_splits", "hello world", []string{"hello", "world"}},
+		{"all_meta_empty", "&|!():*\\'", nil},
+		{"colon_splits", "user:foo", []string{"user", "foo"}},
+
+		// R3 regression cases: previously these leaked punctuation
+		// into the tsquery argument and caused to_tsquery to error.
+		{"dashes_only", "---", nil},
+		{"hyphenated_word", "foo-bar", []string{"foo", "bar"}},
+		{"email_address", "user@example.com",
+			[]string{"user", "example", "com"}},
+		{"dotted_acronym", "a.b.c", []string{"a", "b", "c"}},
+		{"mixed_punct", "v1.2.3-rc.1",
+			[]string{"v1", "2", "3", "rc", "1"}},
+		{"trailing_punct", "invoice---", []string{"invoice"}},
+		{"leading_punct", "---invoice", []string{"invoice"}},
+		{"digit_only", "12345", []string{"12345"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := EscapeTSQueryTerm(tc.in); got != tc.want {
+			got := EscapeTSQueryTerm(tc.in)
+			if !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("EscapeTSQueryTerm(%q) = %q, want %q", tc.in, got, tc.want)
 			}
 		})

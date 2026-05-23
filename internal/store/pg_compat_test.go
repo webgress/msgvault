@@ -119,6 +119,66 @@ func TestSearchMessagesQuery_ToFilterCaseInsensitive(t *testing.T) {
 	}
 }
 
+// TestSearchMessages_R3PunctuationTerms covers R3: the raw search path
+// must not feed `to_tsquery` invalid lexemes built from punctuation-
+// heavy input. Before the fix, a query like `---` or `foo-bar` would
+// emit `---:*` / `foo-bar:*` and PG would error at parse time
+// ("syntax error in tsquery"). The fix tokenizes user terms into
+// letter/digit-only lexemes so punctuation-only inputs collapse to
+// FALSE and hyphenated/email/dotted inputs decompose into individual
+// lexemes that to_tsquery accepts.
+//
+// On both backends the test asserts the query returns *no error* —
+// that's the load-bearing R3 guarantee. Lexeme-level matching is
+// unit-tested via TestPostgreSQLDialect_BuildFTSArg; we don't assert
+// hit counts here because SQLite's FTS5 path strips punctuation
+// without splitting (e.g. `foo-bar` becomes `foobar`, which won't
+// match a body containing the two separate words), so cross-backend
+// match-count assertions would diverge.
+func TestSearchMessages_R3PunctuationTerms(t *testing.T) {
+	f := storetest.New(t)
+
+	msg1 := f.NewMessage().
+		WithSourceMessageID("r3-msg-1").
+		WithSubject("project foo bar").
+		WithSnippet("foo bar baz").
+		Create(t, f.Store)
+	testutil.MustNoErr(t, f.Store.UpsertMessageBody(msg1,
+		sql.NullString{String: "foo and bar appear together here", Valid: true},
+		sql.NullString{}), "UpsertMessageBody 1")
+
+	msg2 := f.NewMessage().
+		WithSourceMessageID("r3-msg-2").
+		WithSubject("email from alice").
+		WithSnippet("contact us at user@example.com please").
+		Create(t, f.Store)
+	testutil.MustNoErr(t, f.Store.UpsertMessageBody(msg2,
+		sql.NullString{String: "reach us at user@example.com for support", Valid: true},
+		sql.NullString{}), "UpsertMessageBody 2")
+
+	if _, err := f.Store.BackfillFTS(nil); err != nil {
+		t.Fatalf("BackfillFTS: %v", err)
+	}
+
+	queries := []string{
+		"---",              // dashes-only — used to crash to_tsquery
+		"...",              // dots-only
+		"foo-bar",          // hyphenated word
+		"user@example.com", // email-like
+		"a.b.c",            // dotted acronym
+		"foo ---",          // mixed clean + punct
+		"v1.2.3-rc.1",      // version-like punctuation
+	}
+	for _, q := range queries {
+		t.Run(q, func(t *testing.T) {
+			_, _, err := f.Store.SearchMessages(q, 0, 50)
+			if err != nil {
+				t.Errorf("SearchMessages(%q): unexpected error %v (must accept punctuation-heavy input without erroring)", q, err)
+			}
+		})
+	}
+}
+
 // TestEnsureParticipant_Concurrent covers H5: 50 goroutines all
 // calling EnsureParticipant with the same email must produce exactly
 // one row and no errors. The fix collapsed the SELECT-then-INSERT

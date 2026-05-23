@@ -37,22 +37,22 @@ func (d *PostgreSQLDialect) BoolTrueExpr(col string) string { return col }
 // mismatch on the sources.sync_config write path.
 func (d *PostgreSQLDialect) JSONBindExpr() string { return "?::JSONB" }
 
-// BuildFTSArg formats search terms for to_tsquery: each term is stripped
-// of tsquery metacharacters, suffixed with ":*" for prefix matching, and
-// joined with " & ". Matches the shape emitted by the query package's
-// PostgreSQLQueryDialect.BuildFTSTerm so the API search and engine
-// deep-search return the same hits. Terms that reduce to an empty
-// escape are dropped; if all drop, returns "" so the caller can
-// substitute a FALSE predicate rather than feed to_tsquery an empty
-// argument.
+// BuildFTSArg formats search terms for to_tsquery: each term is split
+// into letter/digit-only lexemes via sqldialect.EscapeTSQueryTerm so
+// punctuation like `-`, `.`, `@` (which would otherwise produce
+// invalid tsquery strings such as `---:*` or `foo-bar:*`) becomes a
+// lexeme boundary. Each surviving lexeme is suffixed with ":*" for
+// prefix matching and joined with " & ". Matches the shape emitted by
+// the query package's PostgreSQLQueryDialect.BuildFTSTerm so the API
+// search and engine deep-search return the same hits. If no lexemes
+// survive, returns "" so the caller can substitute a FALSE predicate
+// rather than feed to_tsquery an empty argument.
 func (d *PostgreSQLDialect) BuildFTSArg(terms []string) string {
 	out := make([]string, 0, len(terms))
 	for _, t := range terms {
-		clean := sqldialect.EscapeTSQueryTerm(t)
-		if clean == "" {
-			continue
+		for _, lex := range sqldialect.EscapeTSQueryTerm(t) {
+			out = append(out, lex+":*")
 		}
-		out = append(out, clean+":*")
 	}
 	return strings.Join(out, " & ")
 }

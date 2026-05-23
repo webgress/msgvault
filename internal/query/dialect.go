@@ -169,17 +169,17 @@ func (PostgreSQLQueryDialect) HasFTSTableSQL() string {
 // FTSJoin: PostgreSQL's tsvector column lives on messages — no join needed.
 func (PostgreSQLQueryDialect) FTSJoin() string { return "" }
 
-// BuildFTSTerm for PostgreSQL to_tsquery: sanitize each term via
-// sqldialect.EscapeTSQueryTerm (shared with store.PostgreSQLDialect),
-// append :* for prefix match, AND with " & ".
+// BuildFTSTerm for PostgreSQL to_tsquery: tokenize each user term into
+// letter/digit-only lexemes via sqldialect.EscapeTSQueryTerm (shared
+// with store.PostgreSQLDialect) so punctuation like `-`, `.`, `@`
+// becomes a lexeme boundary rather than ending up in an invalid
+// tsquery, append :* for prefix match, AND lexemes with " & ".
 func (PostgreSQLQueryDialect) BuildFTSTerm(terms []string) (expr string, arg string) {
 	tsTerms := make([]string, 0, len(terms))
 	for _, term := range terms {
-		clean := sqldialect.EscapeTSQueryTerm(term)
-		if clean == "" {
-			continue
+		for _, lex := range sqldialect.EscapeTSQueryTerm(term) {
+			tsTerms = append(tsTerms, lex+":*")
 		}
-		tsTerms = append(tsTerms, clean+":*")
 	}
 	if len(tsTerms) == 0 {
 		return "FALSE", ""
