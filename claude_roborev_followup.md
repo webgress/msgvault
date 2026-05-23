@@ -18,7 +18,7 @@ roborev runs because subsequent commits only touched docs/merge content.
   `[]byte`, or keep scanning computed timestamp expressions as strings and
   parse them explicitly.
 
-- [ ] **R2 — `internal/store/schema.sql:327`**
+- [x] **R2 — `internal/store/schema.sql:327`**
   Changing `idx_participants_phone` from non-unique to
   `CREATE UNIQUE INDEX IF NOT EXISTS` will not upgrade existing SQLite
   databases. `IF NOT EXISTS` leaves the old non-unique index in place, so
@@ -79,6 +79,7 @@ the real fix), but new docs must use the env-var form.
 019112f — R4 — scrubbed test DSN from claude_review_fixes.md:18 and claude_roborev_followup.md (placeholder + MSGVAULT_TEST_DB reference). claude_merge_resolution.md:33 still contains the DSN but is out of scope per coder constraints — **human must rotate `msgvault_test` password on CT 100 + sandbox local PG** and manually scrub line 33.
 f0c87e4 — R1 — added `nullableTimestamp` (sql.Scanner accepting nil/time.Time/string/[]byte) in `internal/store/api.go`; routed both `scanMessageRows` (line 624) and `GetMessage` (line 120, also covers `deleted_from_source_at`) through it; tests SQLite `TestNullableTimestampScan|TestParseSQLiteTime|TestGetMessageCcBcc|TestListMessagesCcBcc` and the same set under `MSGVAULT_TEST_DB=<env>` PG run both PASS locally.
 deferred — R4 reviewer-FAIL — reviewer flagged `claude_merge_resolution.md:33` as still-present DSN. That file is explicitly out of scope for the coder per this session's task constraints ("Don't edit … claude_merge_resolution.md"); a Claude-Code session boundary, not a workflow disagreement. Defer to the human to either (a) scrub line 33 themselves alongside the password rotation, or (b) relax the coder constraint and signal a re-run. Not re-toggling `[x]`; leaving `[ ]` to reflect reviewer state until the human resolves.
+830f624 — R2 — added `Store.ensureParticipantsPhoneUniqueIndex` (one-shot migration tracked in `applied_migrations`): dedupes participants sharing `phone_number` by re-pointing FKs (message_recipients, conversation_participants, reactions, messages.sender_id, participant_identifiers) from losers → lowest-id winner, deleting conflicting loser rows first to respect the UNIQUE constraints on each FK table; then `DROP INDEX IF EXISTS idx_participants_phone` + recreate as a UNIQUE partial index (portable SQL on SQLite + PG). Removed the `CREATE UNIQUE INDEX` line from `schema.sql` / `schema_pg.sql` and pointed readers at the Go migration (mirrors the existing `dedupeAttachmentsBeforeUniqueIndex` pattern). Hooked into `InitSchema` after the attachments dedupe. Tests SQLite `TestEnsureParticipantsPhoneUniqueIndex_LegacyNonUnique` (simulates legacy non-unique state + dup phones + 3 messages exercising plain repoint / conflict-then-repoint / sender_id update) PASS, full `Phone|Participant` test grep PASS on SQLite and PG, and `TestEnsureParticipantByPhone_Concurrent` PASS on PG.
 
 ## Reviewer log
 
