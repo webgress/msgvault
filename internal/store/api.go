@@ -113,7 +113,11 @@ func (s *Store) GetMessage(id int64) (*APIMessage, error) {
 	`
 
 	var m APIMessage
-	var sentAt, deletedAt sql.NullTime
+	// sentAt is a COALESCE expression; use nullableTimestamp so
+	// SQLite TEXT results parse correctly. deletedAt is a real
+	// TIMESTAMP column but routing it through the same scanner
+	// keeps the API consistent and tolerant of either driver.
+	var sentAt, deletedAt nullableTimestamp
 	err := s.db.QueryRow(query, id).Scan(&m.ID, &m.ConversationID, &m.Subject, &m.From, &sentAt, &m.Snippet, &m.HasAttachments, &m.SizeEstimate, &deletedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -566,17 +570,57 @@ func (s *Store) searchMessagesLike(query string, offset, limit int) ([]APIMessag
 	return messages, total, nil
 }
 
-// scanMessageRows scans the standard 8-column message row set. Timestamps
-// are scanned into sql.NullTime so the pgx/v5 stdlib driver (which
-// decodes TIMESTAMP/TIMESTAMPTZ as time.Time and refuses to convert to
-// *string) and go-sqlite3 (which accepts time.Time destinations and
-// parses its own stored formats) share a single typed path.
+// nullableTimestamp is a sql.Scanner that accepts time.Time (pgx/v5
+// stdlib for TIMESTAMP/TIMESTAMPTZ), string, []byte (SQLite for
+// computed COALESCE expressions whose declared datetime affinity is
+// lost), and nil. The sql.NullTime path that previously covered both
+// drivers is not sufficient for SQLite: when SELECT COALESCE(...) is
+// used over datetime columns, go-sqlite3 may surface the value as
+// TEXT because the COALESCE result has no column type info, and
+// NullTime's Scan rejects strings.
+type nullableTimestamp struct {
+	Time  time.Time
+	Valid bool
+}
+
+// Scan implements sql.Scanner. Strings and []byte are parsed via
+// parseSQLiteTime which already enumerates every layout SQLite emits;
+// unparseable values are treated as "not valid" rather than a hard
+// error so a single malformed row does not abort an entire listing.
+func (n *nullableTimestamp) Scan(src any) error {
+	if src == nil {
+		n.Time, n.Valid = time.Time{}, false
+		return nil
+	}
+	switch v := src.(type) {
+	case time.Time:
+		n.Time, n.Valid = v, !v.IsZero()
+		return nil
+	case string:
+		t := parseSQLiteTime(v)
+		n.Time, n.Valid = t, !t.IsZero()
+		return nil
+	case []byte:
+		t := parseSQLiteTime(string(v))
+		n.Time, n.Valid = t, !t.IsZero()
+		return nil
+	default:
+		return fmt.Errorf("nullableTimestamp: unsupported scan type %T", src)
+	}
+}
+
+// scanMessageRows scans the standard 8-column message row set.
+// Timestamps go through nullableTimestamp because the sent_at column
+// is a COALESCE(m.sent_at, m.received_at, m.internal_date) computed
+// expression with no declared datetime type, which on SQLite can come
+// back as TEXT and trip sql.NullTime.Scan. pgx/v5 still delivers
+// time.Time, which nullableTimestamp also handles.
 func scanMessageRows(rows *loggedRows) ([]APIMessage, []int64, error) {
 	var messages []APIMessage
 	var ids []int64
 	for rows.Next() {
 		var m APIMessage
-		var sentAt sql.NullTime
+		var sentAt nullableTimestamp
 		err := rows.Scan(&m.ID, &m.ConversationID, &m.Subject, &m.From, &sentAt, &m.Snippet, &m.HasAttachments, &m.SizeEstimate)
 		if err != nil {
 			return nil, nil, err
