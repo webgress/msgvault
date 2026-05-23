@@ -30,7 +30,10 @@ PG-dialect code lives in files the rename also touched.
      - `.github/workflows/ci.yml`: keep our new `test-postgres` job AND the action bump.
    - After resolving: `go build ./...`, `go fmt ./...`, `go vet ./...`,
      `go test -tags fts5 -count=1 ./...` on SQLite, then with
-     `MSGVAULT_TEST_DB=postgres://msgvault_test:msgvault_test@127.0.0.1:5432/msgvault_test?sslmode=disable`
+     `MSGVAULT_TEST_DB` set (placeholder form
+     `postgres://USER:PASS@HOST:5432/DBNAME?sslmode=disable`; **never
+     paste the real DSN into committed files** — keep it in your
+     shell/`.envrc` only)
      on PG.
    - Commit the merge with a message naming the upstream HEAD and a one-line
      conflict summary.
