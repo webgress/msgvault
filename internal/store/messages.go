@@ -154,32 +154,24 @@ func (s *Store) MessageExistsWithRawBatch(sourceID int64, sourceMessageIDs []str
 }
 
 // EnsureConversation gets or creates a conversation (thread) for a message.
+// Concurrent first-inserts converge via INSERT ... ON CONFLICT DO UPDATE
+// RETURNING id: the no-op SET fires the RETURNING clause for both the
+// insert and the conflict path, so the second caller still receives the
+// existing row's id instead of a unique-violation error.
 func (s *Store) EnsureConversation(sourceID int64, sourceConversationID, title string) (int64, error) {
-	// Try to get existing
+	now := s.dialect.Now()
 	var id int64
-	err := s.db.QueryRow(`
-		SELECT id FROM conversations
-		WHERE source_id = ? AND source_conversation_id = ?
-	`, sourceID, sourceConversationID).Scan(&id)
-
-	if err == nil {
-		return id, nil
-	}
-	if err != sql.ErrNoRows {
-		return 0, err
-	}
-
-	// Create new — use RETURNING for portability (pgx has no LastInsertId).
-	var newID int64
-	err = s.db.QueryRow(fmt.Sprintf(`
+	err := s.db.QueryRow(fmt.Sprintf(`
 		INSERT INTO conversations (source_id, source_conversation_id, conversation_type, title, created_at, updated_at)
 		VALUES (?, ?, 'email_thread', ?, %s, %s)
+		ON CONFLICT (source_id, source_conversation_id) DO UPDATE
+		SET source_conversation_id = conversations.source_conversation_id
 		RETURNING id
-	`, s.dialect.Now(), s.dialect.Now()), sourceID, sourceConversationID, title).Scan(&newID)
+	`, now, now), sourceID, sourceConversationID, title).Scan(&id)
 	if err != nil {
 		return 0, err
 	}
-	return newID, nil
+	return id, nil
 }
 
 // upsertMessageSQL returns the message upsert SQL with dialect-specific timestamp.
@@ -1120,50 +1112,33 @@ func (s *Store) RecomputeConversationStats(sourceID int64) error {
 	return nil
 }
 
-// EnsureConversationWithType gets or creates a conversation with an explicit conversation_type.
-// Unlike EnsureConversation (which hardcodes 'email_thread'), this accepts the type as a parameter,
-// making it suitable for WhatsApp and other messaging platforms.
+// EnsureConversationWithType gets or creates a conversation with an
+// explicit conversation_type. Unlike EnsureConversation (which hardcodes
+// 'email_thread'), this accepts the type as a parameter, making it
+// suitable for WhatsApp and other messaging platforms.
+//
+// Concurrent first-inserts converge via INSERT ... ON CONFLICT DO UPDATE
+// RETURNING id. On conflict, conversation_type is overwritten with the
+// caller's value and title is overwritten only when the caller supplies
+// a non-empty title — preserves the prior behavior of not blanking out
+// stored titles when re-syncs pass an empty value.
 func (s *Store) EnsureConversationWithType(sourceID int64, sourceConversationID, conversationType, title string) (int64, error) {
-	// Try to get existing
-	var id int64
-	err := s.db.QueryRow(`
-		SELECT id FROM conversations
-		WHERE source_id = ? AND source_conversation_id = ?
-	`, sourceID, sourceConversationID).Scan(&id)
-
-	if err == nil {
-		// Update conversation_type and title if they've changed.
-		// Only update title when the new value is non-empty (don't blank out existing titles).
-		now := s.dialect.Now()
-		if title != "" {
-			_, _ = s.db.Exec(fmt.Sprintf(`
-				UPDATE conversations SET conversation_type = ?, title = ?, updated_at = %s
-				WHERE id = ? AND (conversation_type != ? OR title != ? OR title IS NULL)
-			`, now), conversationType, title, id, conversationType, title)
-		} else {
-			_, _ = s.db.Exec(fmt.Sprintf(`
-				UPDATE conversations SET conversation_type = ?, updated_at = %s
-				WHERE id = ? AND conversation_type != ?
-			`, now), conversationType, id, conversationType)
-		}
-		return id, nil
-	}
-	if err != sql.ErrNoRows {
-		return 0, err
-	}
-
-	// Create new — use RETURNING for portability (pgx has no LastInsertId).
 	now := s.dialect.Now()
-	var newID int64
-	err = s.db.QueryRow(fmt.Sprintf(`
+	var id int64
+	err := s.db.QueryRow(fmt.Sprintf(`
 		INSERT INTO conversations (source_id, source_conversation_id, conversation_type, title, created_at, updated_at)
 		VALUES (?, ?, ?, ?, %s, %s)
+		ON CONFLICT (source_id, source_conversation_id) DO UPDATE
+		SET conversation_type = EXCLUDED.conversation_type,
+		    title = CASE WHEN EXCLUDED.title IS NOT NULL AND EXCLUDED.title != ''
+		                 THEN EXCLUDED.title ELSE conversations.title END,
+		    updated_at = %s
 		RETURNING id
-	`, now, now), sourceID, sourceConversationID, conversationType, title).Scan(&newID)
+	`, now, now, now), sourceID, sourceConversationID, conversationType, title).Scan(&id)
 	if err != nil {
 		return 0, err
 	}
-	return newID, nil
+	return id, nil
 }
 
 // EnsureParticipantByPhone gets or creates a participant by phone number.
