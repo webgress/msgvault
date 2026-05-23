@@ -26,7 +26,7 @@ Blocking:
 - [x] H1 — UpsertAttachment is not an upsert; concurrent duplicates
 - [x] H2 — AddAccountIdentity loses concurrent signal updates on PG
 - [x] H3 — query.Engine PG search is case-sensitive (subject + metadata LIKE)
-- [ ] H4 — PG absent from CI; status docs disagree with Makefile
+- [x] H4 — PG absent from CI; status docs disagree with Makefile
 
 Significant:
 - [ ] M1 — EnsureConversation / GetOrCreateSource / StartSync read-then-insert races
@@ -41,6 +41,7 @@ Significant:
 - f534155 — H1 — partial unique index on attachments(message_id, content_hash); rewrite UpsertAttachment as INSERT ... ON CONFLICT; pre-schema dedupe
 - d074f62 — H2 — serialize AddAccountIdentity via SQLite BEGIN IMMEDIATE + PG SELECT FOR UPDATE; add Dialect.BeginWriteSQL / SelectForUpdate; retry on conflict/busy
 - 5bb1d56 — H3 — wrap subject+metadata LIKE in LOWER()/LOWER() in query.Engine; escape user input; add TestQueryEngine_CaseInsensitiveSearch_Subject; move unique-attachments index out of schema.sql into InitSchema after dedupe
+- 199efae — H4 — add CI `test-postgres` job (postgres:16 service, MSGVAULT_TEST_DB, -count=5 concurrency); drop Makefile scaffold-only warning; reconcile PG_STATUS
 
 ## Reviewer log
 
