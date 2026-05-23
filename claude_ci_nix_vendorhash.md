@@ -27,7 +27,7 @@ the `buildGoModule`-style derivation). It is **not** the unrelated
 
 ## Findings
 
-- [ ] **F1**: `nix/package.nix:16` — bump `vendorHash` from
+- [x] **F1**: `nix/package.nix:16` — bump `vendorHash` from
       `sha256-/C+svBQ4b9+l8nY8BZ5Lvd072XLKpRDIR2fvqVqLJUE=` to
       `sha256-o+MtdsSXomxymaPY/ZwsBN5PnddGpvKAvwK6ElSUHSQ=` (the value Nix
       computed locally from the current `go.sum`). Verify it matches what
@@ -51,6 +51,8 @@ the `buildGoModule`-style derivation). It is **not** the unrelated
 ## Coder log
 
 (coder appends one line per commit: `<hash> — F<n> — <one-line summary>`)
+
+- e85d8a6 — F1 — bumped nix/package.nix vendorHash to the CI-reported value (nix unavailable on sandbox; CI to confirm)
 
 ## Reviewer log
 
