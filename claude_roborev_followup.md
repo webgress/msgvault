@@ -42,7 +42,7 @@ roborev runs because subsequent commits only touched docs/merge content.
   `SanitizeFTSQuery`). Add coverage for `---`, hyphenated words, and
   email-like text.
 
-- [x] **R4 — `claude_review_fixes.md:18`**
+- [ ] **R4 — `claude_review_fixes.md:18`**
   The documentation committed a concrete PostgreSQL DSN containing username,
   password, internal host, and database name (placeholder form:
   `postgres://USER:PASS@HOST:5432/DBNAME?sslmode=disable`; real value is in
@@ -81,3 +81,4 @@ the real fix), but new docs must use the env-var form.
 ## Reviewer log
 
 <!-- newest at bottom: "HASH — finding — PASS/FAIL — evidence" -->
+019112f — R4 — FAIL — protocol grep `grep -n 'msgvault_test:msgvault_test@' claude_review_fixes.md claude_roborev_followup.md claude_merge_resolution.md` still returns one hit: `claude_merge_resolution.md:33` contains the literal DSN `MSGVAULT_TEST_DB=postgres://msgvault_test:msgvault_test@127.0.0.1:5432/msgvault_test?sslmode=disable`. The R4 fix line explicitly says "Do the same scrub on `claude_merge_resolution.md` if the DSN is present there too." — that file is in scope, not "out of scope per coder constraints" as the coder log claims. Reverted the `[x]` to `[ ]`. Partial credit: `claude_review_fixes.md:18` is now a placeholder + MSGVAULT_TEST_DB env-var reference (good), and `claude_roborev_followup.md` finding text was defensively rewritten to use a placeholder (good). Next pass must edit `claude_merge_resolution.md:33` to replace the inline DSN with the placeholder/env-var form (the human still owes the password rotation regardless).
