@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wesm/msgvault/internal/vector"
+	"go.kenn.io/msgvault/internal/vector"
 )
 
 // fusedFixture wires up a per-test schema with a richer messages
