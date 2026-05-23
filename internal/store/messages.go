@@ -357,32 +357,32 @@ type Participant struct {
 	Domain       sql.NullString
 }
 
-// EnsureParticipant gets or creates a participant by email.
+// EnsureParticipant gets or creates a participant by email. Atomic via
+// INSERT … ON CONFLICT … RETURNING id so two goroutines (or two
+// processes against PostgreSQL) cannot race between a SELECT-empty and
+// the follow-up INSERT and both succeed — one would otherwise lose to
+// the unique constraint on (email_address) with a 23505 error. Display
+// name and domain are left untouched on conflict to preserve any
+// hand-edited values.
 func (s *Store) EnsureParticipant(email, displayName, domain string) (int64, error) {
-	// Try to get existing
+	// ON CONFLICT must mirror the partial unique index on
+	// participants(email_address) WHERE email_address IS NOT NULL — both
+	// PG and SQLite require the WHERE clause on the conflict target to
+	// match the partial index exactly. DO UPDATE (no-op assignment on
+	// the same column) makes RETURNING fire for both INSERT and the
+	// existing-row case, giving us the id either way.
 	var id int64
-	err := s.db.QueryRow(`
-		SELECT id FROM participants WHERE email_address = ?
-	`, email).Scan(&id)
-
-	if err == nil {
-		return id, nil
-	}
-	if err != sql.ErrNoRows {
-		return 0, err
-	}
-
-	// Create new — use RETURNING for portability (pgx has no LastInsertId).
-	var newID int64
-	err = s.db.QueryRow(fmt.Sprintf(`
+	err := s.db.QueryRow(fmt.Sprintf(`
 		INSERT INTO participants (email_address, display_name, domain, created_at, updated_at)
 		VALUES (?, ?, ?, %s, %s)
+		ON CONFLICT (email_address) WHERE email_address IS NOT NULL
+			DO UPDATE SET email_address = EXCLUDED.email_address
 		RETURNING id
-	`, s.dialect.Now(), s.dialect.Now()), email, displayName, domain).Scan(&newID)
+	`, s.dialect.Now(), s.dialect.Now()), email, displayName, domain).Scan(&id)
 	if err != nil {
 		return 0, err
 	}
-	return newID, nil
+	return id, nil
 }
 
 // EnsureParticipantsBatch gets or creates participants in batch.
@@ -1179,33 +1179,30 @@ func (s *Store) EnsureParticipantByPhone(phone, displayName, identifierType stri
 		return 0, fmt.Errorf("phone number must be in E.164 format (starting with +), got %q", phone)
 	}
 
-	// Try to get existing by phone
+	// Atomic upsert via ON CONFLICT — see EnsureParticipant for the
+	// SELECT-then-INSERT race this collapses. The conflict target
+	// mirrors the partial unique index on participants(phone_number)
+	// WHERE phone_number IS NOT NULL exactly, which is required by
+	// both PG and SQLite for partial-index ON CONFLICT to bind. The
+	// DO UPDATE backfills display_name when the existing row has none,
+	// preserving the prior best-effort behaviour without a second
+	// round-trip.
+	now := s.dialect.Now()
 	var id int64
-	err := s.db.QueryRow(`
-		SELECT id FROM participants WHERE phone_number = ?
-	`, phone).Scan(&id)
-
-	if err == nil {
-		// Update display name if provided and currently empty
-		if displayName != "" {
-			_, _ = s.db.Exec(`
-				UPDATE participants SET display_name = ?
-				WHERE id = ? AND (display_name IS NULL OR display_name = '')
-			`, displayName, id) // best-effort display name update, ignore error
-		}
-	} else if err != sql.ErrNoRows {
-		return 0, err
-	} else {
-		// Create new participant — use RETURNING for portability.
-		now := s.dialect.Now()
-		err = s.db.QueryRow(fmt.Sprintf(`
-			INSERT INTO participants (phone_number, display_name, created_at, updated_at)
-			VALUES (?, ?, %s, %s)
-			RETURNING id
-		`, now, now), phone, displayName).Scan(&id)
-		if err != nil {
-			return 0, fmt.Errorf("insert participant: %w", err)
-		}
+	err := s.db.QueryRow(fmt.Sprintf(`
+		INSERT INTO participants (phone_number, display_name, created_at, updated_at)
+		VALUES (?, ?, %s, %s)
+		ON CONFLICT (phone_number) WHERE phone_number IS NOT NULL
+			DO UPDATE SET display_name = CASE
+				WHEN COALESCE(NULLIF(TRIM(participants.display_name), ''), '') = ''
+				     AND EXCLUDED.display_name != ''
+				THEN EXCLUDED.display_name
+				ELSE participants.display_name
+			END
+		RETURNING id
+	`, now, now), phone, displayName).Scan(&id)
+	if err != nil {
+		return 0, fmt.Errorf("upsert participant by phone: %w", err)
 	}
 
 	// Ensure a participant_identifiers row exists for this identifierType.
@@ -1652,25 +1649,43 @@ func (s *Store) IsAttachmentPathReferenced(storagePath string) (bool, error) {
 }
 
 // UpsertAttachment stores an attachment record.
+//
+// `size` is widened to int64 at the bind boundary so 32-bit builds
+// (armv7 etc.) cannot truncate large attachments before the column
+// (which is BIGINT on PG, INTEGER on SQLite — both 8-byte).
+//
+// There is no unique constraint on (message_id, content_hash), so the
+// SELECT-then-INSERT can race with a concurrent caller. The catch is
+// that the existing row will already match on (message_id,
+// content_hash), so on a duplicate-row insert we simply retry the
+// SELECT: it will now find the row and we exit idempotently. The
+// retry loop limits blast radius if the conflict detection
+// misclassifies a different error.
 func (s *Store) UpsertAttachment(messageID int64, filename, mimeType, storagePath, contentHash string, size int) error {
-	// Check if attachment already exists (by message_id and content_hash)
-	var existingID int64
-	err := s.db.QueryRow(`
-		SELECT id FROM attachments WHERE message_id = ? AND content_hash = ?
-	`, messageID, contentHash).Scan(&existingID)
+	const maxAttempts = 3
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		var existingID int64
+		err := s.db.QueryRow(`
+			SELECT id FROM attachments WHERE message_id = ? AND content_hash = ?
+		`, messageID, contentHash).Scan(&existingID)
+		if err == nil {
+			return nil
+		}
+		if err != sql.ErrNoRows {
+			return err
+		}
 
-	if err == nil {
-		// Already exists, nothing to do
-		return nil
+		_, err = s.db.Exec(fmt.Sprintf(`
+			INSERT INTO attachments (message_id, filename, mime_type, storage_path, content_hash, size, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, %s)
+		`, s.dialect.Now()), messageID, filename, mimeType, storagePath, contentHash, int64(size))
+		if err == nil {
+			return nil
+		}
+		if !s.dialect.IsConflictError(err) {
+			return err
+		}
+		// Concurrent insert won — retry to find their row.
 	}
-	if err != sql.ErrNoRows {
-		return err
-	}
-
-	// Insert new attachment
-	_, err = s.db.Exec(fmt.Sprintf(`
-		INSERT INTO attachments (message_id, filename, mime_type, storage_path, content_hash, size, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, %s)
-	`, s.dialect.Now()), messageID, filename, mimeType, storagePath, contentHash, size)
-	return err
+	return fmt.Errorf("upsert attachment: gave up after %d conflict retries", maxAttempts)
 }

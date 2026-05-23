@@ -421,12 +421,14 @@ func (s *Store) UpdateSourceDisplayName(sourceID int64, displayName string) erro
 }
 
 // UpdateSourceSyncConfig updates the JSON sync configuration for an IMAP source.
+// The sync_config column is JSONB on PG; the dialect supplies the
+// appropriate placeholder cast (?::JSONB on PG, bare ? on SQLite).
 func (s *Store) UpdateSourceSyncConfig(sourceID int64, configJSON string) error {
 	_, err := s.db.Exec(fmt.Sprintf(`
 		UPDATE sources
-		SET sync_config = ?, updated_at = %s
+		SET sync_config = %s, updated_at = %s
 		WHERE id = ?
-	`, s.dialect.Now()), configJSON, sourceID)
+	`, s.dialect.JSONBindExpr(), s.dialect.Now()), configJSON, sourceID)
 	return err
 }
 

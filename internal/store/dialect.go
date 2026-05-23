@@ -189,6 +189,14 @@ type Dialect interface {
 	// to_tsquery and the FTS5 MATCH parser).
 	BuildFTSArg(terms []string) string
 
+	// JSONBindExpr returns the SQL fragment to use in place of a bare ?
+	// when binding a Go string (or []byte) to a JSON column. SQLite has
+	// no JSON type and stores JSON as plain TEXT, so the placeholder
+	// stays bare. PostgreSQL's JSONB column does not implicitly cast
+	// from text; without ?::JSONB the bind raises
+	// "column is of type jsonb but expression is of type text".
+	JSONBindExpr() string
+
 	// BeginExclusive opens a transaction on conn that blocks concurrent
 	// writers to the tables sync code touches (sync_runs in particular,
 	// so StartSync's INSERT cannot run until COMMIT/ROLLBACK). Readers

@@ -45,6 +45,11 @@ func (d *PostgreSQLDialect) Now() string { return "NOW()" }
 // type and rejects integer comparisons (`col = 1`) against boolean columns.
 func (d *PostgreSQLDialect) BoolTrueExpr(col string) string { return col }
 
+// JSONBindExpr returns "?::JSONB" — PG won't implicit-cast text to JSONB,
+// so a bare placeholder bound to a Go string raises a column-type
+// mismatch on the sources.sync_config write path.
+func (d *PostgreSQLDialect) JSONBindExpr() string { return "?::JSONB" }
+
 // BuildFTSArg formats search terms for to_tsquery: each term is stripped
 // of tsquery metacharacters, suffixed with ":*" for prefix matching, and
 // joined with " & ". Matches the shape emitted by the query package's

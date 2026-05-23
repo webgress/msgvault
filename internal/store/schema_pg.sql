@@ -319,7 +319,7 @@ CREATE INDEX IF NOT EXISTS idx_sources_type ON sources(source_type);
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_participants_email ON participants(email_address)
     WHERE email_address IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_participants_phone ON participants(phone_number)
+CREATE UNIQUE INDEX IF NOT EXISTS idx_participants_phone ON participants(phone_number)
     WHERE phone_number IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_participants_canonical ON participants(canonical_id)
     WHERE canonical_id IS NOT NULL;

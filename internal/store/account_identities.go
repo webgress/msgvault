@@ -49,9 +49,12 @@ func looksLikeEmail(addr string) bool {
 // column accommodates email, phone E.164, and synthetic identifiers like
 // chat handles where case can be significant).
 //
-// Read-modify-write inside a transaction. The single-writer SQLite model
-// serializes commits within one process; cross-process concurrency is not
-// a supported deployment.
+// Concurrency: the read-modify-write happens inside a transaction, and
+// on a unique-constraint violation from a concurrent insert (PG MVCC
+// lets two goroutines both observe ErrNoRows and both attempt INSERT)
+// the transaction retries the read+merge path. The constraint catches
+// the race instead of letting one caller get a 23505 surfaced as a
+// generic error.
 func (s *Store) AddAccountIdentity(sourceID int64, address, signal string) error {
 	addr := strings.TrimSpace(address)
 	if addr == "" {
@@ -66,42 +69,53 @@ func (s *Store) AddAccountIdentity(sourceID int64, address, signal string) error
 	// lives in identifierMatch — see identifier_match.go.
 	match := newIdentifierMatch(addr)
 
-	return s.withTx(func(tx *loggedTx) error {
-		var existing string
-		err := tx.QueryRow(
-			`SELECT source_signal FROM account_identities
-			 WHERE source_id = ? AND `+match.WhereClause("address"),
-			sourceID, match.BindValue(),
-		).Scan(&existing)
-		switch {
-		case err == sql.ErrNoRows:
-			_, txErr := tx.Exec(
-				`INSERT INTO account_identities (source_id, address, source_signal)
-				 VALUES (?, ?, ?)`,
-				sourceID, addr, signal,
+	const maxAttempts = 3
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		err := s.withTx(func(tx *loggedTx) error {
+			var existing string
+			err := tx.QueryRow(
+				`SELECT source_signal FROM account_identities
+				 WHERE source_id = ? AND `+match.WhereClause("address"),
+				sourceID, match.BindValue(),
+			).Scan(&existing)
+			switch {
+			case err == sql.ErrNoRows:
+				_, txErr := tx.Exec(
+					`INSERT INTO account_identities (source_id, address, source_signal)
+					 VALUES (?, ?, ?)`,
+					sourceID, addr, signal,
+				)
+				if txErr != nil {
+					return fmt.Errorf("insert account identity: %w", txErr)
+				}
+				return nil
+			case err != nil:
+				return fmt.Errorf("read existing source_signal: %w", err)
+			}
+
+			merged := mergeSignalSet(existing, signal)
+			if merged == existing {
+				return nil
+			}
+			_, updateErr := tx.Exec(
+				`UPDATE account_identities SET source_signal = ?
+				 WHERE source_id = ? AND `+match.WhereClause("address"),
+				merged, sourceID, match.BindValue(),
 			)
-			if txErr != nil {
-				return fmt.Errorf("insert account identity: %w", txErr)
+			if updateErr != nil {
+				return fmt.Errorf("update source_signal: %w", updateErr)
 			}
 			return nil
-		case err != nil:
-			return fmt.Errorf("read existing source_signal: %w", err)
+		})
+		// If a concurrent goroutine raced us to the INSERT, the second
+		// caller's tx will hit the (source_id, address) primary-key
+		// conflict — retry, which will find the now-existing row and
+		// fall through to the merge branch.
+		if err == nil || !s.dialect.IsConflictError(err) {
+			return err
 		}
-
-		merged := mergeSignalSet(existing, signal)
-		if merged == existing {
-			return nil
-		}
-		_, updateErr := tx.Exec(
-			`UPDATE account_identities SET source_signal = ?
-			 WHERE source_id = ? AND `+match.WhereClause("address"),
-			merged, sourceID, match.BindValue(),
-		)
-		if updateErr != nil {
-			return fmt.Errorf("update source_signal: %w", updateErr)
-		}
-		return nil
-	})
+	}
+	return fmt.Errorf("add account identity: gave up after %d conflict retries", maxAttempts)
 }
 
 // mergeSignalSet returns the comma-joined sorted union of the existing

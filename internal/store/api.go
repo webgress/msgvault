@@ -374,11 +374,15 @@ func (s *Store) SearchMessagesQuery(
 			"%"+escapeLike(strings.ToLower(lbl))+"%")
 	}
 
-	// subject: filter
+	// subject: filter — LOWER on both sides for PG portability.
+	// SQLite's default LIKE is ASCII-case-insensitive; PG's is strict-
+	// case, so a bare `m.subject LIKE '%invoice%'` returned zero hits
+	// against "Invoice from acme" on PG. Every other LIKE in this
+	// function already wraps with LOWER.
 	for _, term := range q.SubjectTerms {
 		conditions = append(conditions,
-			`m.subject LIKE ? ESCAPE '\'`)
-		args = append(args, "%"+escapeLike(term)+"%")
+			`LOWER(m.subject) LIKE LOWER(?) ESCAPE '\'`)
+		args = append(args, "%"+escapeLike(strings.ToLower(term))+"%")
 	}
 
 	// has:attachment
@@ -504,14 +508,16 @@ func escapeLike(s string) string {
 	return s
 }
 
-// searchMessagesLike is a fallback search using LIKE with batch-loaded recipients and labels.
+// searchMessagesLike is a fallback search using LIKE with batch-loaded
+// recipients and labels. Wraps both sides in LOWER for PG portability —
+// SQLite's ASCII LIKE is case-insensitive by default but PG's is strict.
 func (s *Store) searchMessagesLike(query string, offset, limit int) ([]APIMessage, int64, error) {
-	likePattern := "%" + escapeLike(query) + "%"
+	likePattern := "%" + escapeLike(strings.ToLower(query)) + "%"
 
 	countQuery := fmt.Sprintf(`
 		SELECT COUNT(*) FROM messages
 		WHERE %s
-		AND (subject LIKE ? ESCAPE '\' OR snippet LIKE ? ESCAPE '\')
+		AND (LOWER(subject) LIKE ? ESCAPE '\' OR LOWER(snippet) LIKE ? ESCAPE '\')
 	`, LiveMessagesWhere("", true))
 	var total int64
 	if err := s.db.QueryRow(countQuery, likePattern, likePattern).Scan(&total); err != nil {
@@ -532,7 +538,7 @@ func (s *Store) searchMessagesLike(query string, offset, limit int) ([]APIMessag
 		LEFT JOIN message_recipients mr ON mr.message_id = m.id AND mr.recipient_type = 'from'
 		LEFT JOIN participants p ON p.id = mr.participant_id
 		WHERE %s
-		AND (m.subject LIKE ? ESCAPE '\' OR m.snippet LIKE ? ESCAPE '\')
+		AND (LOWER(m.subject) LIKE ? ESCAPE '\' OR LOWER(m.snippet) LIKE ? ESCAPE '\')
 		ORDER BY COALESCE(m.sent_at, m.received_at, m.internal_date) DESC
 		LIMIT ? OFFSET ?
 	`, LiveMessagesWhere("m", true))

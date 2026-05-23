@@ -216,13 +216,18 @@ func optsToFilterConditions(d Dialect, opts AggregateOptions, prefix string) ([]
 	conditions, args = appendSourceFilter(
 		conditions, args, prefix, opts.SourceID, opts.SourceIDs,
 	)
+	// Bind time.Time values directly. Formatting to a naive
+	// "2006-01-02 15:04:05" string and binding that to a PG TIMESTAMPTZ
+	// column parses the string in session TimeZone (not UTC); pgx
+	// encodes time.Time correctly on both backends, and go-sqlite3
+	// formats it to a sortable RFC3339-with-fractional layout.
 	if opts.After != nil {
 		conditions = append(conditions, prefix+"sent_at >= ?")
-		args = append(args, opts.After.Format("2006-01-02 15:04:05"))
+		args = append(args, *opts.After)
 	}
 	if opts.Before != nil {
 		conditions = append(conditions, prefix+"sent_at < ?")
-		args = append(args, opts.Before.Format("2006-01-02 15:04:05"))
+		args = append(args, *opts.Before)
 	}
 	if opts.WithAttachmentsOnly {
 		conditions = append(conditions, d.BoolTrueExpr(prefix+"has_attachments"))
@@ -292,12 +297,12 @@ func (e *SQLiteEngine) buildFilterJoinsAndConditions(filter MessageFilter, table
 
 	if filter.After != nil {
 		conditions = append(conditions, prefix+"sent_at >= ?")
-		args = append(args, filter.After.Format("2006-01-02 15:04:05"))
+		args = append(args, *filter.After)
 	}
 
 	if filter.Before != nil {
 		conditions = append(conditions, prefix+"sent_at < ?")
-		args = append(args, filter.Before.Format("2006-01-02 15:04:05"))
+		args = append(args, *filter.Before)
 	}
 
 	if filter.WithAttachmentsOnly {
@@ -1218,11 +1223,11 @@ func (e *SQLiteEngine) SearchByDomains(ctx context.Context, domains []string, af
 
 	if after != nil {
 		conditions = append(conditions, "m.sent_at >= ?")
-		args = append(args, after.Format("2006-01-02"))
+		args = append(args, *after)
 	}
 	if before != nil {
 		conditions = append(conditions, "m.sent_at < ?")
-		args = append(args, before.Format("2006-01-02"))
+		args = append(args, *before)
 	}
 
 	if limit <= 0 {
@@ -1269,12 +1274,15 @@ func (e *SQLiteEngine) buildSearchQueryParts(ctx context.Context, q *search.Quer
 		)`, strings.Join(fromParts, " OR ")))
 	}
 
-	// To filter - EXISTS to avoid join multiplication
+	// To filter - EXISTS to avoid join multiplication. The column side
+	// is wrapped in LOWER(); lowercase the bound args Go-side so the
+	// IN list also matches stored case-folded values (mirrors the
+	// From-filter convention above).
 	if len(q.ToAddrs) > 0 {
 		placeholders := make([]string, len(q.ToAddrs))
 		for i, addr := range q.ToAddrs {
 			placeholders[i] = "?"
-			args = append(args, addr)
+			args = append(args, strings.ToLower(addr))
 		}
 		conditions = append(conditions, fmt.Sprintf(`EXISTS (
 			SELECT 1 FROM message_recipients mr_to
@@ -1290,7 +1298,7 @@ func (e *SQLiteEngine) buildSearchQueryParts(ctx context.Context, q *search.Quer
 		placeholders := make([]string, len(q.CcAddrs))
 		for i, addr := range q.CcAddrs {
 			placeholders[i] = "?"
-			args = append(args, addr)
+			args = append(args, strings.ToLower(addr))
 		}
 		conditions = append(conditions, fmt.Sprintf(`EXISTS (
 			SELECT 1 FROM message_recipients mr_cc
@@ -1306,7 +1314,7 @@ func (e *SQLiteEngine) buildSearchQueryParts(ctx context.Context, q *search.Quer
 		placeholders := make([]string, len(q.BccAddrs))
 		for i, addr := range q.BccAddrs {
 			placeholders[i] = "?"
-			args = append(args, addr)
+			args = append(args, strings.ToLower(addr))
 		}
 		conditions = append(conditions, fmt.Sprintf(`EXISTS (
 			SELECT 1 FROM message_recipients mr_bcc
