@@ -32,7 +32,7 @@ Significant:
 - [x] M1 — EnsureConversation / GetOrCreateSource / StartSync read-then-insert races
 - [x] M2 — FTSNeedsBackfill cannot detect stale/null vectors; PG FTSRebuildSchema unimplemented
 - [x] M3 — Dialect boundary porous; store and query dialects duplicate logic
-- [ ] M4 — Comments assert invariants that aren't enforced; PG_STATUS drift
+- [x] M4 — Comments assert invariants that aren't enforced; PG_STATUS drift
 
 ## Coder log
 
@@ -45,6 +45,7 @@ Significant:
 - c41aeae — M1 — collapse EnsureConversation/EnsureConversationWithType/GetOrCreateSource to INSERT ... ON CONFLICT DO UPDATE RETURNING; serialize StartSync in writer-locked tx (BEGIN IMMEDIATE / SELECT FOR UPDATE on sources row) with busy retry
 - d534c39 — M2 — PG FTSNeedsBackfill now COUNT(NULL search_fts) so missing intermediate rows surface; FTSRebuildSchema implemented as DROP index / clear column / re-CREATE index
 - bc03783 — M3 — extract `?`-rebind and tsquery-escape into internal/sqldialect; both store and query PG dialects now delegate; shared package has its own tests
+- 784c564 — M4 — reconcile PG_STATUS.md (add Codex review fixes section; drop CI-coverage from "remaining"); inaccurate H1/H2/M2 comments were rewritten in those fix commits
 
 ## Reviewer log
 
