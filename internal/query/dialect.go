@@ -16,7 +16,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/wesm/msgvault/internal/sqldialect"
+	"go.kenn.io/msgvault/internal/sqldialect"
 )
 
 // Dialect abstracts SQL generation differences for SQLite vs PostgreSQL.

@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib" // Register pgx driver for database/sql
 
-	"github.com/wesm/msgvault/internal/sqldialect"
+	"go.kenn.io/msgvault/internal/sqldialect"
 )
 
 // PostgreSQLDialect implements Dialect for PostgreSQL.

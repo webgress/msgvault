@@ -7,7 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 
-	"github.com/wesm/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/store"
 )
 
 // setupVectorFeatures is the no-sqlite-vec fallback. It returns

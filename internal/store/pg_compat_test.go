@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wesm/msgvault/internal/search"
-	"github.com/wesm/msgvault/internal/store"
-	"github.com/wesm/msgvault/internal/testutil"
-	"github.com/wesm/msgvault/internal/testutil/storetest"
+	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
+	"go.kenn.io/msgvault/internal/testutil/storetest"
 )
 
 // TestInspectMessage_TimestampScan exercises the inspect.go fix that

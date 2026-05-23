@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wesm/msgvault/internal/query"
-	"github.com/wesm/msgvault/internal/search"
-	"github.com/wesm/msgvault/internal/store"
-	"github.com/wesm/msgvault/internal/testutil"
+	"go.kenn.io/msgvault/internal/query"
+	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 )
 
 // TestQueryEngine_PostgresPortability exercises the three SQL shapes

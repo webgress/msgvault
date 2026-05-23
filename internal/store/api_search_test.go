@@ -4,9 +4,9 @@ import (
 	"database/sql"
 	"testing"
 
-	"github.com/wesm/msgvault/internal/search"
-	"github.com/wesm/msgvault/internal/testutil"
-	"github.com/wesm/msgvault/internal/testutil/storetest"
+	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/testutil"
+	"go.kenn.io/msgvault/internal/testutil/storetest"
 )
 
 // TestSearchMessagesQuery_TokenlessTextTerms verifies that text terms which
