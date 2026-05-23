@@ -30,7 +30,7 @@ Blocking:
 
 Significant:
 - [x] M1 — EnsureConversation / GetOrCreateSource / StartSync read-then-insert races
-- [ ] M2 — FTSNeedsBackfill cannot detect stale/null vectors; PG FTSRebuildSchema unimplemented
+- [x] M2 — FTSNeedsBackfill cannot detect stale/null vectors; PG FTSRebuildSchema unimplemented
 - [ ] M3 — Dialect boundary porous; store and query dialects duplicate logic
 - [ ] M4 — Comments assert invariants that aren't enforced; PG_STATUS drift
 
@@ -43,6 +43,7 @@ Significant:
 - 5bb1d56 — H3 — wrap subject+metadata LIKE in LOWER()/LOWER() in query.Engine; escape user input; add TestQueryEngine_CaseInsensitiveSearch_Subject; move unique-attachments index out of schema.sql into InitSchema after dedupe
 - 199efae — H4 — add CI `test-postgres` job (postgres:16 service, MSGVAULT_TEST_DB, -count=5 concurrency); drop Makefile scaffold-only warning; reconcile PG_STATUS
 - c41aeae — M1 — collapse EnsureConversation/EnsureConversationWithType/GetOrCreateSource to INSERT ... ON CONFLICT DO UPDATE RETURNING; serialize StartSync in writer-locked tx (BEGIN IMMEDIATE / SELECT FOR UPDATE on sources row) with busy retry
+- d534c39 — M2 — PG FTSNeedsBackfill now COUNT(NULL search_fts) so missing intermediate rows surface; FTSRebuildSchema implemented as DROP index / clear column / re-CREATE index
 
 ## Reviewer log
 
