@@ -579,6 +579,18 @@ func (s *Store) InitSchema() error {
 		return fmt.Errorf("create idx_attachments_msg_content_hash: %w", err)
 	}
 
+	// Legacy databases may have idx_participants_phone as a non-unique
+	// partial index (it was created that way before the schema flipped
+	// to UNIQUE). `CREATE UNIQUE INDEX IF NOT EXISTS` in schema.sql
+	// silently leaves the non-unique index in place, so
+	// EnsureParticipantByPhone's ON CONFLICT (phone_number) finds no
+	// matching unique constraint on upgraded DBs. Run a one-shot
+	// migration that dedupes phone rows, drops the index, and
+	// recreates it as UNIQUE.
+	if err := s.ensureParticipantsPhoneUniqueIndex(); err != nil {
+		return fmt.Errorf("ensure idx_participants_phone unique: %w", err)
+	}
+
 	// Migrations: add columns for databases created before these features.
 	// The dialect determines the list (SQLite: full ALTER TABLE list;
 	// PostgreSQL: empty — schema_pg.sql is always complete).

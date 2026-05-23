@@ -324,8 +324,10 @@ CREATE INDEX IF NOT EXISTS idx_sources_type ON sources(source_type);
 -- Participants
 CREATE UNIQUE INDEX IF NOT EXISTS idx_participants_email ON participants(email_address)
     WHERE email_address IS NOT NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_participants_phone ON participants(phone_number)
-    WHERE phone_number IS NOT NULL;
+-- idx_participants_phone is created (and upgraded from the legacy
+-- non-unique form) in Go by Store.ensureParticipantsPhoneUniqueIndex
+-- so existing DBs whose IF NOT EXISTS no-op'd the schema bump still
+-- end up with a UNIQUE partial index.
 CREATE INDEX IF NOT EXISTS idx_participants_canonical ON participants(canonical_id)
     WHERE canonical_id IS NOT NULL;
 
