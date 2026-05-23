@@ -338,6 +338,14 @@ func (d *PostgreSQLDialect) BeginExclusive(ctx context.Context, conn *sql.Conn) 
 	return nil
 }
 
+// BeginWriteSQL returns "BEGIN"; PostgreSQL relies on SelectForUpdate
+// to row-lock the modified row inside the transaction.
+func (d *PostgreSQLDialect) BeginWriteSQL() string { return "BEGIN" }
+
+// SelectForUpdate returns " FOR UPDATE" so a SELECT inside a write
+// transaction takes a row-level lock that serializes subsequent merges.
+func (d *PostgreSQLDialect) SelectForUpdate() string { return " FOR UPDATE" }
+
 // isPgError checks if err is a pgconn.PgError with the given SQLSTATE code.
 func isPgError(err error, code string) bool {
 	var pgErr *pgconn.PgError

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"sort"
@@ -49,12 +50,13 @@ func looksLikeEmail(addr string) bool {
 // column accommodates email, phone E.164, and synthetic identifiers like
 // chat handles where case can be significant).
 //
-// Concurrency: the read-modify-write happens inside a transaction, and
-// on a unique-constraint violation from a concurrent insert (PG MVCC
-// lets two goroutines both observe ErrNoRows and both attempt INSERT)
-// the transaction retries the read+merge path. The constraint catches
-// the race instead of letting one caller get a 23505 surfaced as a
-// generic error.
+// Concurrency: the read-modify-write runs in a writer-locked transaction.
+// SQLite acquires the writer lock at BEGIN IMMEDIATE so concurrent
+// callers serialize. PostgreSQL takes a row-level lock with
+// SELECT ... FOR UPDATE so the merge sees the latest committed value.
+// On a still-empty row two callers may both fall through INSERT — the
+// unique-key violation is caught by the retry loop, which then sees the
+// other writer's row and merges into it.
 func (s *Store) AddAccountIdentity(sourceID int64, address, signal string) error {
 	addr := strings.TrimSpace(address)
 	if addr == "" {
@@ -63,59 +65,79 @@ func (s *Store) AddAccountIdentity(sourceID int64, address, signal string) error
 	if strings.Contains(signal, ",") {
 		return fmt.Errorf("signal names cannot contain commas: %q", signal)
 	}
-	// Email-shaped tokens match case-insensitively to keep the
-	// add/remove paths symmetric. Synthetic identifiers (phones,
-	// Matrix MXIDs, chat handles) stay case-sensitive. The branch
-	// lives in identifierMatch — see identifier_match.go.
 	match := newIdentifierMatch(addr)
+	ctx := context.Background()
 
-	const maxAttempts = 3
+	const maxAttempts = 5
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		err := s.withTx(func(tx *loggedTx) error {
-			var existing string
-			err := tx.QueryRow(
-				`SELECT source_signal FROM account_identities
-				 WHERE source_id = ? AND `+match.WhereClause("address"),
-				sourceID, match.BindValue(),
-			).Scan(&existing)
-			switch {
-			case err == sql.ErrNoRows:
-				_, txErr := tx.Exec(
-					`INSERT INTO account_identities (source_id, address, source_signal)
-					 VALUES (?, ?, ?)`,
-					sourceID, addr, signal,
-				)
-				if txErr != nil {
-					return fmt.Errorf("insert account identity: %w", txErr)
-				}
-				return nil
-			case err != nil:
-				return fmt.Errorf("read existing source_signal: %w", err)
-			}
-
-			merged := mergeSignalSet(existing, signal)
-			if merged == existing {
-				return nil
-			}
-			_, updateErr := tx.Exec(
-				`UPDATE account_identities SET source_signal = ?
-				 WHERE source_id = ? AND `+match.WhereClause("address"),
-				merged, sourceID, match.BindValue(),
-			)
-			if updateErr != nil {
-				return fmt.Errorf("update source_signal: %w", updateErr)
-			}
+		err := s.addAccountIdentityOnce(ctx, sourceID, addr, signal, match)
+		if err == nil {
 			return nil
-		})
-		// If a concurrent goroutine raced us to the INSERT, the second
-		// caller's tx will hit the (source_id, address) primary-key
-		// conflict — retry, which will find the now-existing row and
-		// fall through to the merge branch.
-		if err == nil || !s.dialect.IsConflictError(err) {
+		}
+		if !s.dialect.IsConflictError(err) && !s.dialect.IsBusyError(err) {
 			return err
 		}
 	}
-	return fmt.Errorf("add account identity: gave up after %d conflict retries", maxAttempts)
+	return fmt.Errorf("add account identity: gave up after %d retries", maxAttempts)
+}
+
+// addAccountIdentityOnce runs one merge attempt in a writer-locked
+// transaction. The caller's retry loop handles unique-violation
+// (concurrent INSERT race) and busy/snapshot errors (SQLite).
+func (s *Store) addAccountIdentityOnce(
+	ctx context.Context, sourceID int64, addr, signal string, match identifierMatch,
+) (retErr error) {
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire connection: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if _, err := conn.ExecContext(ctx, s.dialect.BeginWriteSQL()); err != nil {
+		return fmt.Errorf("begin write tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		}
+	}()
+
+	rebind := s.dialect.Rebind
+	whereAddr := match.WhereClause("address")
+	var existing string
+	selectSQL := `SELECT source_signal FROM account_identities
+		WHERE source_id = ? AND ` + whereAddr + s.dialect.SelectForUpdate()
+	err = conn.QueryRowContext(ctx, rebind(selectSQL), sourceID, match.BindValue()).Scan(&existing)
+	switch {
+	case err == sql.ErrNoRows:
+		if _, err := conn.ExecContext(ctx,
+			rebind(`INSERT INTO account_identities (source_id, address, source_signal)
+				VALUES (?, ?, ?)`),
+			sourceID, addr, signal,
+		); err != nil {
+			return fmt.Errorf("insert account identity: %w", err)
+		}
+	case err != nil:
+		return fmt.Errorf("read existing source_signal: %w", err)
+	default:
+		merged := mergeSignalSet(existing, signal)
+		if merged != existing {
+			if _, err := conn.ExecContext(ctx,
+				rebind(`UPDATE account_identities SET source_signal = ?
+					WHERE source_id = ? AND `+whereAddr),
+				merged, sourceID, match.BindValue(),
+			); err != nil {
+				return fmt.Errorf("update source_signal: %w", err)
+			}
+		}
+	}
+
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	committed = true
+	return nil
 }
 
 // mergeSignalSet returns the comma-joined sorted union of the existing

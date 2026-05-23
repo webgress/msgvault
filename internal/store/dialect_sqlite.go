@@ -283,6 +283,15 @@ func (d *SQLiteDialect) BeginExclusive(ctx context.Context, conn *sql.Conn) erro
 	return err
 }
 
+// BeginWriteSQL returns "BEGIN IMMEDIATE" so the transaction reserves
+// the SQLite writer lock at BEGIN, removing the snapshot-isolation race
+// that lets two deferred transactions both read the pre-update value.
+func (d *SQLiteDialect) BeginWriteSQL() string { return "BEGIN IMMEDIATE" }
+
+// SelectForUpdate returns "" — SQLite has no FOR UPDATE; serialization
+// comes from BEGIN IMMEDIATE.
+func (d *SQLiteDialect) SelectForUpdate() string { return "" }
+
 func (d *SQLiteDialect) IsBusyError(err error) bool {
 	if err == nil {
 		return false

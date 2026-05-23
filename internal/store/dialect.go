@@ -207,4 +207,18 @@ type Dialect interface {
 	// MODE, which conflicts with the ROW EXCLUSIVE lock INSERT acquires
 	// but does not block ACCESS SHARE (reads).
 	BeginExclusive(ctx context.Context, conn *sql.Conn) error
+
+	// BeginWriteSQL returns the SQL to begin a transaction that
+	// immediately acquires the write lock, so a read-modify-write under
+	// concurrency cannot lose updates to a snapshot race.
+	// SQLite: "BEGIN IMMEDIATE" (reserves the writer slot at BEGIN).
+	// PostgreSQL: "BEGIN" — pair with SelectForUpdate to row-lock the
+	// modified row inside the transaction.
+	BeginWriteSQL() string
+
+	// SelectForUpdate returns the row-lock clause to append to a SELECT
+	// inside BeginWriteSQL transactions. PostgreSQL needs " FOR UPDATE"
+	// to lock the matched row; SQLite already serializes writers under
+	// BEGIN IMMEDIATE and returns "".
+	SelectForUpdate() string
 }
