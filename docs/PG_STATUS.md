@@ -26,7 +26,7 @@ attachment storage on PG, and end-to-end coverage under
 - `PostgreSQLDialect.Rebind()` correctly converts `?` → `$1, $2, ...`
   (including quoted-string safety)
 - `PostgreSQLDialect.Now()`, `InsertOrIgnore()` (complete + prefix),
-  `InsertOrIgnoreSuffix()`, `FTSSearchClause()`, `UpdateOrIgnore()`
+  `InsertOrIgnoreSuffix()`, `FTSSearchClause()`
 - `PostgreSQLDialect.LegacyColumnMigrations()` returns the same logical list
   as SQLite, translated to PG types (`JSONB`, `TIMESTAMPTZ`, `BIGINT`) and
   using `ADD COLUMN IF NOT EXISTS` for idempotency. Existing PG databases
@@ -87,8 +87,10 @@ attachment storage on PG, and end-to-end coverage under
   staged-deletion → Gmail delete → archive update.
 - **Attachment storage paths** under PostgreSQL — content-hash dedup
   and orphan-cleanup paths haven't been exercised end-to-end yet.
-- **CI coverage** under `MSGVAULT_TEST_DB=postgres://...`: the harness
-  exists and tests are portable, but no upstream CI lane runs it yet.
+- **CI coverage** under `MSGVAULT_TEST_DB=postgres://...`: covered by
+  the `test-postgres` job in `.github/workflows/ci.yml` (portable
+  `fts5` suite + `-count=5` concurrency tests against a live PG 16
+  service).
 - **Vector / hybrid search**: SQLite-only by construction —
   `internal/vector/sqlitevec` uses the sqlite-vec extension and
   `ATTACH DATABASE` to fuse `vectors.db` onto the main store, and the
