@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/wesm/msgvault/internal/query"
+	"github.com/wesm/msgvault/internal/search"
 	"github.com/wesm/msgvault/internal/store"
 	"github.com/wesm/msgvault/internal/testutil"
 )
@@ -142,6 +143,48 @@ func TestQueryEngine_PostgresPortability(t *testing.T) {
 				t.Errorf("ListMessages %s: got %d rows, want 4", sort.name, len(msgs))
 			}
 		})
+	}
+}
+
+// TestQueryEngine_CaseInsensitiveSearch_Subject verifies that
+// `subject:` terms passed through query.Engine.Search match
+// case-insensitively on both SQLite and PostgreSQL. SQLite's LIKE is
+// ASCII-case-insensitive by default; PostgreSQL's LIKE is
+// case-sensitive, so an unwrapped `m.subject LIKE ?` would mis-miss
+// rows that the equivalent store API path (which lowercases) returns.
+// Bare-LIKE divergence was H3 in the codex review.
+func TestQueryEngine_CaseInsensitiveSearch_Subject(t *testing.T) {
+	st := testutil.NewTestStore(t)
+	src, err := st.GetOrCreateSource("gmail", "case-search@example.com")
+	testutil.MustNoErr(t, err, "GetOrCreateSource")
+	convID, err := st.EnsureConversation(src.ID, "case-thread", "case thread")
+	testutil.MustNoErr(t, err, "EnsureConversation")
+	mid, err := st.UpsertMessage(&store.Message{
+		ConversationID:  convID,
+		SourceID:        src.ID,
+		SourceMessageID: "case-msg-1",
+		MessageType:     "email",
+		SentAt:          sql.NullTime{Time: time.Date(2024, 7, 1, 12, 0, 0, 0, time.UTC), Valid: true},
+		Subject:         sql.NullString{String: "Quarterly Invoice", Valid: true},
+		Snippet:         sql.NullString{String: "see attached", Valid: true},
+		SizeEstimate:    1024,
+	})
+	testutil.MustNoErr(t, err, "UpsertMessage")
+	_ = mid
+
+	eng := query.NewEngine(st.DB(), st.IsPostgreSQL())
+	ctx := context.Background()
+
+	for _, term := range []string{"invoice", "INVOICE", "Invoice"} {
+		got, err := eng.Search(ctx,
+			&search.Query{SubjectTerms: []string{term}}, 50, 0)
+		if err != nil {
+			t.Fatalf("Search subject=%q: %v", term, err)
+		}
+		if len(got) != 1 {
+			t.Errorf("subject:%q matched %d rows, want 1 (stored subject %q)",
+				term, len(got), "Quarterly Invoice")
+		}
 	}
 }
 

@@ -350,10 +350,8 @@ CREATE INDEX IF NOT EXISTS idx_reactions_message ON reactions(message_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_hash ON attachments(content_hash);
 CREATE INDEX IF NOT EXISTS idx_attachments_storage_path ON attachments(storage_path);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_attachments_msg_content_hash
-    ON attachments(message_id, content_hash)
-    WHERE content_hash IS NOT NULL AND content_hash != '';
+-- idx_attachments_msg_content_hash is created in Go (Store.InitSchema)
+-- after a one-shot dedupe of legacy duplicate rows.
 
 CREATE INDEX IF NOT EXISTS idx_labels_source ON labels(source_id);
 CREATE INDEX IF NOT EXISTS idx_message_labels_label ON message_labels(label_id);

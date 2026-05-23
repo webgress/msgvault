@@ -1337,11 +1337,14 @@ func (e *SQLiteEngine) buildSearchQueryParts(ctx context.Context, q *search.Quer
 		args = append(args, "%"+escapeSQLiteLike(label)+"%")
 	}
 
-	// Subject filter
+	// Subject filter. LOWER both sides so PostgreSQL's case-sensitive
+	// LIKE matches the same rows the store API path returns (which
+	// already lowercases). SQLite's LIKE is ASCII-case-insensitive but
+	// the LOWER wrapper still works there.
 	if len(q.SubjectTerms) > 0 {
 		for _, term := range q.SubjectTerms {
-			conditions = append(conditions, "m.subject LIKE ?")
-			args = append(args, "%"+term+"%")
+			conditions = append(conditions, "LOWER(m.subject) LIKE LOWER(?) ESCAPE '\\'")
+			args = append(args, "%"+escapeSQLiteLike(term)+"%")
 		}
 	}
 
@@ -1381,9 +1384,12 @@ func (e *SQLiteEngine) buildSearchQueryParts(ctx context.Context, q *search.Quer
 			}
 		} else {
 			// Fall back to LIKE-based search on subject/snippet only.
+			// LOWER both sides so PostgreSQL's case-sensitive LIKE
+			// returns the same hits as SQLite's ASCII-folded LIKE.
 			for _, term := range q.TextTerms {
-				likeTerm := "%" + term + "%"
-				conditions = append(conditions, "(m.subject LIKE ? OR m.snippet LIKE ?)")
+				likeTerm := "%" + escapeSQLiteLike(term) + "%"
+				conditions = append(conditions,
+					"(LOWER(m.subject) LIKE LOWER(?) ESCAPE '\\' OR LOWER(m.snippet) LIKE LOWER(?) ESCAPE '\\')")
 				args = append(args, likeTerm, likeTerm)
 			}
 		}
