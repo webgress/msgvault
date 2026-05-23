@@ -25,7 +25,7 @@ test output lines over prose.
 Blocking:
 - [x] H1 — UpsertAttachment is not an upsert; concurrent duplicates
 - [x] H2 — AddAccountIdentity loses concurrent signal updates on PG
-- [ ] H3 — query.Engine PG search is case-sensitive (subject + metadata LIKE)
+- [x] H3 — query.Engine PG search is case-sensitive (subject + metadata LIKE)
 - [ ] H4 — PG absent from CI; status docs disagree with Makefile
 
 Significant:
@@ -40,6 +40,7 @@ Significant:
 
 - f534155 — H1 — partial unique index on attachments(message_id, content_hash); rewrite UpsertAttachment as INSERT ... ON CONFLICT; pre-schema dedupe
 - d074f62 — H2 — serialize AddAccountIdentity via SQLite BEGIN IMMEDIATE + PG SELECT FOR UPDATE; add Dialect.BeginWriteSQL / SelectForUpdate; retry on conflict/busy
+- 5bb1d56 — H3 — wrap subject+metadata LIKE in LOWER()/LOWER() in query.Engine; escape user input; add TestQueryEngine_CaseInsensitiveSearch_Subject; move unique-attachments index out of schema.sql into InitSchema after dedupe
 
 ## Reviewer log
 
@@ -51,3 +52,4 @@ Significant:
 - f534155 — H1 — PASS — `TestUpsertAttachment_Concurrent -count=10` ok on SQLite (0.41s) AND local PG (5.09s); `idx_attachments_msg_content_hash` partial unique index in both schema files; `UpsertAttachment` now `INSERT ... ON CONFLICT (message_id, content_hash) WHERE ... DO NOTHING` (messages.go:1669); pre-schema `dedupeAttachmentsBeforeUniqueIndex` retains lowest-id row.
 - f534155 — regression sweep (`go test -tags fts5 ./...` on SQLite) — all packages PASS except one flake: `TestAddAccountIdentity_Concurrent` failed once with "database is locked" (SQLite lock contention, not the H2 merge issue). Repeat `-count=10` runs pass cleanly, so noting as pre-existing test flake; H2 PG repro still fires at f534155 (`missing "manual"` / `missing "header"`) — coder still owns H2.
 - f534155 — PG regression sweep (`MSGVAULT_TEST_DB=... go test -tags fts5 ./...`) — all non-store packages green (cmd 36s, dedup 16s, deletion 32s, fbmessenger 36s actually ran against PG and passed); store/query/testutil need a fresh PG run after H2 commit (Go cache returned SQLite results since env vars don't invalidate the cache).
+- d074f62 — H2 — PASS — `TestAddAccountIdentity_Concurrent -count=10` ok on SQLite (0.43s) AND local PG (6.97s, no `missing "..."`). `account_identities.go:60-141` retains comma-rejection (`signal names cannot contain commas`) and empty-addr no-op; merge runs inside a writer-locked tx (SQLite `BEGIN IMMEDIATE` via `BeginWriteSQL`; PG `BEGIN` + `SELECT ... FOR UPDATE` via `SelectForUpdate`) with 5-attempt retry on `IsConflictError`/`IsBusyError`. PG cache-bypass sweep clean: store 90.6s, query 7.2s, testutil 1.0s, storetest 4.1s.
