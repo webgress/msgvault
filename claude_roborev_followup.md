@@ -42,10 +42,11 @@ roborev runs because subsequent commits only touched docs/merge content.
   `SanitizeFTSQuery`). Add coverage for `---`, hyphenated words, and
   email-like text.
 
-- [ ] **R4 — `claude_review_fixes.md:18`**
+- [x] **R4 — `claude_review_fixes.md:18`**
   The documentation committed a concrete PostgreSQL DSN containing username,
-  password, internal host, and database name:
-  `postgres://msgvault_test:msgvault_test@192.168.37.100:5432/msgvault_test?sslmode=disable`.
+  password, internal host, and database name (placeholder form:
+  `postgres://USER:PASS@HOST:5432/DBNAME?sslmode=disable`; real value is in
+  `MSGVAULT_TEST_DB`).
   Anyone with repository access and network reachability could reuse it
   against the test database.
   **Fix:** replace with a placeholder DSN in any committed doc (this file
