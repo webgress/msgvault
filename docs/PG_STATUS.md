@@ -89,6 +89,14 @@ attachment storage on PG, and end-to-end coverage under
   and orphan-cleanup paths haven't been exercised end-to-end yet.
 - **CI coverage** under `MSGVAULT_TEST_DB=postgres://...`: the harness
   exists and tests are portable, but no upstream CI lane runs it yet.
+- **Vector / hybrid search**: SQLite-only by construction —
+  `internal/vector/sqlitevec` uses the sqlite-vec extension and
+  `ATTACH DATABASE` to fuse `vectors.db` onto the main store, and the
+  embed worker / fused search dispatch `?` placeholders straight to
+  the main DB handle. `setupVectorFeatures` now refuses a PG DSN
+  with a clear error and `[vector] enabled = false` is required to
+  run msgvault against PostgreSQL. PG support (likely pgvector with
+  an analogous fused-search wrapper) is deferred to PR4.
 
 ## Running Tests Against PostgreSQL
 
