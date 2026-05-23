@@ -189,16 +189,18 @@ func (d *PostgreSQLDialect) FTSAvailable(db *sql.DB) bool {
 }
 
 // FTSNeedsBackfill reports whether the tsvector column needs population.
+// Counts NULL search_fts rows directly so an interrupted backfill that
+// leaves a low-id row NULL (and later inserts continue normally) still
+// flags the gap — the previous max-vs-max comparison missed that case.
+// Costs one indexable WHERE COUNT(*) per startup probe.
 func (d *PostgreSQLDialect) FTSNeedsBackfill(db *sql.DB) bool {
-	var msgMax int64
-	if err := db.QueryRow("SELECT COALESCE(MAX(id), 0) FROM messages").Scan(&msgMax); err != nil || msgMax == 0 {
+	var nullCount int64
+	if err := db.QueryRow(
+		"SELECT COUNT(*) FROM messages WHERE search_fts IS NULL",
+	).Scan(&nullCount); err != nil {
 		return false
 	}
-	var populatedMax int64
-	if err := db.QueryRow("SELECT COALESCE(MAX(id), 0) FROM messages WHERE search_fts IS NOT NULL").Scan(&populatedMax); err != nil {
-		return false
-	}
-	return populatedMax < msgMax-msgMax/10
+	return nullCount > 0
 }
 
 // FTSClearSQL returns the SQL to clear all tsvector data.
@@ -212,13 +214,24 @@ func (d *PostgreSQLDialect) SchemaFTS() string {
 	return ""
 }
 
-// FTSRebuildSchema is a scaffold for PostgreSQL. The SQLite path drops and
-// recreates the FTS5 virtual table to recover from shadow-table corruption;
-// PostgreSQL's tsvector column has no analogous shadow state, so a proper
-// rebuild here (REINDEX the GIN index, NULL out the column, let the caller
-// backfill) is deferred to PR3 along with the rest of the functional path.
+// FTSRebuildSchema clears every tsvector and recreates the GIN index
+// so the caller's backfill can repopulate from scratch. The DROP +
+// CREATE INDEX pair is the PG analogue of SQLite's DROP-and-recreate
+// of the messages_fts virtual table; it covers a malformed index just
+// as the SQLite path covers a malformed shadow table.
 func (d *PostgreSQLDialect) FTSRebuildSchema(db *sql.DB) error {
-	return fmt.Errorf("FTSRebuildSchema: PostgreSQL FTS rebuild not yet implemented")
+	if _, err := db.Exec("DROP INDEX IF EXISTS messages_search_fts_idx"); err != nil {
+		return fmt.Errorf("drop messages_search_fts_idx: %w", err)
+	}
+	if _, err := db.Exec("UPDATE messages SET search_fts = NULL"); err != nil {
+		return fmt.Errorf("clear search_fts: %w", err)
+	}
+	if _, err := db.Exec(
+		"CREATE INDEX IF NOT EXISTS messages_search_fts_idx ON messages USING GIN (search_fts)",
+	); err != nil {
+		return fmt.Errorf("create messages_search_fts_idx: %w", err)
+	}
+	return nil
 }
 
 // LegacyColumnMigrations returns the ALTER TABLE ADD COLUMN statements that
