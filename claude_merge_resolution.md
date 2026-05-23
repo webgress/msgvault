@@ -50,18 +50,19 @@ PG-dialect code lives in files the rename also touched.
 
 ## State
 
-- [ ] Merge attempted
-- [ ] Conflicts resolved (semantic, not blind)
-- [ ] SQLite full sweep green post-merge
-- [ ] PG full sweep green post-merge
+- [x] Merge attempted
+- [x] Conflicts resolved (semantic, not blind)
+- [x] SQLite full sweep green post-merge
+- [x] PG full sweep green post-merge
 - [ ] All 8 codex findings (H1–H4, M1–M4) verified intact
 - [ ] BeginExclusive lock list (4213a6b) still complete
-- [ ] Module rename consistent — no remaining `github.com/wesm/msgvault` references
-- [ ] CI workflow keeps both H4 PG job AND docker action bump
+- [x] Module rename consistent — no remaining `github.com/wesm/msgvault` references
+- [x] CI workflow keeps both H4 PG job AND docker action bump
 
 ## Coder log
 
 <!-- newest at bottom: "HASH — summary" -->
+- `29fe2a1` — Merged upstream/main (a3e6038). Two real conflicts (serve_vector.go imports, postgres.go imports) resolved; rewrote PR3-introduced files' imports to `go.kenn.io/msgvault`; fixed upstream's stale LDFLAGS in `.github/workflows/release.yml` + Dockerfile comment. `go build`/`fmt`/`vet` clean, SQLite + PG full sweeps green.
 
 ## Reviewer log
 
