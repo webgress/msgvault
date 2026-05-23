@@ -297,10 +297,14 @@ func (d *PostgreSQLDialect) IsBusyError(err error) bool {
 // lock that INSERT/UPDATE/DELETE acquire; ACCESS SHARE (reads) is still
 // permitted.
 //
-// The table list mirrors every INSERT/UPDATE/DELETE the sync pipeline
-// emits (verified against internal/store/messages.go,
-// internal/store/sync.go, and internal/sync/*.go): sources is included
-// because UpdateSourceSyncCursor stamps last_sync_at on every sync.
+// The table list mirrors every INSERT/UPDATE/DELETE the sync/import
+// pipeline emits (verified against internal/store/messages.go,
+// internal/store/sync.go, internal/store/account_identities.go,
+// internal/store/migrations.go, and internal/sync/*.go) plus the
+// collection_sources / account_identities / applied_migrations rows
+// reached by ON DELETE CASCADE when RemoveSourceSerialized deletes a
+// source. collections is included so a concurrent collection rename
+// cannot race the cascade.
 func (d *PostgreSQLDialect) BeginExclusive(ctx context.Context, conn *sql.Conn) error {
 	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
 		return err
@@ -308,7 +312,8 @@ func (d *PostgreSQLDialect) BeginExclusive(ctx context.Context, conn *sql.Conn) 
 	if _, err := conn.ExecContext(ctx,
 		"LOCK TABLE sync_runs, sources, conversations, conversation_participants, "+
 			"messages, message_recipients, message_labels, message_bodies, message_raw, "+
-			"attachments, labels, participants, participant_identifiers, reactions "+
+			"attachments, labels, participants, participant_identifiers, reactions, "+
+			"collections, collection_sources, account_identities, applied_migrations "+
 			"IN EXCLUSIVE MODE",
 	); err != nil {
 		_, _ = conn.ExecContext(ctx, "ROLLBACK")
