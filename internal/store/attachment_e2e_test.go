@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/wesm/msgvault/internal/store"
-	"github.com/wesm/msgvault/internal/testutil"
+	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 )
 
 // attachmentCorpus seeds a multi-source corpus of messages with attachments
