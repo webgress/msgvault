@@ -58,3 +58,21 @@ the `buildGoModule`-style derivation). It is **not** the unrelated
 
 (reviewer appends PASS/FAIL with concrete evidence per coder commit, and
 a final all-CI-green PASS when the upstream run flips green)
+
+- e85d8a6 — F1 — **PASS** — coder bumped `nix/package.nix:16` to
+  `sha256-o+MtdsSXomxymaPY/ZwsBN5PnddGpvKAvwK6ElSUHSQ=`. Independently
+  verified two ways: (a) baseline reproduction on HEAD `8b5c9e5` in CI
+  run https://github.com/kenn-io/msgvault/actions/runs/26342426550
+  failed identically with `specified: sha256-/C+sv…LJUE= got:
+  sha256-o+Mtd…HSQ=` (same as the original
+  https://github.com/kenn-io/msgvault/actions/runs/26341744277), and
+  (b) Nix re-derived the same `got` hash both times — that *is* the
+  authoritative value for the current `go.sum`. The committed hash
+  matches byte-for-byte. CI run on `e85d8a6`
+  https://github.com/kenn-io/msgvault/actions/runs/26342471505 is
+  green on all jobs incl. `nix-build`. SQLite `make test` sweep green
+  locally at HEAD `02f13ca` (no test inputs changed; PG suite per
+  `docs/PG_STATUS.md` baseline — not exercised by this fix). Doc
+  commit `02f13ca` CI run
+  https://github.com/kenn-io/msgvault/actions/runs/26342477025 also
+  fully green incl. `nix-build`. F1 closed.
