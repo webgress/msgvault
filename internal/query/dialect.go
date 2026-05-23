@@ -15,6 +15,8 @@ package query
 import (
 	"fmt"
 	"strings"
+
+	"github.com/wesm/msgvault/internal/sqldialect"
 )
 
 // Dialect abstracts SQL generation differences for SQLite vs PostgreSQL.
@@ -126,25 +128,11 @@ func (SQLiteQueryDialect) SanitizeFTSQuery(query string) string {
 type PostgreSQLQueryDialect struct{}
 
 // Rebind converts ? placeholders to $1, $2, ... for PostgreSQL.
-// Correctly handles quoted strings — only converts ? outside single quotes.
+// Delegates to sqldialect so store.PostgreSQLDialect.Rebind stays in
+// lockstep — divergence here would route the same query to two
+// different rebinds depending on which package owns the call site.
 func (PostgreSQLQueryDialect) Rebind(query string) string {
-	var b strings.Builder
-	b.Grow(len(query) + 16)
-	n := 1
-	inQuote := false
-	for i := 0; i < len(query); i++ {
-		ch := query[i]
-		if ch == '\'' {
-			inQuote = !inQuote
-			b.WriteByte(ch)
-		} else if ch == '?' && !inQuote {
-			fmt.Fprintf(&b, "$%d", n)
-			n++
-		} else {
-			b.WriteByte(ch)
-		}
-	}
-	return b.String()
+	return sqldialect.RebindPostgreSQL(query)
 }
 
 func (PostgreSQLQueryDialect) BoolTrueExpr(col string) string { return col }
@@ -181,12 +169,13 @@ func (PostgreSQLQueryDialect) HasFTSTableSQL() string {
 // FTSJoin: PostgreSQL's tsvector column lives on messages — no join needed.
 func (PostgreSQLQueryDialect) FTSJoin() string { return "" }
 
-// BuildFTSTerm for PostgreSQL to_tsquery: sanitize each term, append :* for
-// prefix match, AND them with " & ".
+// BuildFTSTerm for PostgreSQL to_tsquery: sanitize each term via
+// sqldialect.EscapeTSQueryTerm (shared with store.PostgreSQLDialect),
+// append :* for prefix match, AND with " & ".
 func (PostgreSQLQueryDialect) BuildFTSTerm(terms []string) (expr string, arg string) {
 	tsTerms := make([]string, 0, len(terms))
 	for _, term := range terms {
-		clean := tsqueryEscape(term)
+		clean := sqldialect.EscapeTSQueryTerm(term)
 		if clean == "" {
 			continue
 		}
@@ -222,22 +211,4 @@ func (PostgreSQLQueryDialect) SanitizeFTSQuery(query string) string {
 		parts = append(parts, t+":*")
 	}
 	return strings.Join(parts, " & ")
-}
-
-// tsqueryEscape removes PostgreSQL tsquery metacharacters and whitespace,
-// leaving a single alphanumeric+unicode token.
-func tsqueryEscape(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		switch r {
-		case '&', '|', '!', '(', ')', ':', '*', '\\', '\'':
-			// skip
-		default:
-			if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
-				continue
-			}
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
 }

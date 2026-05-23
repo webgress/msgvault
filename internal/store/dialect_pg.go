@@ -9,6 +9,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib" // Register pgx driver for database/sql
+
+	"github.com/wesm/msgvault/internal/sqldialect"
 )
 
 // PostgreSQLDialect implements Dialect for PostgreSQL.
@@ -16,26 +18,11 @@ type PostgreSQLDialect struct{}
 
 func (d *PostgreSQLDialect) DriverName() string { return "pgx" }
 
-// Rebind converts ? placeholders to PostgreSQL $1, $2, ... numbered placeholders.
-// Correctly handles quoted strings — only converts ? outside single quotes.
+// Rebind converts ? placeholders to PostgreSQL $1, $2, ... numbered
+// placeholders. Delegates to sqldialect so the query package's
+// PostgreSQLQueryDialect.Rebind stays in lockstep.
 func (d *PostgreSQLDialect) Rebind(query string) string {
-	var b strings.Builder
-	b.Grow(len(query) + 16)
-	n := 1
-	inQuote := false
-	for i := 0; i < len(query); i++ {
-		ch := query[i]
-		if ch == '\'' {
-			inQuote = !inQuote
-			b.WriteByte(ch)
-		} else if ch == '?' && !inQuote {
-			fmt.Fprintf(&b, "$%d", n)
-			n++
-		} else {
-			b.WriteByte(ch)
-		}
-	}
-	return b.String()
+	return sqldialect.RebindPostgreSQL(query)
 }
 
 // Now returns the PostgreSQL expression for the current timestamp.
@@ -54,41 +41,20 @@ func (d *PostgreSQLDialect) JSONBindExpr() string { return "?::JSONB" }
 // of tsquery metacharacters, suffixed with ":*" for prefix matching, and
 // joined with " & ". Matches the shape emitted by the query package's
 // PostgreSQLQueryDialect.BuildFTSTerm so the API search and engine
-// deep-search return the same hits — "invo" matches "invoice" in both.
-// Terms that reduce to an empty escape are dropped; if all drop, returns
-// "" so the caller can substitute a FALSE predicate rather than feed
-// to_tsquery an empty argument ("text-search query doesn't contain
-// lexemes").
+// deep-search return the same hits. Terms that reduce to an empty
+// escape are dropped; if all drop, returns "" so the caller can
+// substitute a FALSE predicate rather than feed to_tsquery an empty
+// argument.
 func (d *PostgreSQLDialect) BuildFTSArg(terms []string) string {
 	out := make([]string, 0, len(terms))
 	for _, t := range terms {
-		clean := pgTsqueryEscape(t)
+		clean := sqldialect.EscapeTSQueryTerm(t)
 		if clean == "" {
 			continue
 		}
 		out = append(out, clean+":*")
 	}
 	return strings.Join(out, " & ")
-}
-
-// pgTsqueryEscape removes tsquery metacharacters and whitespace,
-// leaving a single alphanumeric+unicode token. Mirrors the helper in
-// internal/query/dialect.go so both packages produce the same shape
-// without taking a cross-package dependency.
-func pgTsqueryEscape(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		switch r {
-		case '&', '|', '!', '(', ')', ':', '*', '\\', '\'':
-			// skip
-		default:
-			if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
-				continue
-			}
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
 }
 
 // InsertOrIgnore rewrites INSERT OR IGNORE INTO to INSERT INTO and appends
