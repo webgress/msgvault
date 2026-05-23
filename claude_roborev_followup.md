@@ -9,7 +9,7 @@ roborev runs because subsequent commits only touched docs/merge content.
 
 ### High
 
-- [ ] **R1 — `internal/store/api.go:566`**
+- [x] **R1 — `internal/store/api.go:566`**
   `scanMessageRows` scans `COALESCE(m.sent_at, m.received_at, m.internal_date)`
   into `sql.NullTime`. On SQLite, that computed `COALESCE` expression has no
   declared datetime type, so the driver can return text and list/search paths
@@ -77,6 +77,8 @@ the real fix), but new docs must use the env-var form.
 
 <!-- newest at bottom: "HASH — finding — summary" -->
 019112f — R4 — scrubbed test DSN from claude_review_fixes.md:18 and claude_roborev_followup.md (placeholder + MSGVAULT_TEST_DB reference). claude_merge_resolution.md:33 still contains the DSN but is out of scope per coder constraints — **human must rotate `msgvault_test` password on CT 100 + sandbox local PG** and manually scrub line 33.
+f0c87e4 — R1 — added `nullableTimestamp` (sql.Scanner accepting nil/time.Time/string/[]byte) in `internal/store/api.go`; routed both `scanMessageRows` (line 624) and `GetMessage` (line 120, also covers `deleted_from_source_at`) through it; tests SQLite `TestNullableTimestampScan|TestParseSQLiteTime|TestGetMessageCcBcc|TestListMessagesCcBcc` and the same set under `MSGVAULT_TEST_DB=<env>` PG run both PASS locally.
+deferred — R4 reviewer-FAIL — reviewer flagged `claude_merge_resolution.md:33` as still-present DSN. That file is explicitly out of scope for the coder per this session's task constraints ("Don't edit … claude_merge_resolution.md"); a Claude-Code session boundary, not a workflow disagreement. Defer to the human to either (a) scrub line 33 themselves alongside the password rotation, or (b) relax the coder constraint and signal a re-run. Not re-toggling `[x]`; leaving `[ ]` to reflect reviewer state until the human resolves.
 
 ## Reviewer log
 
