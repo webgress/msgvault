@@ -78,6 +78,34 @@ attachment storage on PG, and end-to-end coverage under
 | 10 | `PostgreSQLEngine` wired to factory | `query.NewEngine(db, isPostgres)` in cmd/ |
 | 11 | Legacy column migrations on PG | `LegacyColumnMigrations()` returns the SQLite list translated to PG types, using `ADD COLUMN IF NOT EXISTS` for idempotency |
 
+## Codex Review Fixes (Late PR3)
+
+The codex multi-level review of `pr3-upstream` flagged four
+release-blocking concurrency / search-parity issues plus follow-up
+maintainability work. All blocking findings are now addressed in this
+branch:
+
+- **H1** — `UpsertAttachment` now backed by a partial unique index on
+  `(message_id, content_hash)` and uses `INSERT … ON CONFLICT DO
+  NOTHING`. Legacy duplicates are deduped on `InitSchema`.
+- **H2** — `AddAccountIdentity` runs inside a writer-locked
+  transaction (SQLite `BEGIN IMMEDIATE`; PostgreSQL `SELECT … FOR
+  UPDATE`) so concurrent merges no longer drop signals.
+- **H3** — `query.Engine`'s `subject:` and metadata fallback predicates
+  are `LOWER(col) LIKE LOWER(?)` with proper escape, matching the
+  store-layer search.
+- **H4** — `.github/workflows/ci.yml` runs a `test-postgres` job
+  against a live `postgres:16` service.
+- **M1** — `EnsureConversation` / `EnsureConversationWithType` /
+  `GetOrCreateSource` collapse into a single
+  `INSERT … ON CONFLICT DO UPDATE RETURNING` statement; `StartSync`
+  runs in a writer-locked transaction with a `sources` row lock on PG.
+- **M2** — `FTSNeedsBackfill` counts `search_fts IS NULL` rows
+  directly so missing intermediates surface; `FTSRebuildSchema` is
+  implemented for PG (DROP index → clear column → re-CREATE index).
+- **M3** — Shared `?`-rebind and tsquery-escape primitives live in
+  `internal/sqldialect`; both store and query dialects delegate.
+
 ## Remaining for PR4
 
 - **FTS weight differences**: PostgreSQL applies `setweight('A')` to the
@@ -87,10 +115,6 @@ attachment storage on PG, and end-to-end coverage under
   staged-deletion → Gmail delete → archive update.
 - **Attachment storage paths** under PostgreSQL — content-hash dedup
   and orphan-cleanup paths haven't been exercised end-to-end yet.
-- **CI coverage** under `MSGVAULT_TEST_DB=postgres://...`: covered by
-  the `test-postgres` job in `.github/workflows/ci.yml` (portable
-  `fts5` suite + `-count=5` concurrency tests against a live PG 16
-  service).
 - **Vector / hybrid search**: SQLite-only by construction —
   `internal/vector/sqlitevec` uses the sqlite-vec extension and
   `ATTACH DATABASE` to fuse `vectors.db` onto the main store, and the
