@@ -76,6 +76,7 @@ the real fix), but new docs must use the env-var form.
 ## Coder log
 
 <!-- newest at bottom: "HASH — finding — summary" -->
+019112f — R4 — scrubbed test DSN from claude_review_fixes.md:18 and claude_roborev_followup.md (placeholder + MSGVAULT_TEST_DB reference). claude_merge_resolution.md:33 still contains the DSN but is out of scope per coder constraints — **human must rotate `msgvault_test` password on CT 100 + sandbox local PG** and manually scrub line 33.
 
 ## Reviewer log
 
