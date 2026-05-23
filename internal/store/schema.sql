@@ -359,6 +359,13 @@ CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_hash ON attachments(content_hash);
 CREATE INDEX IF NOT EXISTS idx_attachments_storage_path ON attachments(storage_path);
 
+-- Idempotency key for UpsertAttachment: (message_id, content_hash) is unique
+-- when content_hash is a real value. Empty/NULL hash is excluded so two
+-- attachments without a hash on the same message don't collide.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_attachments_msg_content_hash
+    ON attachments(message_id, content_hash)
+    WHERE content_hash IS NOT NULL AND content_hash != '';
+
 -- Labels
 CREATE INDEX IF NOT EXISTS idx_labels_source ON labels(source_id);
 CREATE INDEX IF NOT EXISTS idx_message_labels_label ON message_labels(label_id);

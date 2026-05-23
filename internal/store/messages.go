@@ -1648,44 +1648,42 @@ func (s *Store) IsAttachmentPathReferenced(storagePath string) (bool, error) {
 	return count > 0, nil
 }
 
-// UpsertAttachment stores an attachment record.
+// UpsertAttachment stores an attachment record. Idempotency for the
+// common case is enforced by the partial unique index
+// idx_attachments_msg_content_hash on (message_id, content_hash) where
+// content_hash is non-empty; concurrent inserts collapse to one row via
+// ON CONFLICT DO NOTHING. `size` is widened to int64 at the bind
+// boundary so 32-bit builds cannot truncate large attachments before
+// the column (BIGINT on PG, INTEGER on SQLite).
 //
-// `size` is widened to int64 at the bind boundary so 32-bit builds
-// (armv7 etc.) cannot truncate large attachments before the column
-// (which is BIGINT on PG, INTEGER on SQLite — both 8-byte).
-//
-// There is no unique constraint on (message_id, content_hash), so the
-// SELECT-then-INSERT can race with a concurrent caller. The catch is
-// that the existing row will already match on (message_id,
-// content_hash), so on a duplicate-row insert we simply retry the
-// SELECT: it will now find the row and we exit idempotently. The
-// retry loop limits blast radius if the conflict detection
-// misclassifies a different error.
+// When contentHash is empty (the rare untyped-blob path used by some
+// importers), the unique index does not cover the row; a best-effort
+// (message_id, empty-hash) match is used to avoid trivial duplicates,
+// but two concurrent empty-hash inserts on the same message may both
+// succeed.
 func (s *Store) UpsertAttachment(messageID int64, filename, mimeType, storagePath, contentHash string, size int) error {
-	const maxAttempts = 3
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		var existingID int64
-		err := s.db.QueryRow(`
-			SELECT id FROM attachments WHERE message_id = ? AND content_hash = ?
-		`, messageID, contentHash).Scan(&existingID)
-		if err == nil {
-			return nil
-		}
-		if err != sql.ErrNoRows {
-			return err
-		}
-
-		_, err = s.db.Exec(fmt.Sprintf(`
+	if contentHash != "" {
+		_, err := s.db.Exec(fmt.Sprintf(`
 			INSERT INTO attachments (message_id, filename, mime_type, storage_path, content_hash, size, created_at)
 			VALUES (?, ?, ?, ?, ?, ?, %s)
+			ON CONFLICT (message_id, content_hash) WHERE content_hash IS NOT NULL AND content_hash != '' DO NOTHING
 		`, s.dialect.Now()), messageID, filename, mimeType, storagePath, contentHash, int64(size))
-		if err == nil {
-			return nil
-		}
-		if !s.dialect.IsConflictError(err) {
-			return err
-		}
-		// Concurrent insert won — retry to find their row.
+		return err
 	}
-	return fmt.Errorf("upsert attachment: gave up after %d conflict retries", maxAttempts)
+
+	var existingID int64
+	err := s.db.QueryRow(`
+		SELECT id FROM attachments WHERE message_id = ? AND (content_hash IS NULL OR content_hash = '')
+	`, messageID).Scan(&existingID)
+	if err == nil {
+		return nil
+	}
+	if err != sql.ErrNoRows {
+		return err
+	}
+	_, err = s.db.Exec(fmt.Sprintf(`
+		INSERT INTO attachments (message_id, filename, mime_type, storage_path, content_hash, size, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, %s)
+	`, s.dialect.Now()), messageID, filename, mimeType, storagePath, contentHash, int64(size))
+	return err
 }

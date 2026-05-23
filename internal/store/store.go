@@ -553,6 +553,15 @@ func (s *Store) SchemaStale() (bool, string, error) {
 // InitSchema initializes the database schema.
 // This creates all tables if they don't exist.
 func (s *Store) InitSchema() error {
+	// Pre-schema cleanup: legacy databases may hold duplicate
+	// (message_id, content_hash) attachment rows from the old
+	// SELECT-then-INSERT UpsertAttachment. The new unique index in
+	// schema(.sql|_pg.sql) cannot be created until those duplicates are
+	// removed.
+	if err := s.dedupeAttachmentsBeforeUniqueIndex(); err != nil {
+		return fmt.Errorf("dedupe attachments: %w", err)
+	}
+
 	// Load and execute schema files provided by the dialect.
 	for _, filename := range s.dialect.SchemaFiles() {
 		schema, err := schemaFS.ReadFile(filename)
@@ -601,6 +610,29 @@ func (s *Store) InitSchema() error {
 	}
 
 	return nil
+}
+
+// dedupeAttachmentsBeforeUniqueIndex removes duplicate
+// (message_id, content_hash) rows from attachments so the partial
+// unique index idx_attachments_msg_content_hash can be created.
+// Pre-fix UpsertAttachment used a SELECT-then-INSERT pattern that
+// could create duplicates under concurrency; this cleans them up
+// once. It is a no-op on fresh databases (attachments doesn't exist
+// yet) and idempotent (no rows match after the first pass).
+func (s *Store) dedupeAttachmentsBeforeUniqueIndex() error {
+	_, err := s.db.Exec(`
+		DELETE FROM attachments
+		WHERE content_hash IS NOT NULL AND content_hash != ''
+		  AND id NOT IN (
+			SELECT MIN(id) FROM attachments
+			WHERE content_hash IS NOT NULL AND content_hash != ''
+			GROUP BY message_id, content_hash
+		  )
+	`)
+	if err != nil && s.dialect.IsNoSuchTableError(err) {
+		return nil
+	}
+	return err
 }
 
 // NeedsFTSBackfill reports whether the FTS index needs to be populated.
