@@ -54,8 +54,8 @@ PG-dialect code lives in files the rename also touched.
 - [x] Conflicts resolved (semantic, not blind)
 - [x] SQLite full sweep green post-merge
 - [x] PG full sweep green post-merge
-- [ ] All 8 codex findings (H1–H4, M1–M4) verified intact
-- [ ] BeginExclusive lock list (4213a6b) still complete
+- [x] All 8 codex findings (H1–H4, M1–M4) verified intact
+- [x] BeginExclusive lock list (4213a6b) still complete
 - [x] Module rename consistent — no remaining `github.com/wesm/msgvault` references
 - [x] CI workflow keeps both H4 PG job AND docker action bump
 
@@ -67,3 +67,4 @@ PG-dialect code lives in files the rename also touched.
 ## Reviewer log
 
 <!-- newest at bottom: "HASH — PASS/FAIL — evidence" -->
+- `29fe2a1` — **PASS** — Merge inspected (223 files changed vs ^1 absorbing upstream, ~71 files vs ^2 preserving pr3 PG dialect). Upstream absorbed cleanly: `go.mod` is `module go.kenn.io/msgvault`; only remaining `github.com/wesm/msgvault` reference in tracked code is the homepage URL in `nix/package.nix:44` (intentional, docs-only); `nix/package.nix` exists (flake split); `docker/build-push-action@…v7.2.0` present at `.github/workflows/docker.yml:37,116`; `.github/workflows/ci.yml:95` retains `test-postgres:` job. All 8 fixes intact: H1 partial-unique index + `ON CONFLICT` in `internal/store/messages.go:187` and `internal/store/store.go:575`; H2 `BeginWriteSQL`/`SelectForUpdate` at `internal/store/account_identities.go:96,110`; H3 `LOWER(m.subject) LIKE LOWER(?) ESCAPE '\\'` at `internal/query/sqlite.go:1346,1392`; M1 `ON CONFLICT DO UPDATE … RETURNING id` on `EnsureConversation` (`messages.go:167`), `EnsureConversationWithType` (`messages.go:1131`), `GetOrCreateSource` (`sync.go:359`) + `StartSync` writer-locked via `BeginWriteSQL` (`sync.go:167`); M2 `FTSNeedsBackfill` + `FTSRebuildSchema` at `internal/store/dialect_pg.go:162,188`; M3 `internal/sqldialect/sqldialect.go:{22 RebindPostgreSQL, 42 EscapeTSQueryTerm}`; M4 `docs/PG_STATUS.md` present (137 lines). Roborev #11 BeginExclusive lock list at `internal/store/dialect_pg.go:316` includes all four tables (`collections, collection_sources, account_identities, applied_migrations`). PG concurrency × 10: `TestUpsertAttachment_Concurrent|TestAddAccountIdentity_Concurrent` → `ok 17.388s`. PG targeted sweep (`store|query|api|sqldialect|testutil`) → all `ok`, total 1m36s. SQLite full sweep `go test -tags fts5 -count=1 ./...` → all `ok`, total 31s.
