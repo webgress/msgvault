@@ -23,7 +23,7 @@ test output lines over prose.
 ## Findings (from codex_multilevel_review.md)
 
 Blocking:
-- [ ] H1 — UpsertAttachment is not an upsert; concurrent duplicates
+- [x] H1 — UpsertAttachment is not an upsert; concurrent duplicates
 - [ ] H2 — AddAccountIdentity loses concurrent signal updates on PG
 - [ ] H3 — query.Engine PG search is case-sensitive (subject + metadata LIKE)
 - [ ] H4 — PG absent from CI; status docs disagree with Makefile
@@ -38,6 +38,12 @@ Significant:
 
 <!-- coder appends entries here, newest at bottom: "HASH — finding — summary" -->
 
+- f534155 — H1 — partial unique index on attachments(message_id, content_hash); rewrite UpsertAttachment as INSERT ... ON CONFLICT; pre-schema dedupe
+
 ## Reviewer log
 
 <!-- reviewer appends entries here, newest at bottom: "HASH — finding — PASS/FAIL — evidence" -->
+
+- baseline @ 05c0f93 — H1 SQLite reproduces: `TestUpsertAttachment_Concurrent: got 2 attachment rows, want exactly 1` (`go test -tags fts5 -count=10 ./internal/store -run TestUpsertAttachment_Concurrent`)
+- baseline @ 05c0f93 — H2 PG reproduces (local PG on sandbox, 127.0.0.1, db `msgvault_test`): `merged source_signal "header,manual" missing "account-identifier"`. CT 100 (192.168.37.100) rejects connections from sandbox via pg_hba; using local PG 16 (msgvault_test/msgvault_test) for verification.
+- baseline @ 05c0f93 — H1 on local PG passed 10/10 (not deterministic on PG, but the missing UNIQUE constraint is visible in schema_pg.sql; verification will rely on schema + SQLite repro).
