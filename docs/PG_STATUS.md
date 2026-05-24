@@ -108,20 +108,49 @@ branch:
 
 ## Remaining for PR4
 
-- **FTS rank ordering (partially resolved)**:
-  `SQLiteDialect.FTSSearchClause()` now orders by
+- **FTS rank ordering — best-effort SQLite tuning, NOT cross-backend
+  parity**: `SQLiteDialect.FTSSearchClause()` orders by
   `bm25(messages_fts, 1.0, 10.0, 1.0, 4.0, 1.0, 1.0)` — weights are
   positional over every declared FTS5 column (the leading 1.0 is the
   slot for `message_id UNINDEXED`; the rest map to subject, body,
-  from, to, cc). The 10:4:1 ratio across subject/sender/body mirrors
-  PostgreSQL's `setweight 'A'=1.0 / 'B'=0.4 / 'D'=0.1`, so
-  subject-only matches outrank sender-only, which outrank body-only
-  on both backends. Verified by `TestFTSRankWeightsAcrossBackends`.
-  Note: bm25 (Okapi BM25) and `ts_rank` (cover-density) remain
-  different scorer functions, so intra-class tie-breaking (e.g. two
-  body-only matches) can still diverge. Top-N ordering is consistent
-  for most queries; expect occasional reorderings deep in the result
-  list.
+  from, to, cc). The 10:4:1 ratio across subject/sender/body
+  approximates PostgreSQL's `setweight 'A'=1.0 / 'B'=0.4 / 'D'=0.1`,
+  and on emails with similar document lengths it produces the same
+  field-priority ordering as PG (subject-only > sender-only >
+  body-only).
+
+  **Two known divergences remain, by design:**
+
+  a. **Intra-class tie-breaking** between two hits in the same field
+     class (e.g. two body-only matches) can differ because bm25
+     (Okapi BM25) and `ts_rank` (cover-density) are different scorer
+     functions.
+
+  b. **Document-length normalization** behavior differs across the
+     field-priority classes themselves. SQLite's `bm25()` applies
+     Okapi BM25 length normalization, which penalises long
+     documents; PostgreSQL's `ts_rank()` called without a
+     normalization flag does not. As a result, a long subject-hit
+     document (e.g. `subject="zappa"` with a several-thousand-token
+     body) can rank below a short body-hit document on SQLite, while
+     PG keeps the subject-hit on top. This is not pathological —
+     newsletters, quoted-reply threads, and long mailing-list digests
+     routinely produce this shape.
+
+  Achieving strict cross-backend parity would require either (a) a
+  custom SQLite rank function or auxiliary expression that disables
+  BM25 length normalization (e.g. by computing the column-weighted
+  score with `b=0`-equivalent semantics), or (b) abandoning native
+  scorer functions on one side in favour of a
+  field-priority-then-native-score ordering scheme applied uniformly.
+  Both are explicitly out of scope.
+
+  The regression net for this divergence is
+  `TestFTSRank_KnownDivergence` in `internal/store/`, which pins the
+  expected per-backend ordering for the long-subject-hit vs
+  short-body-hit fixture. If either backend's scoring model changes
+  in a way that flips the recorded ordering, that test fails and
+  this section must be updated accordingly.
 - **Deletion execution path on PostgreSQL**: end-to-end testing of
   staged-deletion → Gmail delete → archive update.
 - **Attachment storage paths** under PostgreSQL — content-hash dedup
