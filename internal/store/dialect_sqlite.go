@@ -93,19 +93,28 @@ func (d *SQLiteDialect) FTSUpsert(q querier, doc FTSDoc) error {
 }
 
 // FTSSearchClause returns SQL fragments for FTS5 full-text search.
-// The bm25 weights mirror the PostgreSQL dialect's setweight scheme so the
-// two backends order results consistently. Weights are positional over
-// every column declared in messages_fts — UNINDEXED columns count too even
-// though they cannot match — so the leading 1.0 is the placeholder for
-// `message_id UNINDEXED`. The remaining slots map to (subject, body,
-// from_addr, to_addr, cc_addr). PostgreSQL applies setweight 'A'=1.0 to
-// subject and 'B'=0.4 to sender, leaving body and other recipients at
-// default 'D'=0.1 — a 10:4:1 ratio. bm25 multiplies per-column scores by
-// these weights, so 10/1/4/1/1 across (subject, body, from, to, cc)
-// reproduces that ordering: subject-only > sender-only > body/recipient-
-// only matches. bm25 returns lower (more negative) scores for more
-// relevant rows, so callers ORDER BY this expression ascending (the
-// default).
+//
+// The bm25 weights approximate PostgreSQL's setweight field-priority
+// preferences (subject heaviest, then sender, then body / other
+// recipients) for typical email shapes. This is a best-effort SQLite
+// tuning, NOT a strict cross-backend parity guarantee.
+//
+// Weights are positional over every column declared in messages_fts —
+// UNINDEXED columns count too even though they cannot match — so the
+// leading 1.0 is the placeholder for `message_id UNINDEXED`. The
+// remaining slots map to (subject, body, from_addr, to_addr, cc_addr).
+// PostgreSQL applies setweight 'A'=1.0 to subject and 'B'=0.4 to sender,
+// leaving body and other recipients at default 'D'=0.1 — a 10:4:1 ratio,
+// which bm25 reproduces as 10/1/4/1/1 across (subject, body, from, to,
+// cc). bm25 returns lower (more negative) scores for more relevant rows,
+// so callers ORDER BY this expression ascending (the default).
+//
+// Known divergence: SQLite's bm25() applies Okapi BM25 document-length
+// normalization while PostgreSQL's default ts_rank() does not, so very
+// long subject-hit documents can still rank below short body-hit
+// documents on SQLite while PG ranks them subject-first. See
+// docs/PG_STATUS.md item 11 and TestFTSRank_KnownDivergence for the
+// expected behavior pin and rationale.
 func (d *SQLiteDialect) FTSSearchClause() (join, where, orderBy string, orderArgCount int) {
 	return "JOIN messages_fts ON messages_fts.rowid = m.id",
 		"messages_fts MATCH ?",
