@@ -32,7 +32,8 @@ var longPadding = strings.Repeat("alpha beta gamma delta epsilon ", 600)
 // and serves as a regression net against either backend's scoring model
 // silently changing.
 //
-// This is EXPECTED BEHAVIOR, not a bug. See docs/PG_STATUS.md (item 11):
+// This is EXPECTED BEHAVIOR, not a bug. See the "FTS rank ordering"
+// entry under docs/PG_STATUS.md "Remaining for PR4":
 //
 //   - SQLite's bm25() applies Okapi BM25 document-length normalization.
 //     A long subject-hit document is penalised so heavily that a short
@@ -138,7 +139,7 @@ func assertSQLiteBodyHitWins(t *testing.T) {
 				"  subject-hit id=%d, body-hit id=%d\n"+
 				"BM25 length normalization should make the short body-hit "+
 				"outrank the long subject-hit. If this is no longer true, "+
-				"update docs/PG_STATUS.md item 11 to match the new behavior.",
+				"update the docs/PG_STATUS.md FTS rank ordering entry to match the new behavior.",
 			gotFirst, gotSecond, wantFirst, wantSecond,
 			subjectHitID, bodyHitID,
 		)
@@ -212,7 +213,7 @@ ORDER BY score DESC`
 				"ts_rank() called without a normalization flag must not apply "+
 				"document-length normalization, so setweight('A') on subject "+
 				"should beat default 'D' on body. If this is no longer true, "+
-				"update docs/PG_STATUS.md item 11 to match the new behavior.",
+				"update the docs/PG_STATUS.md FTS rank ordering entry to match the new behavior.",
 			order, scores,
 		)
 	}
