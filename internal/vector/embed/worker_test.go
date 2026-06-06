@@ -4,6 +4,7 @@ package embed
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -58,10 +59,7 @@ func TestWorker_SplitsChunkInputsAcrossSubBatches(t *testing.T) {
 	// MaxInputChars=80 with the worker's overlap heuristic. Any value
 	// well above BatchSize would do; 12 is comfortably enough to
 	// exercise multiple sub-batches.
-	var body string
-	for i := 0; i < 40; i++ {
-		body += "lorem ipsum dolor sit amet consectetur adipiscing elit. "
-	}
+	body := strings.Repeat("lorem ipsum dolor sit amet consectetur adipiscing elit. ", 40)
 	_, err := f.MainDB.Exec(`UPDATE message_bodies SET body_text = ? WHERE message_id = 1`, body)
 	require.NoError(err, "update body")
 
@@ -277,13 +275,10 @@ func TestWorker_FansOutLongMessageIntoMultipleChunks(t *testing.T) {
 	// Replace the seeded message's body with one long enough to need
 	// multiple chunks at MaxInputChars=200. Each "paragraph" is ~150
 	// chars; six paragraphs ≈ 900 chars → at least 4 chunks.
-	body := ""
-	for i := 0; i < 6; i++ {
-		body += "lorem ipsum dolor sit amet consectetur adipiscing elit. " +
-			"sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. " +
-			"ut enim ad minim veniam quis nostrud exercitation. " +
-			"\n\n"
-	}
+	body := strings.Repeat("lorem ipsum dolor sit amet consectetur adipiscing elit. "+
+		"sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. "+
+		"ut enim ad minim veniam quis nostrud exercitation. "+
+		"\n\n", 6)
 	_, err := f.MainDB.Exec(`UPDATE message_bodies SET body_text = ? WHERE message_id = 1`, body)
 	require.NoError(err, "update body")
 
@@ -750,8 +745,8 @@ func TestWorker_OrphanCompleteFailureDoesNotStrandValidWork(t *testing.T) {
 
 	res, err := w.RunOnce(ctx, f.BuildingGen)
 	require.Error(err, "want non-nil error (orphan drain failed and orphan remained stuck)")
-	assert.ErrorContains(err, "orphan-drain")
-	assert.ErrorContains(err, "ReclaimStale", "user knows recovery is automatic")
+	require.ErrorContains(err, "orphan-drain")
+	require.ErrorContains(err, "ReclaimStale", "user knows recovery is automatic")
 	assert.Equal(1, res.Succeeded, "the valid message must be counted as completed")
 	assert.NotZero(res.Failed, "orphan drain failure should be reported")
 	require.NotEmpty(reports, "expected progress for valid embedded row even though orphan drain failed")
@@ -929,7 +924,7 @@ func TestWorker_ProgressCalledPerSuccessfulBatch(t *testing.T) {
 		assert.Equalf(wantDone[i], p.Done, "report[%d].Done", i)
 		assert.Equalf(wantBatchMsgs[i], p.BatchMsgs, "report[%d].BatchMsgs", i)
 		assert.Equalf(5, p.TotalPending, "report[%d].TotalPending", i)
-		assert.Greaterf(p.BatchChars, 0, "report[%d].BatchChars (non-empty fixture bodies)", i)
+		assert.Positivef(p.BatchChars, "report[%d].BatchChars (non-empty fixture bodies)", i)
 		assert.GreaterOrEqualf(p.BatchElapsed, time.Duration(0), "report[%d].BatchElapsed", i)
 		assert.GreaterOrEqualf(p.RunElapsed, p.BatchElapsed,
 			"report[%d].RunElapsed=%s < BatchElapsed=%s", i, p.RunElapsed, p.BatchElapsed)
@@ -1056,7 +1051,7 @@ func TestWorker_DownshiftDrain_AllDrop_StillTripsCap(t *testing.T) {
 	})
 	_, err := w.RunOnce(context.Background(), f.BuildingGen)
 	requirepkg.Error(t, err, "expected abort error")
-	assertpkg.ErrorContains(t, err, "consecutive failures")
+	requirepkg.ErrorContains(t, err, "consecutive failures")
 	assertpkg.ErrorContains(t, err, "misconfigured", "expected original 4xx body in error")
 }
 
@@ -1093,8 +1088,8 @@ func TestWorker_DownshiftDrain_AllDropClean_NoSilentDelete(t *testing.T) {
 	res, err := w.RunOnce(context.Background(), f.BuildingGen)
 	requirepkg.Error(t, err, "expected cap-trip error on misconfigured endpoint")
 	assert.Equal(0, res.Succeeded, "no embeds during all-drop")
-	assert.ErrorContains(err, "consecutive failures", "expected cap-trip error")
-	assert.ErrorContains(err, "bad-api-key", "expected original 4xx body in error")
+	requirepkg.ErrorContains(t, err, "consecutive failures", "expected cap-trip error")
+	requirepkg.ErrorContains(t, err, "bad-api-key", "expected original 4xx body in error")
 	// Critical: rows must NOT have been silently deleted. They
 	// should still be in pending_embeddings (released back, not
 	// Completed) so a corrected config can re-claim them on the
@@ -1126,7 +1121,7 @@ func TestWorker_SingletonBatch_4xx_NoSilentDelete(t *testing.T) {
 	})
 	_, err := w.RunOnce(context.Background(), f.BuildingGen)
 	requirepkg.Error(t, err, "expected abort after cap")
-	assertpkg.ErrorContains(t, err, "consecutive failures")
+	requirepkg.ErrorContains(t, err, "consecutive failures")
 	assertPending(t, f.VectorsDB, int64(f.BuildingGen), 1)
 }
 
@@ -1173,7 +1168,7 @@ func TestWorker_DownshiftDrain_TransientErrorReleasesRemainingAndErrors(t *testi
 		}
 		singletonCalls++
 		if singletonCalls == 2 {
-			return nil, fmt.Errorf("temporary network failure")
+			return nil, errors.New("temporary network failure")
 		}
 		v := make([]float32, 4)
 		v[0] = 1

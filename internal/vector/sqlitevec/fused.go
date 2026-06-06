@@ -30,7 +30,7 @@ var _ vector.FusingBackend = (*Backend)(nil)
 // outer query can report whether the pool was full on either side.
 func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]vector.FusedHit, bool, error) {
 	if req.QueryVec == nil && req.FTSQuery == "" {
-		return nil, false, fmt.Errorf("FusedSearch: neither vector nor FTS query provided")
+		return nil, false, errors.New("FusedSearch: neither vector nor FTS query provided")
 	}
 
 	var dim int
@@ -246,10 +246,8 @@ SELECT message_id, rrf_score, bm25_score, vector_score,
 	sqlLimit := req.Limit
 	boostActive := req.SubjectBoost > 1.0 && len(req.SubjectTerms) > 0
 	if boostActive {
-		sqlLimit = 2 * req.KPerSignal
-		if sqlLimit < req.Limit {
-			sqlLimit = req.Limit // never under-fetch the requested page
-		}
+		// max() ensures we never under-fetch the requested page.
+		sqlLimit = max(2*req.KPerSignal, req.Limit)
 	}
 
 	// Filter-only named args feed both the chunk-ceiling pre-query
@@ -330,12 +328,17 @@ SELECT message_id, rrf_score, bm25_score, vector_score,
 		bm25PoolSize int
 		annPoolSize  int
 	)
-	for {
+	// runFusedQuery executes one widening iteration. It is a closure so
+	// that `defer rows.Close()` runs at the end of each iteration rather
+	// than accumulating until FusedSearch returns (the loop reuses a
+	// fresh *sql.Rows on every pass).
+	runFusedQuery := func() error {
 		query := buildQuery(chunkK)
 		rows, err := conn.QueryContext(ctx, query, args...)
 		if err != nil {
-			return nil, false, fmt.Errorf("fused query: %w", err)
+			return fmt.Errorf("fused query: %w", err)
 		}
+		defer func() { _ = rows.Close() }()
 
 		hits = hits[:0]
 		// bm25_pool_size and ann_pool_size are correlated subqueries
@@ -351,8 +354,7 @@ SELECT message_id, rrf_score, bm25_score, vector_score,
 			var bm, vec sql.NullFloat64
 			var bmPool, annPool int
 			if err := rows.Scan(&h.MessageID, &h.RRFScore, &bm, &vec, &bmPool, &annPool); err != nil {
-				_ = rows.Close()
-				return nil, false, fmt.Errorf("scan fused hit: %w", err)
+				return fmt.Errorf("scan fused hit: %w", err)
 			}
 			if !poolSizeRead {
 				bm25PoolSize = bmPool
@@ -370,10 +372,15 @@ SELECT message_id, rrf_score, bm25_score, vector_score,
 			hits = append(hits, h)
 		}
 		if err := rows.Err(); err != nil {
-			_ = rows.Close()
-			return nil, false, fmt.Errorf("iterate fused hits: %w", err)
+			return fmt.Errorf("iterate fused hits: %w", err)
 		}
-		_ = rows.Close()
+		return nil
+	}
+
+	for {
+		if err := runFusedQuery(); err != nil {
+			return nil, false, err
+		}
 
 		// Decide whether to widen. Only the ANN side benefits — the
 		// BM25 side is per-message-rowid and never collapses.
@@ -389,10 +396,7 @@ SELECT message_id, rrf_score, bm25_score, vector_score,
 			chunkK >= chunkCeiling {
 			break
 		}
-		next := chunkK * 2
-		if next > chunkCeiling {
-			next = chunkCeiling
-		}
+		next := min(chunkK*2, chunkCeiling)
 		if next == chunkK {
 			break
 		}
@@ -419,7 +423,7 @@ SELECT message_id, rrf_score, bm25_score, vector_score,
 // vectors.db ATTACHed under the alias "vec". Caller must Close it.
 func (b *Backend) openFusedConn(ctx context.Context) (*sql.DB, error) {
 	if b.mainPath == "" {
-		return nil, fmt.Errorf("FusedSearch requires MainPath in Options")
+		return nil, errors.New("FusedSearch requires MainPath in Options")
 	}
 	conn, err := sql.Open(DriverName(), b.mainPath)
 	if err != nil {
@@ -618,7 +622,7 @@ func (b *Backend) applySubjectBoost(ctx context.Context, hits []vector.FusedHit,
 // caller treats as "no subject to boost".
 func (b *Backend) batchGetSubjects(ctx context.Context, ids []int64) (map[int64]string, error) {
 	if len(ids) == 0 {
-		return nil, nil
+		return nil, nil //nolint:nilnil // empty input: no subjects to load and no error; callers range over the (nil) map
 	}
 	placeholders := make([]string, len(ids))
 	args := make([]any, len(ids))

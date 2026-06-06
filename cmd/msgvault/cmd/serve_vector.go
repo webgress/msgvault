@@ -5,6 +5,7 @@ package cmd
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -36,7 +37,7 @@ func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string) (
 	// generic backend-validation error. Vector support for PostgreSQL is
 	// tracked under PR4 (see docs/PG_STATUS.md).
 	if store.IsPostgresURL(mainPath) {
-		return nil, fmt.Errorf(
+		return nil, errors.New(
 			"vector features are SQLite-only; set [vector] enabled = false to use msgvault with PostgreSQL (vector support is planned for PR4)")
 	}
 	if err := cfg.Vector.Validate(); err != nil {
