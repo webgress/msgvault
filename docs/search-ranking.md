@@ -36,9 +36,9 @@ email.
 
 Ranking is `ts_rank()` over a `tsvector` column on `messages`. Fields
 are tagged with PostgreSQL's `setweight` labels (`A` for subject,
-`B` for sender, default `D` for body and other recipients), and
-ranking uses those weights with default normalization (`normalization
-= 0`, i.e. length is ignored). The relative weights are PostgreSQL's
+`B` for sender, default `D` for body and other recipients). Ranking
+uses `ts_rank`'s default normalization flag (`0`), which ignores
+document length. The relative weights are PostgreSQL's
 defaults — roughly `A=1.0`, `B=0.4`, `D=0.1` — the same 10:4:1 ratio
 the SQLite column weights mirror.
 

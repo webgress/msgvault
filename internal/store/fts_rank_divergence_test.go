@@ -112,7 +112,7 @@ func assertSQLiteBodyHitWins(t *testing.T) {
 
 	// Filler docs so avgdl reflects a realistic corpus rather than two
 	// extreme outliers.
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		mk(
 			"adv-filler-"+string(rune('a'+i)),
 			"filler subject "+string(rune('a'+i)),
