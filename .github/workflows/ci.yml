@@ -76,7 +76,11 @@ jobs:
           name: msgvault-windows-amd64
           path: msgvault.exe
 
-  test-postgres:
+  # pgvector backend lane: runs the pgvector-tagged backend tests against
+  # a live pgvector/pgvector image. The `pgvector` build tag is required —
+  # without it the package compiles only ext_stub.go and ships no tests,
+  # so the real backend would otherwise have zero CI coverage.
+  test-pgvector:
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -112,8 +116,8 @@ jobs:
         run: |
           psql -h localhost -U msgvault_test -d msgvault_test -c "CREATE EXTENSION IF NOT EXISTS vector"
 
-      - name: Test
-        run: make test
+      - name: Test (pgvector backend)
+        run: go test -tags "fts5 sqlite_vec pgvector" ./internal/vector/pgvector/...
 
   nix-build:
     runs-on: ubuntu-latest

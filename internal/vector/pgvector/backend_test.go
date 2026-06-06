@@ -433,3 +433,133 @@ func TestBackend_Stats_UnknownGeneration(t *testing.T) {
 		t.Errorf("err=%v, want wrapping ErrUnknownGeneration", err)
 	}
 }
+
+// TestBackend_Upsert_MultiChunk_StoresAllChunks verifies a message that
+// produces multiple chunks persists one row per chunk (not just the last,
+// which the prior (generation_id, message_id) primary key collapsed to)
+// while message_count and Stats.EmbeddingCount stay message-scoped.
+func TestBackend_Upsert_MultiChunk_StoresAllChunks(t *testing.T) {
+	b, ctx, _ := newBackendForTest(t)
+	gen, err := b.CreateGeneration(ctx, "m", 4, "")
+	if err != nil {
+		t.Fatalf("CreateGeneration: %v", err)
+	}
+	if err := b.Upsert(ctx, gen, []vector.Chunk{
+		{MessageID: 1, ChunkIndex: 0, Vector: unitVec(4, 0)},
+		{MessageID: 1, ChunkIndex: 1, Vector: unitVec(4, 1)},
+	}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	var rows int
+	if err := b.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM embeddings WHERE generation_id = $1 AND message_id = 1`,
+		int64(gen)).Scan(&rows); err != nil {
+		t.Fatalf("count chunk rows: %v", err)
+	}
+	if rows != 2 {
+		t.Errorf("chunk rows = %d, want 2 (both chunks must be stored)", rows)
+	}
+
+	var msgCount int64
+	if err := b.db.QueryRowContext(ctx,
+		`SELECT message_count FROM index_generations WHERE id = $1`, int64(gen)).Scan(&msgCount); err != nil {
+		t.Fatalf("message_count: %v", err)
+	}
+	if msgCount != 1 {
+		t.Errorf("message_count = %d, want 1 (chunks of one message count once)", msgCount)
+	}
+
+	s, err := b.Stats(ctx, gen)
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if s.EmbeddingCount != 1 {
+		t.Errorf("Stats.EmbeddingCount = %d, want 1 (distinct messages, not chunks)", s.EmbeddingCount)
+	}
+	if s.StorageBytes <= 0 {
+		t.Errorf("Stats.StorageBytes = %d, want > 0", s.StorageBytes)
+	}
+}
+
+// TestBackend_Upsert_MultiChunk_ReplaceShrinks confirms re-upserting a
+// message with fewer chunks removes the orphaned tail chunks rather than
+// leaving them behind (chunk counts are not stable across re-embeds).
+func TestBackend_Upsert_MultiChunk_ReplaceShrinks(t *testing.T) {
+	b, ctx, _ := newBackendForTest(t)
+	gen, err := b.CreateGeneration(ctx, "m", 4, "")
+	if err != nil {
+		t.Fatalf("CreateGeneration: %v", err)
+	}
+	if err := b.Upsert(ctx, gen, []vector.Chunk{
+		{MessageID: 1, ChunkIndex: 0, Vector: unitVec(4, 0)},
+		{MessageID: 1, ChunkIndex: 1, Vector: unitVec(4, 1)},
+		{MessageID: 1, ChunkIndex: 2, Vector: unitVec(4, 2)},
+	}); err != nil {
+		t.Fatalf("first Upsert: %v", err)
+	}
+	if err := b.Upsert(ctx, gen, []vector.Chunk{
+		{MessageID: 1, ChunkIndex: 0, Vector: unitVec(4, 3)},
+	}); err != nil {
+		t.Fatalf("second Upsert: %v", err)
+	}
+	var rows int
+	if err := b.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM embeddings WHERE generation_id = $1 AND message_id = 1`,
+		int64(gen)).Scan(&rows); err != nil {
+		t.Fatalf("count chunk rows: %v", err)
+	}
+	if rows != 1 {
+		t.Errorf("chunk rows after shrink = %d, want 1 (orphan tail chunks must be removed)", rows)
+	}
+	var msgCount int64
+	if err := b.db.QueryRowContext(ctx,
+		`SELECT message_count FROM index_generations WHERE id = $1`, int64(gen)).Scan(&msgCount); err != nil {
+		t.Fatalf("message_count: %v", err)
+	}
+	if msgCount != 1 {
+		t.Errorf("message_count = %d, want 1", msgCount)
+	}
+}
+
+// TestBackend_Search_MultiChunk_OneHitPerMessage verifies Search returns
+// at most one Hit per message (the best-scoring chunk) when a message has
+// multiple chunks, so one message's chunks cannot crowd out other
+// messages in the top-k.
+func TestBackend_Search_MultiChunk_OneHitPerMessage(t *testing.T) {
+	b, ctx, db := newBackendForTest(t)
+	if _, err := db.ExecContext(ctx, `INSERT INTO messages (id) VALUES (2)`); err != nil {
+		t.Fatalf("seed message 2: %v", err)
+	}
+	gen, err := b.CreateGeneration(ctx, "m", 4, "")
+	if err != nil {
+		t.Fatalf("CreateGeneration: %v", err)
+	}
+	// msg 1 has two chunks (axes 0 and 3); msg 2 has one (axis 1).
+	if err := b.Upsert(ctx, gen, []vector.Chunk{
+		{MessageID: 1, ChunkIndex: 0, Vector: unitVec(4, 0)},
+		{MessageID: 1, ChunkIndex: 1, Vector: unitVec(4, 3)},
+		{MessageID: 2, ChunkIndex: 0, Vector: unitVec(4, 1)},
+	}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	hits, err := b.Search(ctx, gen, unitVec(4, 0), 10, vector.Filter{})
+	if err != nil {
+		t.Fatalf("Search: %v", err)
+	}
+	if len(hits) != 2 {
+		t.Fatalf("len(hits) = %d, want 2 (one per message)", len(hits))
+	}
+	seen := map[int64]int{}
+	for _, h := range hits {
+		seen[h.MessageID]++
+	}
+	for id, n := range seen {
+		if n != 1 {
+			t.Errorf("message %d returned %d times, want exactly 1", id, n)
+		}
+	}
+	if hits[0].MessageID != 1 {
+		t.Errorf("top hit = %d, want 1 (best chunk lies on the query axis)", hits[0].MessageID)
+	}
+}

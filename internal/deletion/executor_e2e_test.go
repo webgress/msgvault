@@ -2,7 +2,6 @@ package deletion
 
 import (
 	"context"
-	"fmt"
 	"testing"
 
 	"go.kenn.io/msgvault/internal/gmail"
@@ -114,10 +113,10 @@ func (f *e2eFixture) upsertAttachment(gmailID, filename, storagePath, contentHas
 func (f *e2eFixture) countLive(sourceID int64) int {
 	f.t.Helper()
 	var n int
-	err := f.store.DB().QueryRow(f.store.Rebind(fmt.Sprintf(
-		`SELECT COUNT(*) FROM messages WHERE source_id = ? AND %s`,
-		store.LiveMessagesWhere("", true),
-	)), sourceID).Scan(&n)
+	err := f.store.DB().QueryRow(f.store.Rebind(
+		`SELECT COUNT(*) FROM messages WHERE source_id = ? AND `+
+			store.LiveMessagesWhere("", true),
+	), sourceID).Scan(&n)
 	if err != nil {
 		f.t.Fatalf("countLive(%d): %v", sourceID, err)
 	}
@@ -316,6 +315,7 @@ func TestExecutor_E2E_PermanentDeletePreservesOtherSourceAttachmentFile(t *testi
 // e2eContext bridges the e2eFixture to the executor test plumbing.
 type e2eContext struct {
 	*TestContext
+
 	fix *e2eFixture
 }
 

@@ -368,45 +368,68 @@ func (b *Backend) Upsert(ctx context.Context, gen vector.GenerationID, chunks []
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	chunkIDs := make([]int64, len(chunks))
-	for i, c := range chunks {
-		chunkIDs[i] = c.MessageID
-	}
-	preexisting, err := countExistingEmbeddingsTx(ctx, tx, gen, chunkIDs)
+	// message_count tracks distinct messages, not chunks. Count how many
+	// of the batch's message_ids already have any row in the generation
+	// so we can apply an O(1) delta after the replace below.
+	distinctIDs := distinctMessageIDs(chunks)
+	preexisting, err := countExistingMessagesTx(ctx, tx, gen, distinctIDs)
 	if err != nil {
 		return err
+	}
+
+	// Idempotency: clear any prior chunks for the message_ids we're about
+	// to (re)write before inserting the new chunk set. Chunking is not
+	// stable across upserts — the same message may have produced 3 chunks
+	// last time and 2 this time — so a plain per-chunk upsert would leave
+	// orphaned tail chunks behind. Mirrors sqlitevec's replace semantics.
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM embeddings
+		  WHERE generation_id = $1 AND message_id = ANY($2::bigint[])`,
+		int64(gen), int64Array(distinctIDs)); err != nil {
+		return fmt.Errorf("clear prior chunks: %w", err)
 	}
 
 	now := time.Now().Unix()
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO embeddings
-		  (generation_id, message_id, embedded_at, source_char_len, truncated, dimension, embedding)
-		VALUES ($1, $2, $3, $4, $5, $6, $7::vector)
-		ON CONFLICT (generation_id, message_id) DO UPDATE
-		   SET embedded_at     = EXCLUDED.embedded_at,
-		       source_char_len = EXCLUDED.source_char_len,
-		       truncated       = EXCLUDED.truncated,
-		       dimension       = EXCLUDED.dimension,
-		       embedding       = EXCLUDED.embedding`)
+		  (generation_id, message_id, chunk_index, embedded_at, source_char_len,
+		   chunk_char_start, chunk_char_end, truncated, dimension, embedding)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::vector)`)
 	if err != nil {
-		return fmt.Errorf("prepare embeddings upsert: %w", err)
+		return fmt.Errorf("prepare embeddings insert: %w", err)
 	}
 	defer func() { _ = stmt.Close() }()
 
 	for _, c := range chunks {
 		if _, err := stmt.ExecContext(ctx,
-			int64(gen), c.MessageID, now, c.SourceCharLen, c.Truncated, dim,
+			int64(gen), c.MessageID, c.ChunkIndex, now, c.SourceCharLen,
+			c.ChunkCharStart, c.ChunkCharEnd, c.Truncated, dim,
 			vectorLiteral(c.Vector),
 		); err != nil {
-			return fmt.Errorf("upsert embedding for msg %d: %w", c.MessageID, err)
+			return fmt.Errorf("insert embedding for msg %d chunk %d: %w", c.MessageID, c.ChunkIndex, err)
 		}
 	}
 
-	delta := len(chunks) - preexisting
+	delta := len(distinctIDs) - preexisting
 	if err := applyMessageCountDeltaTx(ctx, tx, gen, delta); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+// distinctMessageIDs returns the unique message_ids referenced by chunks,
+// preserving first-seen order. Mirrors the sqlitevec helper.
+func distinctMessageIDs(chunks []vector.Chunk) []int64 {
+	seen := make(map[int64]struct{}, len(chunks))
+	out := make([]int64, 0, len(chunks))
+	for _, c := range chunks {
+		if _, ok := seen[c.MessageID]; ok {
+			continue
+		}
+		seen[c.MessageID] = struct{}{}
+		out = append(out, c.MessageID)
+	}
+	return out
 }
 
 func applyMessageCountDeltaTx(ctx context.Context, tx *sql.Tx, gen vector.GenerationID, delta int) error {
@@ -421,17 +444,21 @@ func applyMessageCountDeltaTx(ctx context.Context, tx *sql.Tx, gen vector.Genera
 	return nil
 }
 
-func countExistingEmbeddingsTx(ctx context.Context, tx *sql.Tx, gen vector.GenerationID, ids []int64) (int, error) {
+// countExistingMessagesTx returns how many of the given message_ids
+// already have at least one embedding row in the generation. Counts
+// DISTINCT messages (not chunk rows) so message_count deltas stay
+// message-scoped even when a message spans multiple chunks.
+func countExistingMessagesTx(ctx context.Context, tx *sql.Tx, gen vector.GenerationID, ids []int64) (int, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
 	var n int
 	err := tx.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM embeddings
+		`SELECT COUNT(DISTINCT message_id) FROM embeddings
 		  WHERE generation_id = $1 AND message_id = ANY($2::bigint[])`,
 		int64(gen), int64Array(ids)).Scan(&n)
 	if err != nil {
-		return 0, fmt.Errorf("count existing embeddings: %w", err)
+		return 0, fmt.Errorf("count existing messages: %w", err)
 	}
 	return n, nil
 }
@@ -508,10 +535,14 @@ func (b *Backend) LoadVector(ctx context.Context, messageID int64) ([]float32, e
 	if err != nil {
 		return nil, err
 	}
+	// Return the chunk_index = 0 vector — the head of the message, which
+	// always exists for any embedded message regardless of how many
+	// additional chunks it has. find_similar (the only LoadVector caller
+	// today) treats embeddings as message-level. Mirrors sqlitevec.
 	var lit string
 	err = b.db.QueryRowContext(ctx,
 		`SELECT embedding::text FROM embeddings
-		  WHERE generation_id = $1 AND message_id = $2`,
+		  WHERE generation_id = $1 AND message_id = $2 AND chunk_index = 0`,
 		int64(active.ID), messageID).Scan(&lit)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("no embedding for message %d in generation %d", messageID, active.ID)
@@ -554,17 +585,23 @@ func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec 
 	if filter.IsEmpty() {
 		// Fast path: ANN order with an inline live-message check via
 		// EXISTS to skip soft-deleted rows without dragging the whole
-		// recipients/labels machinery in.
+		// recipients/labels machinery in. GROUP BY message_id with
+		// MIN(distance) keeps the best-scoring chunk per message and
+		// discards the rest, so a multi-chunk message yields exactly one
+		// Hit (the Backend contract). Grouping precludes the per-row HNSW
+		// ordering; acceptable for this not-yet-tuned path, and the
+		// filtered path below already scans rather than indexes.
 		stmt := fmt.Sprintf(`
 			SELECT e.message_id,
-			       (e.embedding::vector(%d)) <=> $1::vector AS distance
+			       MIN((e.embedding::vector(%d)) <=> $1::vector) AS distance
 			  FROM embeddings e
 			 WHERE e.generation_id = $2
 			   AND EXISTS (
 			        SELECT 1 FROM messages m
 			         WHERE m.id = e.message_id AND %s)
-			 ORDER BY (e.embedding::vector(%d)) <=> $1::vector
-			 LIMIT $3`, dim, store.LiveMessagesWhere("m", true), dim)
+			 GROUP BY e.message_id
+			 ORDER BY distance
+			 LIMIT $3`, dim, store.LiveMessagesWhere("m", true))
 		return b.scanHits(ctx, stmt, queryVecLit, int64(gen), k)
 	}
 
@@ -577,12 +614,13 @@ func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec 
 	}
 	stmt := fmt.Sprintf(`
 		SELECT e.message_id,
-		       (e.embedding::vector(%d)) <=> $1::vector AS distance
+		       MIN((e.embedding::vector(%d)) <=> $1::vector) AS distance
 		  FROM embeddings e
 		 WHERE e.generation_id = $2
 		   AND e.message_id = ANY($3::bigint[])
-		 ORDER BY (e.embedding::vector(%d)) <=> $1::vector
-		 LIMIT $4`, dim, dim)
+		 GROUP BY e.message_id
+		 ORDER BY distance
+		 LIMIT $4`, dim)
 	return b.scanHits(ctx, stmt, queryVecLit, int64(gen), int64Array(ids), k)
 }
 
@@ -677,8 +715,11 @@ func (b *Backend) filteredMessageIDs(ctx context.Context, f vector.Filter) ([]in
 		clauses = append(clauses, fmt.Sprintf("m.size_estimate < %s", bind(*f.SmallerThan)))
 	}
 	for _, term := range f.SubjectSubstrings {
+		// Case-insensitive to match SQLite's default ASCII-insensitive
+		// LIKE and the store/query PostgreSQL search path. LOWER on both
+		// sides keeps ESCAPE semantics intact (escape chars are ASCII).
 		clauses = append(clauses, fmt.Sprintf(
-			`m.subject LIKE %s ESCAPE '\'`,
+			`LOWER(m.subject) LIKE LOWER(%s) ESCAPE '\'`,
 			bind("%"+escapeLikeSubject(term)+"%")))
 	}
 	for _, ids := range f.LabelGroups {
@@ -744,7 +785,7 @@ func (b *Backend) Delete(ctx context.Context, gen vector.GenerationID, messageID
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	willDelete, err := countExistingEmbeddingsTx(ctx, tx, gen, messageIDs)
+	willDelete, err := countExistingMessagesTx(ctx, tx, gen, messageIDs)
 	if err != nil {
 		return err
 	}
@@ -764,10 +805,10 @@ func (b *Backend) Delete(ctx context.Context, gen vector.GenerationID, messageID
 }
 
 // Stats returns counts for the given generation. When gen == 0,
-// counts are aggregated across all generations. StorageBytes is
-// reported by the underlying database (pg_relation_size of the
-// embeddings table) — a single value across generations, which the
-// caller can interpret with that caveat.
+// counts are aggregated across all generations. StorageBytes is the
+// total size of the embeddings table (pg_total_relation_size) — a
+// single table-wide value across generations, which the caller can
+// interpret with that caveat.
 func (b *Backend) Stats(ctx context.Context, gen vector.GenerationID) (vector.Stats, error) {
 	var s vector.Stats
 	where := "WHERE generation_id = $1"
@@ -786,13 +827,31 @@ func (b *Backend) Stats(ctx context.Context, gen vector.GenerationID) (vector.St
 		}
 	}
 
-	if err := b.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM embeddings `+where, args...).Scan(&s.EmbeddingCount); err != nil {
+	// EmbeddingCount is distinct messages, not chunk rows — a long message
+	// occupies multiple rows but counts as one embedded message, matching
+	// the sqlitevec semantics the progress/summary code relies on. The
+	// aggregate path (gen == 0) counts DISTINCT (generation_id, message_id)
+	// so a message embedded in two generations counts as two units of work.
+	embeddingCountSQL := `SELECT COUNT(DISTINCT message_id) FROM embeddings ` + where
+	if gen == 0 {
+		embeddingCountSQL = `SELECT COUNT(*) FROM (SELECT DISTINCT generation_id, message_id FROM embeddings) s`
+	}
+	if err := b.db.QueryRowContext(ctx, embeddingCountSQL, args...).Scan(&s.EmbeddingCount); err != nil {
 		return s, fmt.Errorf("count embeddings: %w", err)
 	}
 	if err := b.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM pending_embeddings `+where, args...).Scan(&s.PendingCount); err != nil {
 		return s, fmt.Errorf("count pending: %w", err)
+	}
+	// StorageBytes: total on-disk size of the embeddings table (heap +
+	// indexes + TOAST), table-wide rather than per-generation. Unlike
+	// sqlitevec (whose caller derives size from the vectors.db file),
+	// pgvector embeddings share the main database, so the backend is the
+	// only place that can report this. to_regclass guards a not-yet-
+	// migrated table so Stats never errors.
+	if err := b.db.QueryRowContext(ctx,
+		`SELECT COALESCE(pg_total_relation_size(to_regclass('embeddings')), 0)`).Scan(&s.StorageBytes); err != nil {
+		return s, fmt.Errorf("embeddings storage size: %w", err)
 	}
 	return s, nil
 }
