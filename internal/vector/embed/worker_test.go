@@ -445,7 +445,7 @@ func TestWorker_ReclaimStale_FromStartup(t *testing.T) {
 	})
 
 	// Simulate a crashed worker: claim 2 rows, then back-date the claim.
-	q := NewQueue(f.VectorsDB)
+	q := NewQueue(f.VectorsDB, nil)
 	ids, _, err := q.Claim(ctx, f.BuildingGen, 2)
 	require.NoError(err, "Claim setup")
 	require.Len(ids, 2)
