@@ -74,11 +74,14 @@ func (b *Backend) DB() *sql.DB { return b.db }
 // with the same fingerprint already exists, returns its id so a crashed
 // rebuild can resume; a mismatched fingerprint surfaces
 // vector.ErrBuildingInProgress.
-func (b *Backend) CreateGeneration(ctx context.Context, model string, dim int) (vector.GenerationID, error) {
+func (b *Backend) CreateGeneration(ctx context.Context, model string, dim int, fingerprint string) (vector.GenerationID, error) {
 	if err := EnsureVectorIndex(ctx, b.db, dim); err != nil {
 		return 0, err
 	}
-	fp := fmt.Sprintf("%s:%d", model, dim)
+	fp := fingerprint
+	if fp == "" {
+		fp = fmt.Sprintf("%s:%d", model, dim)
+	}
 	now := time.Now().Unix()
 
 	gen, isNew, err := b.claimOrInsertBuilding(ctx, model, dim, fp, now)

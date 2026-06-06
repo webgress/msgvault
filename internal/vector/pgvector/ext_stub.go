@@ -43,7 +43,7 @@ func (b *Backend) Close() error { return nil }
 // DB returns nil for the stub.
 func (b *Backend) DB() *sql.DB { return nil }
 
-func (b *Backend) CreateGeneration(_ context.Context, _ string, _ int) (vector.GenerationID, error) {
+func (b *Backend) CreateGeneration(_ context.Context, _ string, _ int, _ string) (vector.GenerationID, error) {
 	return 0, ErrNotBuilt
 }
 func (b *Backend) ActivateGeneration(_ context.Context, _ vector.GenerationID) error {

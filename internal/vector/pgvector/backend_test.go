@@ -17,7 +17,7 @@ import (
 func TestBackend_CreateActivateRetire(t *testing.T) {
 	b, ctx, _ := newBackendForTest(t)
 
-	gid, err := b.CreateGeneration(ctx, "nomic-embed-text-v1.5", 768)
+	gid, err := b.CreateGeneration(ctx, "nomic-embed-text-v1.5", 768, "")
 	if err != nil {
 		t.Fatalf("CreateGeneration: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestBackend_CreateActivateRetire(t *testing.T) {
 // pass populates pending_embeddings with one row per live message.
 func TestBackend_CreateGeneration_SeedsPending(t *testing.T) {
 	b, ctx, _ := newBackendForTest(t)
-	gid, err := b.CreateGeneration(ctx, "m", 768)
+	gid, err := b.CreateGeneration(ctx, "m", 768, "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestBackend_CreateGeneration_SkipsDeleted(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = b.Close() })
 
-	gid, err := b.CreateGeneration(ctx, "m", 768)
+	gid, err := b.CreateGeneration(ctx, "m", 768, "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -108,11 +108,11 @@ func TestBackend_CreateGeneration_SkipsDeleted(t *testing.T) {
 func TestBackend_CreateGeneration_ResumesBuilding(t *testing.T) {
 	b, ctx, _ := newBackendForTest(t)
 
-	first, err := b.CreateGeneration(ctx, "m", 768)
+	first, err := b.CreateGeneration(ctx, "m", 768, "")
 	if err != nil {
 		t.Fatalf("first Create: %v", err)
 	}
-	second, err := b.CreateGeneration(ctx, "m", 768)
+	second, err := b.CreateGeneration(ctx, "m", 768, "")
 	if err != nil {
 		t.Fatalf("second Create: %v", err)
 	}
@@ -127,10 +127,10 @@ func TestBackend_CreateGeneration_ResumesBuilding(t *testing.T) {
 func TestBackend_CreateGeneration_MismatchedFingerprint(t *testing.T) {
 	b, ctx, _ := newBackendForTest(t)
 
-	if _, err := b.CreateGeneration(ctx, "model-a", 768); err != nil {
+	if _, err := b.CreateGeneration(ctx, "model-a", 768, ""); err != nil {
 		t.Fatalf("first Create: %v", err)
 	}
-	_, err := b.CreateGeneration(ctx, "model-b", 768)
+	_, err := b.CreateGeneration(ctx, "model-b", 768, "")
 	if err == nil {
 		t.Fatal("second Create with different fingerprint: want error, got nil")
 	}
@@ -145,7 +145,7 @@ func TestBackend_CreateGeneration_MismatchedFingerprint(t *testing.T) {
 func TestBackend_CreateGeneration_ResumeReseedsUnseededGeneration(t *testing.T) {
 	b, ctx, _ := newBackendForTest(t)
 
-	gen, err := b.CreateGeneration(ctx, "m", 768)
+	gen, err := b.CreateGeneration(ctx, "m", 768, "")
 	if err != nil {
 		t.Fatalf("first Create: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestBackend_CreateGeneration_ResumeReseedsUnseededGeneration(t *testing.T) 
 		`DELETE FROM pending_embeddings WHERE generation_id = $1`, int64(gen)); err != nil {
 		t.Fatalf("clear pending: %v", err)
 	}
-	resumed, err := b.CreateGeneration(ctx, "m", 768)
+	resumed, err := b.CreateGeneration(ctx, "m", 768, "")
 	if err != nil {
 		t.Fatalf("resume Create: %v", err)
 	}
@@ -187,7 +187,7 @@ func TestBackend_CreateGeneration_ResumeReseedsUnseededGeneration(t *testing.T) 
 // asserts the seeded_at stamp persists across calls.
 func TestBackend_EnsureSeeded_Idempotent(t *testing.T) {
 	b, ctx, _ := newBackendForTest(t)
-	gen, err := b.CreateGeneration(ctx, "m", 768)
+	gen, err := b.CreateGeneration(ctx, "m", 768, "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestBackend_EnsureSeeded_Idempotent(t *testing.T) {
 // that prevents re-seeding a non-building generation.
 func TestBackend_EnsureSeeded_RejectsActiveGeneration(t *testing.T) {
 	b, ctx, _ := newBackendForTest(t)
-	gen, err := b.CreateGeneration(ctx, "m", 768)
+	gen, err := b.CreateGeneration(ctx, "m", 768, "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
@@ -220,7 +220,7 @@ func TestBackend_EnsureSeeded_RejectsActiveGeneration(t *testing.T) {
 // dimension check fires before any row is written.
 func TestBackend_Upsert_RejectsDimensionMismatch(t *testing.T) {
 	b, ctx, _ := newBackendForTest(t)
-	gen, err := b.CreateGeneration(ctx, "m", 4)
+	gen, err := b.CreateGeneration(ctx, "m", 4, "")
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}

@@ -178,7 +178,7 @@ func seedAndEmbed(t *testing.T, b *Backend, db *sql.DB, vecs map[int64][]float32
 		}
 	}
 
-	gid, err := b.CreateGeneration(ctx, "m", expectedDim)
+	gid, err := b.CreateGeneration(ctx, "m", expectedDim, "")
 	if err != nil {
 		t.Fatalf("CreateGeneration: %v", err)
 	}
