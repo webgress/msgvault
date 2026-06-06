@@ -42,6 +42,14 @@ type EmbedJob struct {
 	// case the daemon will not auto-activate building generations.
 	VectorsDB *sql.DB
 
+	// Rebind translates ?-placeholders to the driver's native form for
+	// queries this job issues directly against VectorsDB (pendingCount).
+	// nil is treated as the identity (used by SQLite); the PostgreSQL
+	// serve path must wire in (&store.PostgreSQLDialect{}).Rebind so the
+	// activation-gate count runs on pgx — a bare ? is rejected by the
+	// pgx driver.
+	Rebind func(string) string
+
 	// Fingerprint is the configured generation fingerprint (typically
 	// vector.Config.GenerationFingerprint() — "model:dim:preprocess").
 	// When set, a building OR active generation whose fingerprint
@@ -222,9 +230,13 @@ func (j *EmbedJob) pickTarget(ctx context.Context, log *slog.Logger) (vector.Gen
 // pendingCount returns the number of pending_embeddings rows for gen.
 // Used by the activation gate.
 func (j *EmbedJob) pendingCount(ctx context.Context, gen vector.GenerationID) (int, error) {
+	rebind := j.Rebind
+	if rebind == nil {
+		rebind = func(q string) string { return q }
+	}
 	var n int
 	if err := j.VectorsDB.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM pending_embeddings WHERE generation_id = ?`, int64(gen)).Scan(&n); err != nil {
+		rebind(`SELECT COUNT(*) FROM pending_embeddings WHERE generation_id = ?`), int64(gen)).Scan(&n); err != nil {
 		return 0, err
 	}
 	return n, nil

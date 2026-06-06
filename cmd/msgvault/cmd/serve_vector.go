@@ -5,10 +5,8 @@ package cmd
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"path/filepath"
-	"strings"
 
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
@@ -30,18 +28,18 @@ func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string) (
 	if !cfg.Vector.Enabled {
 		return nil, nil //nolint:nilnil // vector disabled: callers nil-check vf; (nil, nil) means "no features, no error"
 	}
-	// The vector backend uses the sqlite-vec extension and `ATTACH
-	// DATABASE` to fuse vectors.db onto the main store — both
-	// SQLite-only. Refuse up-front on a PG DSN, BEFORE cfg.Vector.Validate(),
-	// so the user gets the actionable SQLite-only message rather than a
-	// generic backend-validation error. Vector support for PostgreSQL is
-	// tracked under PR4 (see docs/PG_STATUS.md).
-	if store.IsPostgresURL(mainPath) {
-		return nil, errors.New(
-			"vector features are SQLite-only; set [vector] enabled = false to use msgvault with PostgreSQL (vector support is planned for PR4)")
-	}
 	if err := cfg.Vector.Validate(); err != nil {
 		return nil, fmt.Errorf("vector config: %w", err)
+	}
+
+	// Resolve the dialect once from the main DSN. The queue, worker, and
+	// enqueuer are dialect-portable via Rebind / InsertOrIgnore, so the
+	// serve daemon and MCP run vector features on PostgreSQL the same way
+	// `msgvault embed` does. SQLite's Rebind / InsertOrIgnore are identity
+	// so the SQLite path is unchanged.
+	var dialect store.Dialect = &store.SQLiteDialect{}
+	if store.IsPostgresURL(mainPath) {
+		dialect = &store.PostgreSQLDialect{}
 	}
 
 	var (
@@ -49,7 +47,7 @@ func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string) (
 		vectorsDB *sql.DB
 		closeFn   func() error
 	)
-	if isPostgresDSN(mainPath) {
+	if store.IsPostgresURL(mainPath) {
 		// Same database handle as the main store: pgvector embeddings
 		// live alongside messages, so there is no separate vectors.db.
 		pgb, err := pgvector.Open(ctx, pgvector.Options{
@@ -110,7 +108,10 @@ func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string) (
 		BatchSize:       cfg.Vector.Embeddings.BatchSize,
 		EmbedTimeout:    cfg.Vector.Embeddings.Timeout,
 		EmbedMaxRetries: cfg.Vector.Embeddings.MaxRetries,
-		Log:             logger,
+		// Rebind makes the worker's queue + body-fetch SQL run on pgx.
+		// SQLiteDialect.Rebind is identity, so the SQLite path is unchanged.
+		Rebind: dialect.Rebind,
+		Log:    logger,
 	})
 
 	engine := hybrid.NewEngine(backend, mainDB, client, hybrid.Config{
@@ -120,7 +121,10 @@ func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string) (
 		SubjectBoost:        cfg.Vector.Search.SubjectBoost,
 	})
 
-	enqueuer := embed.NewEnqueuer(vectorsDB)
+	// The enqueuer drives sync-time enqueueing into pending_embeddings.
+	// On PG it must run on pgx (rebind ? → $N) and use ON CONFLICT DO
+	// NOTHING (insertOrIgnore) instead of SQLite's INSERT OR IGNORE.
+	enqueuer := embed.NewEnqueuer(vectorsDB, dialect.Rebind, dialect.InsertOrIgnore)
 
 	return &vectorFeatures{
 		Backend:      backend,
@@ -129,15 +133,7 @@ func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string) (
 		Worker:       worker,
 		Cfg:          cfg.Vector,
 		VectorsDB:    vectorsDB,
+		Rebind:       dialect.Rebind,
 		Close:        closeFn,
 	}, nil
-}
-
-// isPostgresDSN returns true when dsn looks like a PostgreSQL
-// connection string. The serve path receives the dsn used to open the
-// main store; we re-detect it here rather than threading a *store.Store
-// through this layer because it's the cleanest seam — the main DB
-// handle is already opened by the caller.
-func isPostgresDSN(dsn string) bool {
-	return strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://")
 }
