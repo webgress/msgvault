@@ -563,3 +563,58 @@ func TestBackend_Search_MultiChunk_OneHitPerMessage(t *testing.T) {
 		t.Errorf("top hit = %d, want 1 (best chunk lies on the query axis)", hits[0].MessageID)
 	}
 }
+
+// TestBackend_Search_SubjectFilter_CaseInsensitive protects the
+// case-insensitive subject filter: PostgreSQL LIKE is case-sensitive, so
+// the backend lowercases both sides. A lowercase query term must match a
+// mixed-case subject (a regression to plain LIKE would return nothing),
+// and LIKE wildcards in the term must be matched literally (escaped).
+func TestBackend_Search_SubjectFilter_CaseInsensitive(t *testing.T) {
+	b, ctx, db := newBackendForTest(t)
+	if _, err := db.ExecContext(ctx, `INSERT INTO messages (id) VALUES (2), (3)`); err != nil {
+		t.Fatalf("seed messages: %v", err)
+	}
+	subjects := map[int64]string{
+		1: "Quarterly Invoice", // mixed case — exercises case-insensitivity
+		2: "Team lunch",        // unrelated
+		3: "50% discount code", // literal % — exercises wildcard escaping
+	}
+	for id, subj := range subjects {
+		if _, err := db.ExecContext(ctx,
+			`UPDATE messages SET subject = $1 WHERE id = $2`, subj, id); err != nil {
+			t.Fatalf("set subject %d: %v", id, err)
+		}
+	}
+	gen, err := b.CreateGeneration(ctx, "m", 4, "")
+	if err != nil {
+		t.Fatalf("CreateGeneration: %v", err)
+	}
+	if err := b.Upsert(ctx, gen, []vector.Chunk{
+		{MessageID: 1, ChunkIndex: 0, Vector: unitVec(4, 0)},
+		{MessageID: 2, ChunkIndex: 0, Vector: unitVec(4, 1)},
+		{MessageID: 3, ChunkIndex: 0, Vector: unitVec(4, 2)},
+	}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	// Lowercase term must match the mixed-case "Quarterly Invoice".
+	hits, err := b.Search(ctx, gen, unitVec(4, 0), 10,
+		vector.Filter{SubjectSubstrings: []string{"invoice"}})
+	if err != nil {
+		t.Fatalf("Search(invoice): %v", err)
+	}
+	if len(hits) != 1 || hits[0].MessageID != 1 {
+		t.Errorf("case-insensitive subject filter hits = %+v, want exactly [msg 1]", hits)
+	}
+
+	// A LIKE wildcard in the term is matched literally: "50%" matches the
+	// literal "50% discount code" (msg 3) and nothing else.
+	hits, err = b.Search(ctx, gen, unitVec(4, 2), 10,
+		vector.Filter{SubjectSubstrings: []string{"50%"}})
+	if err != nil {
+		t.Fatalf("Search(50%%): %v", err)
+	}
+	if len(hits) != 1 || hits[0].MessageID != 3 {
+		t.Errorf("escaped-wildcard subject filter hits = %+v, want exactly [msg 3]", hits)
+	}
+}
