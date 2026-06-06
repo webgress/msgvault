@@ -314,7 +314,7 @@ func (b *Backend) seedPending(ctx context.Context, gen vector.GenerationID, now 
 	// query-time live filtering (dropDeletedFromSource,
 	// filteredMessageIDs) enforces the live-message contract.
 	rows, err := b.mainDB.QueryContext(ctx,
-		fmt.Sprintf(`SELECT id FROM messages WHERE %s`, store.LiveMessagesWhere("", true)))
+		`SELECT id FROM messages WHERE `+store.LiveMessagesWhere("", true))
 	if err != nil {
 		return fmt.Errorf("select messages: %w", err)
 	}
@@ -397,7 +397,7 @@ func (b *Backend) ActiveGeneration(ctx context.Context) (vector.Generation, erro
 func (b *Backend) BuildingGeneration(ctx context.Context) (*vector.Generation, error) {
 	g, err := b.generationByState(ctx, vector.GenerationBuilding)
 	if errors.Is(err, vector.ErrNoActiveGeneration) {
-		return nil, nil
+		return nil, nil //nolint:nilnil // (nil, nil) signals "no building generation"; callers nil-check the pointer
 	}
 	if err != nil {
 		return nil, err
@@ -635,9 +635,9 @@ func float32SliceBlob(v []float32) []byte {
 	buf := make([]byte, 4*len(v))
 	for i, f := range v {
 		bits := math.Float32bits(f)
-		buf[4*i] = byte(bits)
-		buf[4*i+1] = byte(bits >> 8)
-		buf[4*i+2] = byte(bits >> 16)
+		buf[4*i] = byte(bits & 0xff)
+		buf[4*i+1] = byte((bits >> 8) & 0xff)
+		buf[4*i+2] = byte((bits >> 16) & 0xff)
 		buf[4*i+3] = byte(bits >> 24)
 	}
 	return buf
@@ -650,7 +650,7 @@ func blobToFloat32(b []byte, dim int) ([]float32, error) {
 		return nil, fmt.Errorf("blob length %d does not match dimension %d", len(b), dim)
 	}
 	out := make([]float32, dim)
-	for i := 0; i < dim; i++ {
+	for i := range dim {
 		bits := uint32(b[4*i]) | uint32(b[4*i+1])<<8 | uint32(b[4*i+2])<<16 | uint32(b[4*i+3])<<24
 		out[i] = math.Float32frombits(bits)
 	}
@@ -697,7 +697,7 @@ func (b *Backend) LoadVector(ctx context.Context, messageID int64) ([]float32, e
 // ordered by ascending distance and assigned 1-based ranks.
 func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec []float32, k int, filter vector.Filter) ([]vector.Hit, error) {
 	if len(queryVec) == 0 {
-		return nil, fmt.Errorf("search: empty query vector")
+		return nil, errors.New("search: empty query vector")
 	}
 
 	var dim int
@@ -768,10 +768,8 @@ func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec 
 		//   - deletion-level: existing soft-delete filter may shrink
 		//     the result; the doubling loop below already handles
 		//     this dimension.
-		fetch := k * chunkOverfetchFactor * deletedOverfetchFactor
-		if fetch < k {
-			fetch = k // guard against overflow or degenerate small k
-		}
+		// max() guards against overflow or degenerate small k.
+		fetch := max(k*chunkOverfetchFactor*deletedOverfetchFactor, k)
 		for {
 			if fetch > chunkCeiling {
 				fetch = chunkCeiling
@@ -854,10 +852,7 @@ func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec 
 		 ORDER BY distance ASC
 	`, vecTable, idClause)
 
-	fetch := k * chunkOverfetchFactor
-	if fetch < k {
-		fetch = k
-	}
+	fetch := max(k*chunkOverfetchFactor, k)
 	for {
 		if fetch > chunkCeiling {
 			fetch = chunkCeiling
@@ -987,9 +982,9 @@ func (b *Backend) dropDeletedFromSource(ctx context.Context, hits []vector.Hit) 
 	if err != nil {
 		return nil, fmt.Errorf("encode hit ids: %w", err)
 	}
-	q := fmt.Sprintf(`SELECT id FROM messages
+	q := `SELECT id FROM messages
 	       WHERE id IN (SELECT value FROM json_each(?))
-	         AND %s`, store.LiveMessagesWhere("", true))
+	         AND ` + store.LiveMessagesWhere("", true)
 	rows, err := b.mainDB.QueryContext(ctx, q, string(blob))
 	if err != nil {
 		return nil, fmt.Errorf("live-hit filter: %w", err)

@@ -390,6 +390,7 @@ func TestPickEmbedGeneration_ResumeRacesActivation(t *testing.T) {
 // underneath us after BuildingGeneration returned.
 type buildingShim struct {
 	vector.Backend
+
 	forceBuilding *vector.Generation
 }
 
@@ -402,7 +403,7 @@ func TestNewProgressPrinter_UsesWindowedRate(t *testing.T) {
 	var buf bytes.Buffer
 	// window=2, total=210 so the percent path runs. The zero
 	// interval keeps the test deterministic without sleeping.
-	print := newProgressPrinterWithMinInterval(&buf, 210, 2, 0)
+	printer := newProgressPrinterWithMinInterval(&buf, 210, 2, 0)
 
 	// Three calls. Pick values so the windowed rate at the final
 	// event is different from the cumulative rate the old printer
@@ -419,19 +420,19 @@ func TestNewProgressPrinter_UsesWindowedRate(t *testing.T) {
 	// The old cumulative implementation would have printed
 	// 210/RunElapsed=7s = 30 → "30 msg/s". Asserting on the final
 	// line distinguishes the two.
-	print(embed.ProgressReport{
+	printer(embed.ProgressReport{
 		Done: 100, TotalPending: 210,
 		BatchMsgs: 100, BatchChars: 1000,
 		BatchElapsed: 1 * time.Second,
 		RunElapsed:   1 * time.Second,
 	})
-	print(embed.ProgressReport{
+	printer(embed.ProgressReport{
 		Done: 200, TotalPending: 210,
 		BatchMsgs: 100, BatchChars: 1000,
 		BatchElapsed: 1 * time.Second,
 		RunElapsed:   2 * time.Second,
 	})
-	print(embed.ProgressReport{
+	printer(embed.ProgressReport{
 		Done: 210, TotalPending: 210,
 		BatchMsgs: 10, BatchChars: 100,
 		BatchElapsed: 5 * time.Second,
@@ -450,15 +451,15 @@ func TestNewProgressPrinter_UsesWindowedRate(t *testing.T) {
 
 func TestNewProgressPrinter_DoesNotBypassThrottleAfterInitialTotal(t *testing.T) {
 	var buf bytes.Buffer
-	print := newProgressPrinter(&buf, 2, 2)
+	printer := newProgressPrinter(&buf, 2, 2)
 
-	print(embed.ProgressReport{
+	printer(embed.ProgressReport{
 		Done: 2, TotalPending: 2,
 		BatchMsgs: 2, BatchChars: 20,
 		BatchElapsed: 1 * time.Second,
 		RunElapsed:   1 * time.Second,
 	})
-	print(embed.ProgressReport{
+	printer(embed.ProgressReport{
 		Done: 3, TotalPending: 2,
 		BatchMsgs: 1, BatchChars: 10,
 		BatchElapsed: 1 * time.Second,

@@ -640,7 +640,7 @@ func TestBackend_Search_DimensionMismatch(t *testing.T) {
 // id and failed with `too many SQL variables` once it crossed the cap.
 func TestBackend_Search_FilterIDsExceedSQLiteParamCap(t *testing.T) {
 	require := requirepkg.New(t)
-	b, ctx, _ := newFusedBackendForTest(t)
+	b, ctx := newFusedBackendForTest(t)
 
 	const total = 1200 // well past SQLite's 999-variable ceiling
 	// The helper seeds 3 FTS rows; insert `total` more messages each
@@ -686,7 +686,7 @@ func TestBackend_Search_FilterIDsExceedSQLiteParamCap(t *testing.T) {
 // larger/smaller size bounds, and subject substring match.
 func TestBackend_Search_NewFilterFields(t *testing.T) {
 	require := requirepkg.New(t)
-	b, ctx, _ := newFusedBackendForTest(t)
+	b, ctx := newFusedBackendForTest(t)
 
 	// Reset and seed 4 messages with distinct recipient / size / subject
 	// profiles so each assertion is unambiguous.
@@ -787,7 +787,7 @@ func TestBackend_Search_NewFilterFields(t *testing.T) {
 // they are AND'd together. Same shape as label group AND'ing.
 func TestBackend_Search_RecipientGroupsAreANDed(t *testing.T) {
 	require := requirepkg.New(t)
-	b, ctx, _ := newFusedBackendForTest(t)
+	b, ctx := newFusedBackendForTest(t)
 
 	_, err := b.mainDB.ExecContext(ctx,
 		`DELETE FROM messages; DELETE FROM messages_fts; DELETE FROM message_recipients; DELETE FROM message_labels`)
@@ -882,7 +882,7 @@ func TestBackend_Search_RecipientGroupsAreANDed(t *testing.T) {
 func TestBackend_Search_SenderMatchesFromRecipientOnly(t *testing.T) {
 	require := requirepkg.New(t)
 	assert := assertpkg.New(t)
-	b, ctx, _ := newFusedBackendForTest(t)
+	b, ctx := newFusedBackendForTest(t)
 
 	// Reset the fused helper's seed data so we control the rows.
 	_, err := b.mainDB.ExecContext(ctx,
@@ -939,7 +939,7 @@ func TestBackend_Search_SenderMatchesFromRecipientOnly(t *testing.T) {
 // participant-level intersection (which would drop such messages).
 func TestBackend_Search_SenderGroupsAreANDed_AtMessageLevel(t *testing.T) {
 	require := requirepkg.New(t)
-	b, ctx, _ := newFusedBackendForTest(t)
+	b, ctx := newFusedBackendForTest(t)
 
 	_, err := b.mainDB.ExecContext(ctx,
 		`DELETE FROM messages; DELETE FROM messages_fts; DELETE FROM message_recipients`)
@@ -1011,7 +1011,7 @@ func TestBackend_Search_SenderGroupsAreANDed_AtMessageLevel(t *testing.T) {
 func TestBackend_Search_ExcludesDeletedFromSource(t *testing.T) {
 	require := requirepkg.New(t)
 	assert := assertpkg.New(t)
-	b, ctx, _ := newFusedBackendForTest(t)
+	b, ctx := newFusedBackendForTest(t)
 
 	_, err := b.mainDB.ExecContext(ctx,
 		`DELETE FROM messages; DELETE FROM messages_fts; DELETE FROM message_recipients`)
@@ -1050,7 +1050,7 @@ func TestBackend_Search_ExcludesDeletedFromSource(t *testing.T) {
 func TestBackend_Search_OverFetchesToHonorKWhenTopHitsDeleted(t *testing.T) {
 	require := requirepkg.New(t)
 	assert := assertpkg.New(t)
-	b, ctx, _ := newFusedBackendForTest(t)
+	b, ctx := newFusedBackendForTest(t)
 
 	_, err := b.mainDB.ExecContext(ctx,
 		`DELETE FROM messages; DELETE FROM messages_fts; DELETE FROM message_recipients`)
@@ -1118,7 +1118,7 @@ func TestBackend_Search_OverFetchesToHonorKWhenTopHitsDeleted(t *testing.T) {
 func TestBackend_Search_IterativelyExpandsWhenDeletionsExceedOverfetch(t *testing.T) {
 	require := requirepkg.New(t)
 	assert := assertpkg.New(t)
-	b, ctx, _ := newFusedBackendForTest(t)
+	b, ctx := newFusedBackendForTest(t)
 
 	_, err := b.mainDB.ExecContext(ctx,
 		`DELETE FROM messages; DELETE FROM messages_fts; DELETE FROM message_recipients`)
@@ -1176,7 +1176,7 @@ func TestBackend_Search_IterativelyExpandsWhenDeletionsExceedOverfetch(t *testin
 // remainder without looping forever.
 func TestBackend_Search_ExhaustedCorpusReturnsWhatsAvailable(t *testing.T) {
 	require := requirepkg.New(t)
-	b, ctx, _ := newFusedBackendForTest(t)
+	b, ctx := newFusedBackendForTest(t)
 
 	_, err := b.mainDB.ExecContext(ctx,
 		`DELETE FROM messages; DELETE FROM messages_fts; DELETE FROM message_recipients`)
@@ -1383,7 +1383,10 @@ func TestBackend_LoadVector(t *testing.T) {
 	require.NoError(err, "LoadVector")
 	require.Len(got, 768)
 	for i, v := range got {
-		require.Equalf(vec[i], v, "mismatch at i=%d", i)
+		// InDelta (not InEpsilon) because vec[0] == 0 and epsilon is a
+		// relative tolerance; the float32 round-trip is exact, so 1e-6
+		// is generous.
+		require.InDeltaf(vec[i], v, 1e-6, "mismatch at i=%d", i)
 	}
 }
 
