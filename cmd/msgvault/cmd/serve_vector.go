@@ -119,6 +119,11 @@ func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string) (
 		RRFK:                cfg.Vector.Search.RRFK,
 		KPerSignal:          cfg.Vector.Search.KPerSignal,
 		SubjectBoost:        cfg.Vector.Search.SubjectBoost,
+		// BuildFilter's participant/label lookups run against mainDB with ?
+		// placeholders. On PG those must become $N or pgx rejects them, so
+		// the serve/MCP hybrid engine (shared via vectorFeatures.HybridEngine)
+		// carries the dialect's Rebind. SQLite's Rebind is identity.
+		Rebind: dialect.Rebind,
 	})
 
 	// The enqueuer drives sync-time enqueueing into pending_embeddings.
