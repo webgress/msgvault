@@ -17,7 +17,7 @@ func TestQueue_ClaimReleaseComplete(t *testing.T) {
 	assert := assertpkg.New(t)
 	ctx := context.Background()
 	db := openVectorsDBWithPending(t, 5)
-	q := NewQueue(db)
+	q := NewQueue(db, nil)
 
 	ids, token, err := q.Claim(ctx, 1, 3)
 	require.NoError(err, "Claim")
@@ -43,7 +43,7 @@ func TestQueue_ClaimReleaseComplete(t *testing.T) {
 func TestQueue_Claim_EmptyBatchIsNoop(t *testing.T) {
 	ctx := context.Background()
 	db := openVectorsDBWithPending(t, 1)
-	q := NewQueue(db)
+	q := NewQueue(db, nil)
 	ids, token, err := q.Claim(ctx, 1, 0)
 	requirepkg.NoError(t, err, "Claim(0)")
 	assertpkg.Empty(t, ids)
@@ -53,7 +53,7 @@ func TestQueue_Claim_EmptyBatchIsNoop(t *testing.T) {
 func TestQueue_Claim_NoAvailableReturnsEmpty(t *testing.T) {
 	ctx := context.Background()
 	db := openVectorsDBWithPending(t, 0)
-	q := NewQueue(db)
+	q := NewQueue(db, nil)
 	ids, token, err := q.Claim(ctx, 1, 10)
 	requirepkg.NoError(t, err, "Claim")
 	assertpkg.Empty(t, ids)
@@ -64,7 +64,7 @@ func TestQueue_Complete_WrongTokenNoop(t *testing.T) {
 	require := requirepkg.New(t)
 	ctx := context.Background()
 	db := openVectorsDBWithPending(t, 2)
-	q := NewQueue(db)
+	q := NewQueue(db, nil)
 	ids, _, err := q.Claim(ctx, 1, 2)
 	require.NoError(err)
 	// Wrong token — rows should remain.
@@ -77,7 +77,7 @@ func TestQueue_Complete_WrongTokenNoop(t *testing.T) {
 func TestQueue_Release_WrongTokenNoop(t *testing.T) {
 	ctx := context.Background()
 	db := openVectorsDBWithPending(t, 2)
-	q := NewQueue(db)
+	q := NewQueue(db, nil)
 	ids, _, err := q.Claim(ctx, 1, 2)
 	requirepkg.NoError(t, err)
 	requirepkg.NoError(t, q.Release(ctx, 1, "deadbeef", ids), "Release with wrong token")
@@ -89,7 +89,7 @@ func TestQueue_ReclaimStale(t *testing.T) {
 	assert := assertpkg.New(t)
 	ctx := context.Background()
 	db := openVectorsDBWithPending(t, 2)
-	q := NewQueue(db)
+	q := NewQueue(db, nil)
 	_, _, err := q.Claim(ctx, 1, 2)
 	require.NoError(err)
 	// Back-date the claim past the threshold.
@@ -106,7 +106,7 @@ func TestQueue_ReclaimStale(t *testing.T) {
 func TestQueue_Complete_EmptyIDsIsNoop(t *testing.T) {
 	ctx := context.Background()
 	db := openVectorsDBWithPending(t, 1)
-	q := NewQueue(db)
+	q := NewQueue(db, nil)
 	assertpkg.NoError(t, q.Complete(ctx, 1, "token", nil), "Complete(nil)")
 }
 
@@ -118,7 +118,7 @@ func TestQueue_Complete_EmptyIDsIsNoop(t *testing.T) {
 func TestQueue_Claim_ReturnsIDsAscending(t *testing.T) {
 	ctx := context.Background()
 	db := openVectorsDBWithPending(t, 10)
-	q := NewQueue(db)
+	q := NewQueue(db, nil)
 
 	ids, _, err := q.Claim(ctx, 1, 10)
 	requirepkg.NoError(t, err, "Claim")
@@ -138,7 +138,7 @@ func TestQueue_Complete_AfterReclaim_PreservesNewClaim(t *testing.T) {
 	assert := assertpkg.New(t)
 	ctx := context.Background()
 	db := openVectorsDBWithPending(t, 2)
-	q := NewQueue(db)
+	q := NewQueue(db, nil)
 
 	idsA, tokenA, err := q.Claim(ctx, 1, 2)
 	require.NoError(err, "Claim A")

@@ -50,7 +50,12 @@ type WorkerDeps struct {
 	// and returns an error. A successful batch resets the counter.
 	// Default 5.
 	MaxConsecutiveFailures int
-	Log                    *slog.Logger
+	// Rebind translates ?-placeholders to the driver's native form.
+	// nil is treated as the identity (used by SQLite); pgvector callers
+	// must wire in (&store.PostgreSQLDialect{}).Rebind so the queue's
+	// IN-clause and UPDATE statements run on pgx.
+	Rebind func(string) string
+	Log    *slog.Logger
 	// TotalPending is the queue depth at run start, used by a Progress
 	// callback (if any) to report percent done and ETA. Zero disables
 	// the denominator — Progress still fires but leaves ETA empty.
@@ -82,8 +87,13 @@ type ProgressReport struct {
 // parallelize, construct multiple workers that share the same Backend
 // and DB handles.
 type Worker struct {
-	deps     WorkerDeps
-	q        *Queue
+	deps WorkerDeps
+	q    *Queue
+	// rebind translates ?-placeholders to the driver's native form for
+	// queries the worker issues directly against MainDB (embedBatch's
+	// IN-clause). Resolved in NewWorker from WorkerDeps.Rebind; nil is
+	// normalized to the identity so the SQLite path is unchanged.
+	rebind   func(string) string
 	runStart time.Time // valid only during a RunOnce call
 }
 
@@ -103,7 +113,11 @@ func NewWorker(d WorkerDeps) *Worker {
 	if d.MaxConsecutiveFailures == 0 {
 		d.MaxConsecutiveFailures = 5
 	}
-	return &Worker{deps: d, q: NewQueue(d.VectorsDB)}
+	rebind := d.Rebind
+	if rebind == nil {
+		rebind = func(q string) string { return q }
+	}
+	return &Worker{deps: d, q: NewQueue(d.VectorsDB, d.Rebind), rebind: rebind}
 }
 
 // derivedStaleThreshold picks a default StaleThreshold from the
@@ -461,11 +475,11 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 		placeholders[i] = "?"
 		args[i] = id
 	}
-	query := fmt.Sprintf(`
+	query := w.rebind(fmt.Sprintf(`
         SELECT m.id, COALESCE(m.subject, ''), COALESCE(mb.body_text, ''), COALESCE(mb.body_html, '')
           FROM messages m
           LEFT JOIN message_bodies mb ON mb.message_id = m.id
-         WHERE m.id IN (%s)`, strings.Join(placeholders, ","))
+         WHERE m.id IN (%s)`, strings.Join(placeholders, ",")))
 
 	rows, err := w.deps.MainDB.QueryContext(ctx, query, args...)
 	if err != nil {
