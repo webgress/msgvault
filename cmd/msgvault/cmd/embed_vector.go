@@ -29,27 +29,17 @@ func runEmbed(cmd *cobra.Command) error {
 	}
 	defer func() { _ = s.Close() }()
 
-	// The embed pipeline (embed.Queue claim/complete, the enqueuer, and
-	// the batch IN(...) lookups) still emits SQLite-only SQL — `?`
-	// placeholders, INSERT OR IGNORE, json_each — so it cannot run against
-	// pgx. Refuse PostgreSQL up-front with the same actionable message as
-	// `serve` rather than failing deep in the worker with an opaque pgx
-	// syntax error. Vector support for PostgreSQL is tracked under PR4
-	// (see docs/PG_STATUS.md); the pgvector branch below is retained for
-	// when the queue/worker layer becomes dialect-aware.
-	if s.IsPostgreSQL() {
-		return errors.New(
-			"vector features are SQLite-only; set [vector] enabled = false to use msgvault with PostgreSQL (vector support is planned for PR4)")
-	}
-
 	var (
 		backend   vector.Backend
 		vectorsDB *sql.DB
 		closeFn   func() error
+		rebind    func(string) string
 	)
 	if s.IsPostgreSQL() {
 		// pgvector embeddings live in the same Postgres database as
-		// messages — no separate vectors.db.
+		// messages — no separate vectors.db. The queue/worker layer is
+		// dialect-aware via rebind, so the build pipeline runs directly
+		// against pgx.
 		pgb, err := pgvector.Open(ctx, pgvector.Options{
 			DB:        s.DB(),
 			Dimension: cfg.Vector.Embeddings.Dimension,
@@ -60,6 +50,7 @@ func runEmbed(cmd *cobra.Command) error {
 		backend = pgb
 		vectorsDB = pgb.DB()
 		closeFn = pgb.Close
+		rebind = (&store.PostgreSQLDialect{}).Rebind
 	} else {
 		if err := sqlitevec.RegisterExtension(); err != nil {
 			return fmt.Errorf("register sqlite-vec: %w", err)
@@ -106,7 +97,7 @@ func runEmbed(cmd *cobra.Command) error {
 		Timeout:    cfg.Vector.Embeddings.Timeout,
 		MaxRetries: cfg.Vector.Embeddings.MaxRetries,
 	})
-	totalPending, err := pendingCount(ctx, vectorsDB, gen)
+	totalPending, err := pendingCount(ctx, vectorsDB, rebind, gen)
 	if err != nil {
 		return fmt.Errorf("count pending: %w", err)
 	}
@@ -128,6 +119,7 @@ func runEmbed(cmd *cobra.Command) error {
 		BatchSize:       cfg.Vector.Embeddings.BatchSize,
 		EmbedTimeout:    cfg.Vector.Embeddings.Timeout,
 		EmbedMaxRetries: cfg.Vector.Embeddings.MaxRetries,
+		Rebind:          rebind,
 		TotalPending:    totalPending,
 		Progress:        newProgressPrinter(errOut, totalPending, cfg.Vector.Embeddings.ETAWindow),
 	})
@@ -150,7 +142,7 @@ func runEmbed(cmd *cobra.Command) error {
 	// worker later recovers from must not block activation, and an
 	// active generation must not be re-activated.
 	if rebuildInProgress {
-		remaining, err := pendingCount(ctx, vectorsDB, gen)
+		remaining, err := pendingCount(ctx, vectorsDB, rebind, gen)
 		if err != nil {
 			return fmt.Errorf("count pending: %w", err)
 		}
@@ -285,10 +277,16 @@ func pickEmbedGeneration(ctx context.Context, backend vector.Backend, opts embed
 	}
 }
 
-func pendingCount(ctx context.Context, db *sql.DB, gen vector.GenerationID) (int, error) {
+// pendingCount counts queue rows for gen. rebind translates the
+// ?-placeholder to the driver's native form; nil is treated as the
+// identity so the SQLite path is unchanged.
+func pendingCount(ctx context.Context, db *sql.DB, rebind func(string) string, gen vector.GenerationID) (int, error) {
+	if rebind == nil {
+		rebind = func(q string) string { return q }
+	}
 	var n int
 	if err := db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM pending_embeddings WHERE generation_id = ?`, int64(gen)).Scan(&n); err != nil {
+		rebind(`SELECT COUNT(*) FROM pending_embeddings WHERE generation_id = ?`), int64(gen)).Scan(&n); err != nil {
 		return 0, fmt.Errorf("query pending: %w", err)
 	}
 	return n, nil
