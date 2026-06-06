@@ -38,18 +38,31 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_generations_building
 -- known dim via `WHERE dimension = N`. Without the partial-index
 -- guard, a 4-dim row would trip the (embedding::vector(768)) cast in
 -- a 768-dim index and pgvector would reject the insert.
+--
+-- One row per chunk: long messages produce multiple rows distinguished
+-- by chunk_index (0-based, dense), short messages keep a single row
+-- with chunk_index = 0. The (generation_id, message_id, chunk_index)
+-- primary key mirrors sqlitevec's UNIQUE constraint and preserves
+-- idempotent re-upsert. chunk_char_start / chunk_char_end record the
+-- rune-space offsets of the chunk in the preprocessed text — debugging
+-- metadata today (search returns one Hit per message) that ships now so
+-- chunk highlighting can be retro-fitted without another migration.
 CREATE TABLE IF NOT EXISTS embeddings (
     generation_id    BIGINT NOT NULL REFERENCES index_generations(id) ON DELETE CASCADE,
     message_id       BIGINT NOT NULL,
+    chunk_index      INTEGER NOT NULL DEFAULT 0,
     embedded_at      BIGINT NOT NULL,
     source_char_len  INTEGER NOT NULL,
+    chunk_char_start INTEGER NOT NULL DEFAULT 0,
+    chunk_char_end   INTEGER NOT NULL DEFAULT 0,
     truncated        BOOLEAN NOT NULL DEFAULT FALSE,
     dimension        INTEGER NOT NULL,
     embedding        vector NOT NULL,
-    PRIMARY KEY (generation_id, message_id)
+    PRIMARY KEY (generation_id, message_id, chunk_index)
 );
 CREATE INDEX IF NOT EXISTS idx_embeddings_msg ON embeddings(message_id);
 CREATE INDEX IF NOT EXISTS idx_embeddings_dim ON embeddings(dimension);
+CREATE INDEX IF NOT EXISTS idx_embeddings_gen_msg ON embeddings(generation_id, message_id);
 
 CREATE TABLE IF NOT EXISTS pending_embeddings (
     generation_id BIGINT NOT NULL REFERENCES index_generations(id) ON DELETE CASCADE,

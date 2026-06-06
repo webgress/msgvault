@@ -92,6 +92,11 @@ func (c *attachmentCorpus) attachmentRowCount() int {
 	return n
 }
 
+// attachmentRowsForHash counts attachment rows carrying the given content
+// hash. The hash argument is always hashShared in the current suite but
+// kept explicit so each call site reads as a content-hash assertion.
+//
+//nolint:unparam // hash intentionally parameterized; see doc comment.
 func (c *attachmentCorpus) attachmentRowsForHash(hash string) int {
 	c.t.Helper()
 	var n int

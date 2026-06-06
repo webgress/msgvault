@@ -29,6 +29,19 @@ func runEmbed(cmd *cobra.Command) error {
 	}
 	defer func() { _ = s.Close() }()
 
+	// The embed pipeline (embed.Queue claim/complete, the enqueuer, and
+	// the batch IN(...) lookups) still emits SQLite-only SQL — `?`
+	// placeholders, INSERT OR IGNORE, json_each — so it cannot run against
+	// pgx. Refuse PostgreSQL up-front with the same actionable message as
+	// `serve` rather than failing deep in the worker with an opaque pgx
+	// syntax error. Vector support for PostgreSQL is tracked under PR4
+	// (see docs/PG_STATUS.md); the pgvector branch below is retained for
+	// when the queue/worker layer becomes dialect-aware.
+	if s.IsPostgreSQL() {
+		return fmt.Errorf(
+			"vector features are SQLite-only; set [vector] enabled = false to use msgvault with PostgreSQL (vector support is planned for PR4)")
+	}
+
 	var (
 		backend   vector.Backend
 		vectorsDB *sql.DB
