@@ -9,7 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 	"testing"
 
@@ -24,7 +24,7 @@ import (
 func testDBURL(t *testing.T) string {
 	t.Helper()
 	url := os.Getenv("MSGVAULT_TEST_DB")
-	if !(strings.HasPrefix(url, "postgres://") || strings.HasPrefix(url, "postgresql://")) {
+	if !strings.HasPrefix(url, "postgres://") && !strings.HasPrefix(url, "postgresql://") {
 		t.Skip("pgvector tests require MSGVAULT_TEST_DB to point at a PostgreSQL DSN")
 	}
 	return url
@@ -55,7 +55,7 @@ func openPGTestDB(t *testing.T) *sql.DB {
 		t.Fatalf("open setup: %v", err)
 	}
 	defer func() { _ = setup.Close() }()
-	if _, err := setup.Exec(fmt.Sprintf("CREATE SCHEMA %s", schemaName)); err != nil {
+	if _, err := setup.Exec("CREATE SCHEMA " + schemaName); err != nil {
 		t.Fatalf("create schema: %v", err)
 	}
 
@@ -140,6 +140,8 @@ func newBackendForTest(t *testing.T) (*Backend, context.Context, *sql.DB) {
 // unitVec returns a unit vector of the given dimension with 1.0 at
 // position axis and 0.0 elsewhere — the building block for similarity
 // assertions where we know which message should rank first.
+//
+//nolint:unparam // dim kept for future non-4-dim coverage; shared with backend_test.go call sites
 func unitVec(dim, axis int) []float32 {
 	v := make([]float32, dim)
 	v[axis] = 1
@@ -162,7 +164,7 @@ func seedAndEmbed(t *testing.T, b *Backend, db *sql.DB, vecs map[int64][]float32
 	for id := range vecs {
 		ids = append(ids, id)
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 
 	expectedDim := len(vecs[ids[0]])
 	for _, id := range ids {

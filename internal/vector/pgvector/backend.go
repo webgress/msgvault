@@ -50,7 +50,7 @@ type Backend struct {
 // ownership and Close() is a no-op for the handle itself.
 func Open(ctx context.Context, opts Options) (*Backend, error) {
 	if opts.DB == nil {
-		return nil, fmt.Errorf("pgvector.Open: Options.DB is required")
+		return nil, errors.New("pgvector.Open: Options.DB is required")
 	}
 	if err := Migrate(ctx, opts.DB, opts.Dimension); err != nil {
 		return nil, fmt.Errorf("pgvector migrate: %w", err)
@@ -300,7 +300,7 @@ func (b *Backend) ActiveGeneration(ctx context.Context) (vector.Generation, erro
 func (b *Backend) BuildingGeneration(ctx context.Context) (*vector.Generation, error) {
 	g, err := b.generationByState(ctx, vector.GenerationBuilding)
 	if errors.Is(err, vector.ErrNoActiveGeneration) {
-		return nil, nil
+		return nil, nil //nolint:nilnil // (nil, nil) signals "no building generation"; callers nil-check the pointer
 	}
 	if err != nil {
 		return nil, err
@@ -560,7 +560,7 @@ func (b *Backend) LoadVector(ctx context.Context, messageID int64) ([]float32, e
 // sqlitevec convention.
 func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec []float32, k int, filter vector.Filter) ([]vector.Hit, error) {
 	if len(queryVec) == 0 {
-		return nil, fmt.Errorf("search: empty query vector")
+		return nil, errors.New("search: empty query vector")
 	}
 	var dim int
 	err := b.db.QueryRowContext(ctx,
@@ -700,19 +700,19 @@ func (b *Backend) filteredMessageIDs(ctx context.Context, f vector.Filter) ([]in
 	addRecipientGroups("bcc", f.BccGroups)
 
 	if f.HasAttachment != nil {
-		clauses = append(clauses, fmt.Sprintf("m.has_attachments = %s", bind(*f.HasAttachment)))
+		clauses = append(clauses, "m.has_attachments = "+bind(*f.HasAttachment))
 	}
 	if f.After != nil {
-		clauses = append(clauses, fmt.Sprintf("m.sent_at >= %s", bind(*f.After)))
+		clauses = append(clauses, "m.sent_at >= "+bind(*f.After))
 	}
 	if f.Before != nil {
-		clauses = append(clauses, fmt.Sprintf("m.sent_at < %s", bind(*f.Before)))
+		clauses = append(clauses, "m.sent_at < "+bind(*f.Before))
 	}
 	if f.LargerThan != nil {
-		clauses = append(clauses, fmt.Sprintf("m.size_estimate > %s", bind(*f.LargerThan)))
+		clauses = append(clauses, "m.size_estimate > "+bind(*f.LargerThan))
 	}
 	if f.SmallerThan != nil {
-		clauses = append(clauses, fmt.Sprintf("m.size_estimate < %s", bind(*f.SmallerThan)))
+		clauses = append(clauses, "m.size_estimate < "+bind(*f.SmallerThan))
 	}
 	for _, term := range f.SubjectSubstrings {
 		// Case-insensitive to match SQLite's default ASCII-insensitive

@@ -38,7 +38,7 @@ func runEmbed(cmd *cobra.Command) error {
 	// (see docs/PG_STATUS.md); the pgvector branch below is retained for
 	// when the queue/worker layer becomes dialect-aware.
 	if s.IsPostgreSQL() {
-		return fmt.Errorf(
+		return errors.New(
 			"vector features are SQLite-only; set [vector] enabled = false to use msgvault with PostgreSQL (vector support is planned for PR4)")
 	}
 
@@ -135,14 +135,14 @@ func runEmbed(cmd *cobra.Command) error {
 	if n, err := worker.ReclaimStale(ctx); err != nil {
 		return fmt.Errorf("reclaim stale: %w", err)
 	} else if n > 0 {
-		fmt.Fprintf(errOut, "Reclaimed %d stale claims.\n", n)
+		_, _ = fmt.Fprintf(errOut, "Reclaimed %d stale claims.\n", n)
 	}
 
 	res, err := worker.RunOnce(ctx, gen)
 	if err != nil {
 		return fmt.Errorf("embed run: %w", err)
 	}
-	fmt.Fprintf(out, "Claimed: %d, succeeded: %d, failed: %d, truncated: %d\n",
+	_, _ = fmt.Fprintf(out, "Claimed: %d, succeeded: %d, failed: %d, truncated: %d\n",
 		res.Claimed, res.Succeeded, res.Failed, res.Truncated)
 
 	// Activation is a function of the generation's final state, not
@@ -158,9 +158,9 @@ func runEmbed(cmd *cobra.Command) error {
 			if err := backend.ActivateGeneration(ctx, gen); err != nil {
 				return fmt.Errorf("activate generation: %w", err)
 			}
-			fmt.Fprintf(out, "Generation %d activated.\n", gen)
+			_, _ = fmt.Fprintf(out, "Generation %d activated.\n", gen)
 		} else {
-			fmt.Fprintf(errOut,
+			_, _ = fmt.Fprintf(errOut,
 				"Generation %d still has %d pending rows; run `msgvault embeddings resume` again to finish, then it will activate automatically.\n",
 				gen, remaining)
 		}
@@ -209,7 +209,7 @@ type embedGenerationOpts struct {
 func pickEmbedGeneration(ctx context.Context, backend vector.Backend, opts embedGenerationOpts) (vector.GenerationID, bool, error) {
 	if opts.FullRebuild {
 		if opts.Confirm != nil && !opts.Confirm() {
-			return 0, false, fmt.Errorf("aborted")
+			return 0, false, errors.New("aborted")
 		}
 		gen, err := backend.CreateGeneration(ctx, opts.Model, opts.Dimension, opts.Fingerprint)
 		if err != nil {
@@ -329,17 +329,14 @@ func newProgressPrinterWithMinInterval(w io.Writer, total int, windowSize int, m
 		usPerChar := float64(p.BatchElapsed.Microseconds()) / float64(max1(p.BatchChars))
 
 		if total > 0 && windowedRate > 0 {
-			remaining := total - p.Done
-			if remaining < 0 {
-				remaining = 0
-			}
+			remaining := max(total-p.Done, 0)
 			eta := time.Duration(float64(remaining)/windowedRate) * time.Second
 			pct := 100 * float64(p.Done) / float64(total)
-			fmt.Fprintf(w,
+			_, _ = fmt.Fprintf(w,
 				"progress: %d/%d (%.1f%%) — %.0f msg/s (last %d), %.1f ms/msg, %.2f µs/char, ETA %s\n",
 				p.Done, total, pct, windowedRate, samples, msPerMsg, usPerChar, formatETA(eta))
 		} else {
-			fmt.Fprintf(w,
+			_, _ = fmt.Fprintf(w,
 				"progress: %d embedded — %.0f msg/s (last %d), %.1f ms/msg, %.2f µs/char\n",
 				p.Done, windowedRate, samples, msPerMsg, usPerChar)
 		}

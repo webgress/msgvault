@@ -5,6 +5,7 @@ package cmd
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -13,7 +14,7 @@ import (
 	"text/tabwriter"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/mattn/go-sqlite3" // SQLite driver (database/sql)
 	"github.com/spf13/cobra"
 	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/vector"
@@ -29,13 +30,13 @@ import (
 // Scope means no scope flag was supplied.
 func runHybridSearch(cmd *cobra.Command, queryStr, mode string, explain bool, scope Scope) error {
 	if queryStr == "" {
-		return fmt.Errorf("empty search query")
+		return errors.New("empty search query")
 	}
 	if !cfg.Vector.Enabled {
-		return fmt.Errorf("vector search not enabled; set [vector].enabled = true in config")
+		return errors.New("vector search not enabled; set [vector].enabled = true in config")
 	}
 	if cfg.Vector.Embeddings.Endpoint == "" || cfg.Vector.Embeddings.Model == "" {
-		return fmt.Errorf("vector search requires [vector.embeddings] endpoint and model in config")
+		return errors.New("vector search requires [vector.embeddings] endpoint and model in config")
 	}
 
 	ctx := cmd.Context()
@@ -160,7 +161,8 @@ func runHybridSearch(cmd *cobra.Command, queryStr, mode string, explain bool, sc
 	if searchJSON {
 		return outputHybridResultsJSON(results, meta, explain)
 	}
-	return outputHybridResultsTable(results, meta, explain)
+	outputHybridResultsTable(results, meta, explain)
+	return nil
 }
 
 type hybridResultRow struct {
@@ -254,12 +256,12 @@ func hydrateHybridResults(ctx context.Context, db *sql.DB, hits []vector.FusedHi
 	return compact, nil
 }
 
-func outputHybridResultsTable(results []hybridResultRow, meta hybrid.ResultMeta, explain bool) error {
+func outputHybridResultsTable(results []hybridResultRow, meta hybrid.ResultMeta, explain bool) {
 	if len(results) == 0 {
 		fmt.Println("No messages found.")
 		fmt.Printf("\nGeneration #%d (%s, fingerprint=%q)\n",
 			int64(meta.Generation.ID), meta.Generation.State, meta.Generation.Fingerprint)
-		return nil
+		return
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
@@ -289,7 +291,6 @@ func outputHybridResultsTable(results []hybridResultRow, meta hybrid.ResultMeta,
 	_ = w.Flush()
 	fmt.Printf("\nShowing %d results (generation #%d %s, fingerprint=%q)\n",
 		len(results), int64(meta.Generation.ID), meta.Generation.State, meta.Generation.Fingerprint)
-	return nil
 }
 
 func outputHybridResultsJSON(results []hybridResultRow, meta hybrid.ResultMeta, explain bool) error {
