@@ -195,6 +195,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 			Worker:      vf.Worker,
 			Backend:     vf.Backend,
 			VectorsDB:   vf.VectorsDB,
+			Rebind:      vf.Rebind,
 			Fingerprint: vf.Cfg.GenerationFingerprint(),
 			Log:         logger,
 		}

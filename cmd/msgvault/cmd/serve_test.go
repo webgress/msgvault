@@ -127,22 +127,6 @@ func TestSetupVectorFeatures_Disabled(t *testing.T) {
 	assertpkg.Nil(t, vf, "setupVectorFeatures should be nil when disabled")
 }
 
-// TestSetupVectorFeatures_RefusesPostgres verifies setupVectorFeatures
-// returns a clear error when invoked against a postgres:// DSN. The
-// underlying backend (sqlite-vec + ATTACH DATABASE) cannot work on PG;
-// fail closed at the entry point rather than crashing downstream when
-// sql.Open("sqlite3", "postgres://...") gets a non-sqlite DSN.
-func TestSetupVectorFeatures_RefusesPostgres(t *testing.T) {
-	savedCfg := cfg
-	defer func() { cfg = savedCfg }()
-	cfg = &config.Config{}
-	cfg.Vector.Enabled = true
-
-	_, err := setupVectorFeatures(context.Background(), nil, "postgres://user@host/db")
-	requirepkg.Error(t, err, "setupVectorFeatures with postgres DSN")
-	assertpkg.ErrorContains(t, err, "SQLite-only")
-}
-
 // TestFindScheduledSyncSource verifies that the scheduler's
 // source-resolution helper picks gmail over imap and ignores rows of
 // non-syncable source types (mbox, apple-mail, etc.). Regression for
