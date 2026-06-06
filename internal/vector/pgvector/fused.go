@@ -1,0 +1,402 @@
+//go:build pgvector
+
+package pgvector
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"math"
+	"sort"
+	"strings"
+
+	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/vector"
+)
+
+// Compile-time check that *Backend satisfies vector.FusingBackend.
+var _ vector.FusingBackend = (*Backend)(nil)
+
+// FusedSearch runs the single-query hybrid CTE against pgvector.
+// Mirrors sqlitevec.FusedSearch (spec §5.3) but built around
+// websearch_to_tsquery + ts_rank_cd on the inline messages.search_fts
+// column and pgvector's `<=>` cosine-distance operator. The 'simple'
+// text-search configuration matches what FTSUpsert/FTSBackfillBatchSQL
+// in internal/store/dialect_pg.go writes into search_fts, so query-
+// time tokens line up with stored tokens (no English stemming on
+// either side). The returned saturated flag is true when either
+// per-signal pool produced more than KPerSignal candidates — the pool
+// was capped and downstream callers should consider raising
+// KPerSignal or narrowing the query.
+func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]vector.FusedHit, bool, error) {
+	useFTS := req.FTSQuery != ""
+	useANN := req.QueryVec != nil
+	if !useFTS && !useANN {
+		return nil, false, errors.New("FusedSearch: neither vector nor FTS query provided")
+	}
+
+	var dim int
+	err := b.db.QueryRowContext(ctx,
+		`SELECT dimension FROM index_generations WHERE id = $1`, int64(req.Generation)).Scan(&dim)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, fmt.Errorf("%w: %d", vector.ErrUnknownGeneration, req.Generation)
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("lookup generation %d: %w", req.Generation, err)
+	}
+	if useANN && len(req.QueryVec) != dim {
+		return nil, false, fmt.Errorf("%w: query has %d dims, gen has %d",
+			vector.ErrDimensionMismatch, len(req.QueryVec), dim)
+	}
+
+	// When the subject boost is active, the SQL LIMIT must not cut
+	// boost-eligible candidates out of the result set before Go can
+	// re-rank them. Fetch the entire fused candidate pool (at most
+	// 2 × KPerSignal rows) so the boost has the full pool to reorder.
+	sqlLimit := req.Limit
+	boostActive := req.SubjectBoost > 1.0 && len(req.SubjectTerms) > 0
+	if boostActive {
+		sqlLimit = max(2*req.KPerSignal, req.Limit)
+	}
+
+	var args []any
+	bind := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+
+	filterSQL := applyFilterClauses(req.Filter, bind)
+	liveSQL := store.LiveMessagesWhere("m", true)
+
+	ctes := []string{fmt.Sprintf(
+		"filtered AS (SELECT m.id FROM messages m WHERE %s%s)", liveSQL, filterSQL)}
+
+	kPlus1 := req.KPerSignal + 1
+
+	if useFTS {
+		ftsArg := bind(req.FTSQuery)
+		kp1Arg := bind(kPlus1)
+		kArg := bind(req.KPerSignal)
+		ctes = append(ctes,
+			fmt.Sprintf(`fts_pool AS (
+    SELECT m.id AS message_id,
+           ts_rank_cd(m.search_fts, websearch_to_tsquery('simple', %s), 32) AS bm25
+      FROM messages m
+      JOIN filtered f ON f.id = m.id
+     WHERE m.search_fts @@ websearch_to_tsquery('simple', %s)
+     ORDER BY bm25 DESC
+     LIMIT %s
+)`, ftsArg, ftsArg, kp1Arg),
+			fmt.Sprintf(`fts_ranked AS (
+    SELECT message_id, bm25,
+           ROW_NUMBER() OVER (ORDER BY bm25 DESC, message_id ASC) AS rnk
+      FROM fts_pool
+     ORDER BY bm25 DESC, message_id ASC
+     LIMIT %s
+)`, kArg))
+	}
+
+	if useANN {
+		vecArg := bind(vectorLiteral(req.QueryVec))
+		genArg := bind(int64(req.Generation))
+		kp1Arg := bind(kPlus1)
+		kArg := bind(req.KPerSignal)
+		// Collapse the per-chunk embedding rows to one row per message
+		// before pooling. The embeddings PK is
+		// (generation_id, message_id, chunk_index), so a multi-chunk
+		// message has several rows; without GROUP BY the FULL OUTER JOIN
+		// against fts_ranked would see duplicate message_ids and
+		// double-count them. MIN(distance) keeps the best-scoring chunk
+		// per message — the exact dedup pattern Search() uses — and the
+		// pool cap (LIMIT KPerSignal+1) then applies to deduped rows.
+		ctes = append(ctes,
+			fmt.Sprintf(`ann_pool AS (
+    SELECT e.message_id,
+           MIN((e.embedding::vector(%d)) <=> %s::vector) AS distance
+      FROM embeddings e
+      JOIN filtered f ON f.id = e.message_id
+     WHERE e.generation_id = %s AND e.dimension = %d
+     GROUP BY e.message_id
+     ORDER BY distance
+     LIMIT %s
+)`, dim, vecArg, genArg, dim, kp1Arg),
+			fmt.Sprintf(`ann_ranked AS (
+    SELECT message_id, distance,
+           ROW_NUMBER() OVER (ORDER BY distance ASC, message_id ASC) AS rnk
+      FROM ann_pool
+     ORDER BY distance ASC, message_id ASC
+     LIMIT %s
+)`, kArg))
+	}
+
+	// Pool CTEs are now fully bound. Remember how many args belong to
+	// the pool prefix so the empty-result saturation fallback can
+	// re-run the prefix-only SQL without the trailing rrfk/limit args.
+	poolArgsLen := len(args)
+	poolCTEs := append([]string(nil), ctes...)
+
+	rrfkArg := bind(req.RRFK)
+	limitArg := bind(sqlLimit)
+
+	var fusedSQL string
+	switch {
+	case useFTS && useANN:
+		fusedSQL = fmt.Sprintf(`fused AS (
+    SELECT COALESCE(b.message_id, v.message_id) AS message_id,
+           COALESCE(1.0 / (%s + b.rnk), 0.0) +
+           COALESCE(1.0 / (%s + v.rnk), 0.0) AS rrf_score,
+           b.bm25 AS bm25_score,
+           CASE WHEN v.distance IS NULL THEN NULL ELSE 1.0 - v.distance END AS vector_score
+      FROM fts_ranked b
+      FULL OUTER JOIN ann_ranked v USING (message_id)
+)`, rrfkArg, rrfkArg)
+	case useFTS:
+		fusedSQL = fmt.Sprintf(`fused AS (
+    SELECT b.message_id AS message_id,
+           1.0 / (%s + b.rnk) AS rrf_score,
+           b.bm25 AS bm25_score,
+           CAST(NULL AS DOUBLE PRECISION) AS vector_score
+      FROM fts_ranked b
+)`, rrfkArg)
+	case useANN:
+		fusedSQL = fmt.Sprintf(`fused AS (
+    SELECT v.message_id AS message_id,
+           1.0 / (%s + v.rnk) AS rrf_score,
+           CAST(NULL AS DOUBLE PRECISION) AS bm25_score,
+           1.0 - v.distance AS vector_score
+      FROM ann_ranked v
+)`, rrfkArg)
+	}
+	ctes = append(ctes, fusedSQL)
+
+	ftsPoolExpr := "0"
+	annPoolExpr := "0"
+	if useFTS {
+		ftsPoolExpr = "(SELECT COUNT(*) FROM fts_pool)"
+	}
+	if useANN {
+		annPoolExpr = "(SELECT COUNT(*) FROM ann_pool)"
+	}
+
+	query := "WITH " + strings.Join(ctes, ",\n") + fmt.Sprintf(`
+SELECT message_id, rrf_score, bm25_score, vector_score,
+       %s AS fts_pool_size,
+       %s AS ann_pool_size
+  FROM fused
+ ORDER BY rrf_score DESC, message_id ASC
+ LIMIT %s`, ftsPoolExpr, annPoolExpr, limitArg)
+
+	rows, err := b.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, false, fmt.Errorf("fused query: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var hits []vector.FusedHit
+	var ftsPoolSize, annPoolSize int
+	var poolSizeRead bool
+	for rows.Next() {
+		var h vector.FusedHit
+		var bm, vec sql.NullFloat64
+		var ftsPool, annPool int
+		if err := rows.Scan(&h.MessageID, &h.RRFScore, &bm, &vec, &ftsPool, &annPool); err != nil {
+			return nil, false, fmt.Errorf("scan fused hit: %w", err)
+		}
+		if !poolSizeRead {
+			ftsPoolSize = ftsPool
+			annPoolSize = annPool
+			poolSizeRead = true
+		}
+		h.BM25Score = math.NaN()
+		if bm.Valid {
+			h.BM25Score = bm.Float64
+		}
+		h.VectorScore = math.NaN()
+		if vec.Valid {
+			h.VectorScore = vec.Float64
+		}
+		hits = append(hits, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("iterate fused hits: %w", err)
+	}
+
+	// Saturation: when the fused result set is empty, the correlated
+	// subqueries that carry pool counts never fire (they ride on the
+	// row stream). Fall back to a prefix-only query that uses just
+	// the pool CTEs and their args — the trailing rrfk/limit args
+	// are excluded so PG's "expected N arguments" check is satisfied.
+	if !poolSizeRead {
+		prefix := "WITH " + strings.Join(poolCTEs, ",\n") + "\n"
+		prefixArgs := args[:poolArgsLen]
+		if useFTS {
+			if err := b.db.QueryRowContext(ctx,
+				prefix+"SELECT COUNT(*) FROM fts_pool", prefixArgs...).Scan(&ftsPoolSize); err != nil {
+				return nil, false, fmt.Errorf("count fts_pool: %w", err)
+			}
+		}
+		if useANN {
+			if err := b.db.QueryRowContext(ctx,
+				prefix+"SELECT COUNT(*) FROM ann_pool", prefixArgs...).Scan(&annPoolSize); err != nil {
+				return nil, false, fmt.Errorf("count ann_pool: %w", err)
+			}
+		}
+	}
+
+	if boostActive {
+		b.applySubjectBoost(ctx, hits, req.SubjectTerms, req.SubjectBoost)
+		if len(hits) > req.Limit {
+			hits = hits[:req.Limit]
+		}
+	}
+
+	saturated := ftsPoolSize > req.KPerSignal || annPoolSize > req.KPerSignal
+	return hits, saturated, nil
+}
+
+// applyFilterClauses returns the " AND ..." fragment to append after a
+// LiveMessagesWhere predicate so each WHERE in the fused CTE narrows
+// down to messages matching the structured filter. Mirrors
+// filteredMessageIDs in backend.go but emits SQL only — args are
+// accumulated through the bind closure so the caller controls the
+// $N counter shared across all CTEs.
+func applyFilterClauses(f vector.Filter, bind func(any) string) string {
+	if f.IsEmpty() {
+		return ""
+	}
+	var sb strings.Builder
+	if len(f.SourceIDs) > 0 {
+		fmt.Fprintf(&sb, " AND m.source_id = ANY(%s::bigint[])", bind(int64Array(f.SourceIDs)))
+	}
+	for _, group := range f.SenderGroups {
+		if len(group) == 0 {
+			continue
+		}
+		fmt.Fprintf(&sb, ` AND EXISTS (
+            SELECT 1 FROM message_recipients mr
+             WHERE mr.message_id = m.id
+               AND mr.recipient_type = 'from'
+               AND mr.participant_id = ANY(%s::bigint[]))`, bind(int64Array(group)))
+	}
+	appendRecipientGroups := func(recipientType string, groups [][]int64) {
+		for _, ids := range groups {
+			if len(ids) == 0 {
+				continue
+			}
+			fmt.Fprintf(&sb, ` AND EXISTS (
+            SELECT 1 FROM message_recipients mr
+             WHERE mr.message_id = m.id
+               AND mr.recipient_type = '%s'
+               AND mr.participant_id = ANY(%s::bigint[]))`, recipientType, bind(int64Array(ids)))
+		}
+	}
+	appendRecipientGroups("to", f.ToGroups)
+	appendRecipientGroups("cc", f.CcGroups)
+	appendRecipientGroups("bcc", f.BccGroups)
+	for _, ids := range f.LabelGroups {
+		if len(ids) == 0 {
+			continue
+		}
+		fmt.Fprintf(&sb, ` AND EXISTS (
+            SELECT 1 FROM message_labels ml
+             WHERE ml.message_id = m.id
+               AND ml.label_id = ANY(%s::bigint[]))`, bind(int64Array(ids)))
+	}
+	if f.HasAttachment != nil {
+		fmt.Fprintf(&sb, " AND m.has_attachments = %s", bind(*f.HasAttachment))
+	}
+	if f.After != nil {
+		fmt.Fprintf(&sb, " AND m.sent_at >= %s", bind(*f.After))
+	}
+	if f.Before != nil {
+		fmt.Fprintf(&sb, " AND m.sent_at < %s", bind(*f.Before))
+	}
+	if f.LargerThan != nil {
+		fmt.Fprintf(&sb, " AND m.size_estimate > %s", bind(*f.LargerThan))
+	}
+	if f.SmallerThan != nil {
+		fmt.Fprintf(&sb, " AND m.size_estimate < %s", bind(*f.SmallerThan))
+	}
+	for _, term := range f.SubjectSubstrings {
+		// Case-insensitive subject match: LOWER on both sides mirrors
+		// backend.go's filteredMessageIDs so the two filter paths agree.
+		// ESCAPE semantics survive because escape chars are ASCII.
+		fmt.Fprintf(&sb, ` AND LOWER(m.subject) LIKE LOWER(%s) ESCAPE '\'`,
+			bind("%"+escapeLikeSubject(term)+"%"))
+	}
+	return sb.String()
+}
+
+// applySubjectBoost re-ranks hits whose subject contains any of the
+// supplied (already-lowercased) terms as a case-insensitive
+// substring. Mirrors sqlitevec.applySubjectBoost; a failed subject
+// lookup degrades gracefully to "unboosted ordering" rather than
+// failing the search.
+func (b *Backend) applySubjectBoost(ctx context.Context, hits []vector.FusedHit, subjectTerms []string, boost float64) {
+	if len(hits) == 0 || len(subjectTerms) == 0 || boost <= 1.0 {
+		return
+	}
+	ids := make([]int64, len(hits))
+	for i, h := range hits {
+		ids[i] = h.MessageID
+	}
+	subjects, err := b.batchGetSubjects(ctx, ids)
+	if err != nil {
+		return
+	}
+	for i := range hits {
+		subj := subjects[hits[i].MessageID]
+		if subj == "" {
+			continue
+		}
+		lower := strings.ToLower(subj)
+		for _, term := range subjectTerms {
+			if term == "" {
+				continue
+			}
+			if strings.Contains(lower, term) {
+				hits[i].RRFScore *= boost
+				hits[i].SubjectBoosted = true
+				break
+			}
+		}
+	}
+	sort.SliceStable(hits, func(i, j int) bool {
+		if hits[i].RRFScore != hits[j].RRFScore {
+			return hits[i].RRFScore > hits[j].RRFScore
+		}
+		return hits[i].MessageID < hits[j].MessageID
+	})
+}
+
+// batchGetSubjects loads m.subject for the given ids in one query.
+// Liveness is enforced upstream during ranking, so we hydrate
+// whatever was ranked without re-filtering — re-filtering here would
+// silently drop the subject for hits soft-deleted between ranking
+// and hydration.
+func (b *Backend) batchGetSubjects(ctx context.Context, ids []int64) (map[int64]string, error) {
+	if len(ids) == 0 {
+		return nil, nil //nolint:nilnil // empty input → no subjects and no error; callers range the map
+	}
+	rows, err := b.db.QueryContext(ctx,
+		`SELECT id, COALESCE(subject, '') FROM messages WHERE id = ANY($1::bigint[])`,
+		int64Array(ids))
+	if err != nil {
+		return nil, fmt.Errorf("batch get subjects: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := make(map[int64]string, len(ids))
+	for rows.Next() {
+		var id int64
+		var subj string
+		if err := rows.Scan(&id, &subj); err != nil {
+			return nil, fmt.Errorf("scan subject: %w", err)
+		}
+		out[id] = subj
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate subjects: %w", err)
+	}
+	return out, nil
+}
