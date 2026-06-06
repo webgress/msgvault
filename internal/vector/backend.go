@@ -186,7 +186,7 @@ type FusingBackend interface {
 
 // FusedRequest is the parameter bundle for a single-query fused hybrid search.
 type FusedRequest struct {
-	FTSQuery     string    // pre-tokenized FTS5 MATCH expression; empty skips BM25
+	FTSQuery     string    // full-text query; empty skips BM25. Dialect-specific: sqlitevec treats it as an FTS5 MATCH expression, pgvector feeds it raw to websearch_to_tsquery
 	QueryVec     []float32 // query embedding; nil skips ANN
 	Generation   GenerationID
 	KPerSignal   int

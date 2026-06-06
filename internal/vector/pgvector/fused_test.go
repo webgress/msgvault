@@ -88,6 +88,21 @@ func (f *fusedFixture) embedAll(t *testing.T, vecs map[int64][]float32) {
 	require.NoError(t, f.b.ActivateGeneration(f.ctx, gen), "Activate")
 }
 
+// embedChunks creates a generation sized to the first chunk's vector
+// and upserts the supplied chunks verbatim, preserving each chunk's
+// ChunkIndex. Unlike embedAll (one vector per message), this lets a
+// single message carry several chunks so multi-chunk dedup can be
+// exercised. The fixture-seeded message ids must exist beforehand.
+func (f *fusedFixture) embedChunks(t *testing.T, chunks []vector.Chunk) {
+	t.Helper()
+	require.NotEmpty(t, chunks, "embedChunks: no chunks supplied")
+	gen, err := f.b.CreateGeneration(f.ctx, "m", len(chunks[0].Vector), "")
+	require.NoError(t, err, "CreateGeneration")
+	f.gen = gen
+	require.NoError(t, f.b.Upsert(f.ctx, gen, chunks), "Upsert")
+	require.NoError(t, f.b.ActivateGeneration(f.ctx, gen), "Activate")
+}
+
 // seedThree wires up a 3-message corpus with distinct vectors and
 // distinct keyword content so each test below can mix-and-match
 // signal/filter combinations on the same data shape.
@@ -172,6 +187,89 @@ func TestFusedSearch_Hybrid(t *testing.T) {
 	}
 }
 
+// TestFusedSearch_MultiChunk_OneHitPerMessage regression-guards the
+// ANN pool's per-message dedup. The ann_pool CTE collapses chunks via
+// GROUP BY message_id + MIN(distance) (fused.go ~line 114-123). Without
+// that collapse a multi-chunk message yields one ann_pool row per chunk;
+// the FULL OUTER JOIN ... USING (message_id) in the fused CTE then emits
+// duplicate message_id rows and the per-chunk ranks distort RRF.
+//
+// Setup mirrors backend_test.go's TestBackend_Search_MultiChunk_OneHitPerMessage:
+// msg 1 has TWO chunks (chunk_index 0 close to the query along axis 0,
+// chunk_index 1 far along axis 2); msg 2 is a single-chunk competitor on
+// axis 1. The query points along axis 0.
+func TestFusedSearch_MultiChunk_OneHitPerMessage(t *testing.T) {
+	f := newFusedFixture(t)
+	base := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
+	// Both messages match the FTS query so the hybrid path joins ann/fts;
+	// distinct subjects keep the corpus realistic.
+	f.seedMsg(t, 1, "alpha report rollup", "the report covers everything", 10, base, false)
+	f.seedMsg(t, 2, "beta report digest", "another report entirely", 20, base, false)
+	f.embedChunks(t, []vector.Chunk{
+		{MessageID: 1, ChunkIndex: 0, Vector: unitVec(4, 0)}, // CLOSE to query → distance 0
+		{MessageID: 1, ChunkIndex: 1, Vector: unitVec(4, 2)}, // FAR from query  → distance 1
+		{MessageID: 2, ChunkIndex: 0, Vector: unitVec(4, 1)}, // single-chunk competitor
+	})
+
+	// ANN-only: isolates the ann_pool dedup from any FTS contribution.
+	t.Run("ann_only", func(t *testing.T) {
+		hits, _, err := f.b.FusedSearch(f.ctx, vector.FusedRequest{
+			QueryVec:   unitVec(4, 0),
+			Generation: f.gen,
+			KPerSignal: 10,
+			Limit:      10,
+			RRFK:       60,
+		})
+		require.NoError(t, err, "FusedSearch")
+		// Exactly two rows — one per message, no duplicate for msg 1's
+		// second chunk.
+		require.Len(t, hits, 2, "want one row per message; hits=%+v", hits)
+		counts := map[int64]int{}
+		for _, h := range hits {
+			counts[h.MessageID]++
+		}
+		assert.Equal(t, 1, counts[1], "msg 1 must appear exactly once (its two chunks collapse)")
+		assert.Equal(t, 1, counts[2], "msg 2 must appear exactly once")
+		// The close chunk (distance 0) wins the MIN, so msg 1's
+		// VectorScore (= 1 - distance) is ~1.0 and it ranks first.
+		assert.Equal(t, int64(1), hits[0].MessageID, "msg 1 wins on its close chunk")
+		var msg1 vector.FusedHit
+		for _, h := range hits {
+			if h.MessageID == 1 {
+				msg1 = h
+			}
+		}
+		assert.InDelta(t, 1.0, msg1.VectorScore, 1e-6,
+			"msg 1 effective VectorScore must reflect MIN distance (close chunk), got %v", msg1.VectorScore)
+	})
+
+	// Hybrid: the far chunk must not earn msg 1 a second ann_ranked row
+	// that would give it extra RRF weight and crowd out the competitor.
+	t.Run("hybrid", func(t *testing.T) {
+		hits, _, err := f.b.FusedSearch(f.ctx, vector.FusedRequest{
+			FTSQuery:   "report",
+			QueryVec:   unitVec(4, 0),
+			Generation: f.gen,
+			KPerSignal: 10,
+			Limit:      10,
+			RRFK:       60,
+		})
+		require.NoError(t, err, "FusedSearch")
+		require.Len(t, hits, 2, "want exactly msgs 1 and 2, each once; hits=%+v", hits)
+		counts := map[int64]int{}
+		for _, h := range hits {
+			counts[h.MessageID]++
+		}
+		assert.Equal(t, 1, counts[1], "msg 1 must appear exactly once in hybrid mode")
+		assert.Equal(t, 1, counts[2], "competitor msg 2 must not be crowded out")
+		// RRF descending invariant holds.
+		for i := 1; i < len(hits); i++ {
+			assert.GreaterOrEqualf(t, hits[i-1].RRFScore, hits[i].RRFScore,
+				"RRF not descending at %d: %v then %v", i, hits[i-1].RRFScore, hits[i].RRFScore)
+		}
+	})
+}
+
 func TestFusedSearch_Saturated(t *testing.T) {
 	f := seedThree(t)
 	hits, saturated, err := f.b.FusedSearch(f.ctx, vector.FusedRequest{
@@ -188,7 +286,7 @@ func TestFusedSearch_Saturated(t *testing.T) {
 
 func TestFusedSearch_FilterBySource(t *testing.T) {
 	f := seedThree(t)
-	hits, _, err := f.b.FusedSearch(f.ctx, vector.FusedRequest{
+	hits, saturated, err := f.b.FusedSearch(f.ctx, vector.FusedRequest{
 		FTSQuery:   "quantum",
 		Generation: f.gen,
 		KPerSignal: 10,
@@ -199,8 +297,11 @@ func TestFusedSearch_FilterBySource(t *testing.T) {
 	require.NoError(t, err, "FusedSearch")
 	// SourceIDs={20} only allows msg 2 through, which doesn't match 'quantum'.
 	assert.Empty(t, hits, "want empty (source 20 has no quantum match)")
+	// Empty result drives the saturation fallback: with an empty pool
+	// (0 ≤ KPerSignal=10) there is no overflow, so saturated must be false.
+	assert.False(t, saturated, "empty filtered pool cannot saturate")
 
-	hits, _, err = f.b.FusedSearch(f.ctx, vector.FusedRequest{
+	hits, saturated, err = f.b.FusedSearch(f.ctx, vector.FusedRequest{
 		FTSQuery:   "quantum",
 		Generation: f.gen,
 		KPerSignal: 10,
@@ -210,6 +311,7 @@ func TestFusedSearch_FilterBySource(t *testing.T) {
 	})
 	require.NoError(t, err, "FusedSearch (source 10)")
 	assert.Len(t, hits, 2, "want msgs 1+3 in source 10 that match quantum")
+	assert.False(t, saturated, "pool size 2 < KPerSignal 10 must not saturate")
 }
 
 func TestFusedSearch_FilterByDateRange(t *testing.T) {
