@@ -42,7 +42,7 @@ const embedPolicyVersion = 1
 // [vector] TOML table.
 type Config struct {
 	Enabled    bool             `toml:"enabled"`
-	Backend    string           `toml:"backend"` // "sqlite-vec" (MVP); "lance" reserved
+	Backend    string           `toml:"backend"` // "sqlite-vec" or "pgvector"; concrete backend is DSN-selected
 	DBPath     string           `toml:"db_path"` // backend-specific
 	Embeddings EmbeddingsConfig `toml:"embeddings"`
 	Preprocess PreprocessConfig `toml:"preprocess"`
@@ -249,8 +249,14 @@ func (c *Config) GenerationFingerprint() string {
 // Validate returns a descriptive error if the config is unusable.
 // Only called when Enabled is true; disabled configs are not checked.
 func (c *Config) Validate() error {
-	if c.Backend != "sqlite-vec" {
-		return fmt.Errorf("vector.backend: unknown backend %q (only \"sqlite-vec\" is supported in MVP)", c.Backend)
+	// The concrete backend is selected at the command layer from the
+	// database DSN (SQLite → sqlite-vec, PostgreSQL → pgvector); this
+	// field is a declared marker, not the selector. Accept either known
+	// backend and reject anything else.
+	switch c.Backend {
+	case "sqlite-vec", "pgvector":
+	default:
+		return fmt.Errorf("vector.backend: unknown backend %q (supported: \"sqlite-vec\", \"pgvector\")", c.Backend)
 	}
 	if c.Embeddings.Endpoint == "" {
 		return errors.New("vector.embeddings.endpoint: required")
