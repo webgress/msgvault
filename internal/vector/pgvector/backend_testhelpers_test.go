@@ -165,9 +165,8 @@ func seedAndEmbed(t *testing.T, b *Backend, db *sql.DB, vecs map[int64][]float32
 
 	expectedDim := len(vecs[ids[0]])
 	for _, id := range ids {
-		if v := vecs[id]; len(v) != expectedDim {
-			t.Fatalf("seedAndEmbed: vector for msg %d has %d dims, want %d", id, len(v), expectedDim)
-		}
+		v := vecs[id]
+		require.Lenf(t, v, expectedDim, "seedAndEmbed: vector for msg %d has %d dims, want %d", id, len(v), expectedDim)
 	}
 
 	for _, id := range ids {

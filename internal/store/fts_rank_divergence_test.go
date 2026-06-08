@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // pgx driver for the PG sub-test
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil"
 )
@@ -71,7 +73,7 @@ func TestFTSRank_KnownDivergence(t *testing.T) {
 	case "postgres":
 		assertPostgresSubjectHitWins(t)
 	default:
-		t.Fatalf("unknown backend")
+		require.Failf(t, "unknown backend", "%q", currentBackend())
 	}
 }
 
@@ -80,13 +82,9 @@ func assertSQLiteBodyHitWins(t *testing.T) {
 	st := testutil.NewTestStore(t)
 
 	src, err := st.GetOrCreateSource("gmail", "divergence@example.com")
-	if err != nil {
-		t.Fatalf("GetOrCreateSource: %v", err)
-	}
+	require.NoError(t, err, "GetOrCreateSource")
 	convID, err := st.EnsureConversation(src.ID, "divergence-thread", "Divergence Fixture")
-	if err != nil {
-		t.Fatalf("EnsureConversation: %v", err)
-	}
+	require.NoError(t, err, "EnsureConversation")
 
 	mk := func(label, subject, body string) int64 {
 		id, err := st.UpsertMessage(&store.Message{
@@ -98,12 +96,8 @@ func assertSQLiteBodyHitWins(t *testing.T) {
 			Snippet:         nullString(body),
 			SizeEstimate:    int64(len(subject) + len(body)),
 		})
-		if err != nil {
-			t.Fatalf("UpsertMessage(%q): %v", label, err)
-		}
-		if err := st.UpsertFTS(id, subject, body, "noreply@example.com", "", ""); err != nil {
-			t.Fatalf("UpsertFTS(%q): %v", label, err)
-		}
+		require.NoErrorf(t, err, "UpsertMessage(%q)", label)
+		require.NoErrorf(t, st.UpsertFTS(id, subject, body, "noreply@example.com", "", ""), "UpsertFTS(%q)", label)
 		return id
 	}
 
@@ -121,20 +115,16 @@ func assertSQLiteBodyHitWins(t *testing.T) {
 	}
 
 	results, total, err := st.SearchMessages("zappa", 0, 20)
-	if err != nil {
-		t.Fatalf("SearchMessages: %v", err)
-	}
-	if total < 2 || len(results) < 2 {
-		t.Fatalf("got total=%d len=%d, want >= 2 (both adversarial docs must match)",
-			total, len(results))
-	}
+	require.NoError(t, err, "SearchMessages")
+	require.Falsef(t, total < 2 || len(results) < 2,
+		"got total=%d len=%d, want >= 2 (both adversarial docs must match)", total, len(results))
 
 	gotFirst, gotSecond := results[0].ID, results[1].ID
 	wantFirst, wantSecond := bodyHitID, subjectHitID
 	if gotFirst != wantFirst || gotSecond != wantSecond {
-		t.Errorf(
-			"sqlite: documented divergence not reproduced.\n"+
-				"  got order:  [%d, %d, ...]\n"+
+		assert.Failf(t,
+			"sqlite: documented divergence not reproduced",
+			"  got order:  [%d, %d, ...]\n"+
 				"  want order: [%d (body-hit), %d (subject-hit), ...]\n"+
 				"  subject-hit id=%d, body-hit id=%d\n"+
 				"BM25 length normalization should make the short body-hit "+
@@ -158,9 +148,7 @@ func assertPostgresSubjectHitWins(t *testing.T) {
 	// blockers are resolved and the full Store path becomes runnable.
 	dsn := os.Getenv("MSGVAULT_TEST_DB")
 	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("sql.Open(pgx): %v", err)
-	}
+	require.NoError(t, err, "sql.Open(pgx)")
 	defer func() { _ = db.Close() }()
 
 	// Mirror SQLiteDialect.FTSUpsert / FTSSearchClause for PG:
@@ -182,9 +170,7 @@ WHERE v @@ plainto_tsquery('simple', 'zappa')
 ORDER BY score DESC`
 
 	rows, err := db.Query(q, longPadding)
-	if err != nil {
-		t.Fatalf("query ts_rank: %v", err)
-	}
+	require.NoError(t, err, "query ts_rank")
 	defer func() { _ = rows.Close() }()
 
 	var order []string
@@ -192,23 +178,17 @@ ORDER BY score DESC`
 	for rows.Next() {
 		var label string
 		var score float64
-		if err := rows.Scan(&label, &score); err != nil {
-			t.Fatalf("scan: %v", err)
-		}
+		require.NoError(t, rows.Scan(&label, &score), "scan")
 		order = append(order, label)
 		scores = append(scores, score)
 	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("rows.Err: %v", err)
-	}
+	require.NoError(t, rows.Err(), "rows.Err")
 
-	if len(order) < 2 {
-		t.Fatalf("got %d rows, want >= 2", len(order))
-	}
+	require.GreaterOrEqualf(t, len(order), 2, "got %d rows, want >= 2", len(order))
 	if order[0] != "subject-hit" || order[1] != "body-hit" {
-		t.Errorf(
-			"postgres: documented divergence not reproduced.\n"+
-				"  got order:  %v (scores %v)\n"+
+		assert.Failf(t,
+			"postgres: documented divergence not reproduced",
+			"  got order:  %v (scores %v)\n"+
 				"  want order: [subject-hit, body-hit] (subject-hit > body-hit)\n"+
 				"ts_rank() called without a normalization flag must not apply "+
 				"document-length normalization, so setweight('A') on subject "+
