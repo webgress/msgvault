@@ -307,6 +307,16 @@ func openPostgresDB(dbURL string, readOnly bool) (*sql.DB, func(), error) {
 	return db, cleanup, nil
 }
 
+// OpenPostgresDB opens a raw *sql.DB handle for the given PostgreSQL URL using
+// the same connection config (statement_timeout, runtime params) as Store.Open.
+// The returned cleanup func must be called when the handle is no longer needed.
+// Use this for lightweight consumers that only need the *sql.DB handle without
+// the full Store wrapper (e.g. embeddings metadata queries that live in the
+// same PG database as messages but do not need store-level operations).
+func OpenPostgresDB(dbURL string) (*sql.DB, func(), error) {
+	return openPostgresDB(dbURL, false)
+}
+
 // Close checkpoints the WAL (unless read-only) and closes the database.
 func (s *Store) Close() error {
 	if !s.readOnly {
