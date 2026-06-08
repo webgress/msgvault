@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/vector"
 )
 
@@ -45,19 +46,15 @@ func openPGTestDB(t *testing.T) *sql.DB {
 	url := testDBURL(t)
 
 	buf := make([]byte, 8)
-	if _, err := rand.Read(buf); err != nil {
-		t.Fatalf("random schema name: %v", err)
-	}
+	_, err := rand.Read(buf)
+	require.NoError(t, err, "random schema name")
 	schemaName := "pgvec_test_" + hex.EncodeToString(buf)
 
 	setup, err := sql.Open("pgx", url)
-	if err != nil {
-		t.Fatalf("open setup: %v", err)
-	}
+	require.NoError(t, err, "open setup")
 	defer func() { _ = setup.Close() }()
-	if _, err := setup.Exec("CREATE SCHEMA " + schemaName); err != nil {
-		t.Fatalf("create schema: %v", err)
-	}
+	_, err = setup.Exec("CREATE SCHEMA " + schemaName)
+	require.NoError(t, err, "create schema")
 
 	testURL := url
 	sep := "?"
@@ -70,9 +67,7 @@ func openPGTestDB(t *testing.T) *sql.DB {
 	testURL += sep + "search_path=" + schemaName + ",public"
 
 	db, err := sql.Open("pgx", testURL)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
+	require.NoError(t, err, "open")
 
 	t.Cleanup(func() {
 		_ = db.Close()
@@ -84,7 +79,17 @@ func openPGTestDB(t *testing.T) *sql.DB {
 		_, _ = cleanup.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE", schemaName))
 	})
 
-	if _, err := db.Exec(`
+	testSetupPGSchema(t, db)
+	return db
+}
+
+// testSetupPGSchema creates the minimal main-schema tables that all PG
+// test files need. Called by openPGTestDB so that every caller gets a
+// consistent schema; fused tests may extend it with extra columns via
+// ALTER TABLE IF NOT EXISTS / CREATE TABLE IF NOT EXISTS.
+func testSetupPGSchema(t *testing.T, db *sql.DB) {
+	t.Helper()
+	_, err := db.Exec(`
 		CREATE TABLE messages (
 			id BIGINT PRIMARY KEY,
 			source_id BIGINT,
@@ -106,20 +111,16 @@ func openPGTestDB(t *testing.T) *sql.DB {
 			message_id BIGINT NOT NULL,
 			label_id BIGINT NOT NULL,
 			PRIMARY KEY (message_id, label_id)
-		);`); err != nil {
-		t.Fatalf("create main schema: %v", err)
-	}
-
-	return db
+		);`)
+	require.NoError(t, err, "create main schema")
 }
 
 // seedOneMessage inserts a single live message (id=1) into the main
 // schema, mirroring the SQLite testhelper of the same shape.
 func seedOneMessage(t *testing.T, db *sql.DB) {
 	t.Helper()
-	if _, err := db.Exec(`INSERT INTO messages (id) VALUES (1)`); err != nil {
-		t.Fatalf("seed message: %v", err)
-	}
+	_, err := db.Exec(`INSERT INTO messages (id) VALUES (1)`)
+	require.NoError(t, err, "seed message")
 }
 
 // newBackendForTest opens a per-test database with one live message
@@ -130,9 +131,7 @@ func newBackendForTest(t *testing.T) (*Backend, context.Context, *sql.DB) {
 	seedOneMessage(t, db)
 	ctx := context.Background()
 	b, err := Open(ctx, Options{DB: db, Dimension: 768})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
+	require.NoError(t, err, "Open")
 	t.Cleanup(func() { _ = b.Close() })
 	return b, ctx, db
 }
@@ -155,9 +154,7 @@ func unitVec(dim, axis int) []float32 {
 // helper of the same name.
 func seedAndEmbed(t *testing.T, b *Backend, db *sql.DB, vecs map[int64][]float32) vector.GenerationID {
 	t.Helper()
-	if len(vecs) == 0 {
-		t.Fatal("seedAndEmbed: no vectors supplied")
-	}
+	require.NotEmpty(t, vecs, "seedAndEmbed: no vectors supplied")
 	ctx := context.Background()
 
 	ids := make([]int64, 0, len(vecs))
@@ -174,27 +171,22 @@ func seedAndEmbed(t *testing.T, b *Backend, db *sql.DB, vecs map[int64][]float32
 	}
 
 	for _, id := range ids {
-		if _, err := db.ExecContext(ctx,
-			`INSERT INTO messages (id) VALUES ($1) ON CONFLICT DO NOTHING`, id); err != nil {
-			t.Fatalf("seed message %d: %v", id, err)
-		}
+		_, err := db.ExecContext(ctx,
+			`INSERT INTO messages (id) VALUES ($1) ON CONFLICT DO NOTHING`, id)
+		require.NoErrorf(t, err, "seed message %d", id)
 	}
 
 	gid, err := b.CreateGeneration(ctx, "m", expectedDim, "")
-	if err != nil {
-		t.Fatalf("CreateGeneration: %v", err)
-	}
+	require.NoError(t, err, "CreateGeneration")
 
 	chunks := make([]vector.Chunk, 0, len(ids))
 	for _, id := range ids {
 		chunks = append(chunks, vector.Chunk{MessageID: id, Vector: vecs[id]})
 	}
-	if err := b.Upsert(ctx, gid, chunks); err != nil {
-		t.Fatalf("Upsert: %v", err)
-	}
-	if _, err := b.db.ExecContext(ctx,
-		`DELETE FROM pending_embeddings WHERE generation_id = $1`, int64(gid)); err != nil {
-		t.Fatalf("clear pending: %v", err)
-	}
+	require.NoError(t, b.Upsert(ctx, gid, chunks), "Upsert")
+
+	_, err = b.db.ExecContext(ctx,
+		`DELETE FROM pending_embeddings WHERE generation_id = $1`, int64(gid))
+	require.NoError(t, err, "clear pending")
 	return gid
 }

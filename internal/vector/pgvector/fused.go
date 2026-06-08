@@ -258,75 +258,11 @@ SELECT message_id, rrf_score, bm25_score, vector_score,
 
 // applyFilterClauses returns the " AND ..." fragment to append after a
 // LiveMessagesWhere predicate so each WHERE in the fused CTE narrows
-// down to messages matching the structured filter. Mirrors
-// filteredMessageIDs in backend.go but emits SQL only — args are
-// accumulated through the bind closure so the caller controls the
-// $N counter shared across all CTEs.
+// down to messages matching the structured filter. Delegates to
+// buildPGFilterFragment (filter.go) so the clause logic stays in one
+// place and evolves consistently across the fast-path and fused paths.
 func applyFilterClauses(f vector.Filter, bind func(any) string) string {
-	if f.IsEmpty() {
-		return ""
-	}
-	var sb strings.Builder
-	if len(f.SourceIDs) > 0 {
-		fmt.Fprintf(&sb, " AND m.source_id = ANY(%s::bigint[])", bind(int64Array(f.SourceIDs)))
-	}
-	for _, group := range f.SenderGroups {
-		if len(group) == 0 {
-			continue
-		}
-		fmt.Fprintf(&sb, ` AND EXISTS (
-            SELECT 1 FROM message_recipients mr
-             WHERE mr.message_id = m.id
-               AND mr.recipient_type = 'from'
-               AND mr.participant_id = ANY(%s::bigint[]))`, bind(int64Array(group)))
-	}
-	appendRecipientGroups := func(recipientType string, groups [][]int64) {
-		for _, ids := range groups {
-			if len(ids) == 0 {
-				continue
-			}
-			fmt.Fprintf(&sb, ` AND EXISTS (
-            SELECT 1 FROM message_recipients mr
-             WHERE mr.message_id = m.id
-               AND mr.recipient_type = '%s'
-               AND mr.participant_id = ANY(%s::bigint[]))`, recipientType, bind(int64Array(ids)))
-		}
-	}
-	appendRecipientGroups("to", f.ToGroups)
-	appendRecipientGroups("cc", f.CcGroups)
-	appendRecipientGroups("bcc", f.BccGroups)
-	for _, ids := range f.LabelGroups {
-		if len(ids) == 0 {
-			continue
-		}
-		fmt.Fprintf(&sb, ` AND EXISTS (
-            SELECT 1 FROM message_labels ml
-             WHERE ml.message_id = m.id
-               AND ml.label_id = ANY(%s::bigint[]))`, bind(int64Array(ids)))
-	}
-	if f.HasAttachment != nil {
-		fmt.Fprintf(&sb, " AND m.has_attachments = %s", bind(*f.HasAttachment))
-	}
-	if f.After != nil {
-		fmt.Fprintf(&sb, " AND m.sent_at >= %s", bind(*f.After))
-	}
-	if f.Before != nil {
-		fmt.Fprintf(&sb, " AND m.sent_at < %s", bind(*f.Before))
-	}
-	if f.LargerThan != nil {
-		fmt.Fprintf(&sb, " AND m.size_estimate > %s", bind(*f.LargerThan))
-	}
-	if f.SmallerThan != nil {
-		fmt.Fprintf(&sb, " AND m.size_estimate < %s", bind(*f.SmallerThan))
-	}
-	for _, term := range f.SubjectSubstrings {
-		// Case-insensitive subject match: LOWER on both sides mirrors
-		// backend.go's filteredMessageIDs so the two filter paths agree.
-		// ESCAPE semantics survive because escape chars are ASCII.
-		fmt.Fprintf(&sb, ` AND LOWER(m.subject) LIKE LOWER(%s) ESCAPE '\'`,
-			bind("%"+escapeLikeSubject(term)+"%"))
-	}
-	return sb.String()
+	return buildPGFilterFragment(f, bind)
 }
 
 // applySubjectBoost re-ranks hits whose subject contains any of the

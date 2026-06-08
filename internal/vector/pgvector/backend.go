@@ -663,7 +663,6 @@ func (b *Backend) scanHits(ctx context.Context, query string, args ...any) ([]ve
 // json_each. Date bounds bind time.Time directly because messages.sent_at
 // is TIMESTAMPTZ in schema_pg.sql.
 func (b *Backend) filteredMessageIDs(ctx context.Context, f vector.Filter) ([]int64, error) {
-	clauses := []string{store.LiveMessagesWhere("m", true)}
 	var args []any
 	// bind appends v as a query argument and returns the matching $N
 	// placeholder. Using a counter-based helper keeps the conditional
@@ -673,73 +672,7 @@ func (b *Backend) filteredMessageIDs(ctx context.Context, f vector.Filter) ([]in
 		return fmt.Sprintf("$%d", len(args))
 	}
 
-	if len(f.SourceIDs) > 0 {
-		clauses = append(clauses, fmt.Sprintf("m.source_id = ANY(%s::bigint[])", bind(int64Array(f.SourceIDs))))
-	}
-	for _, group := range f.SenderGroups {
-		if len(group) == 0 {
-			continue
-		}
-		clauses = append(clauses, fmt.Sprintf(
-			`EXISTS (
-				SELECT 1 FROM message_recipients mr
-				 WHERE mr.message_id = m.id
-				   AND mr.recipient_type = 'from'
-				   AND mr.participant_id = ANY(%s::bigint[])
-			)`, bind(int64Array(group))))
-	}
-	addRecipientGroups := func(recipientType string, groups [][]int64) {
-		for _, ids := range groups {
-			if len(ids) == 0 {
-				continue
-			}
-			clauses = append(clauses, fmt.Sprintf(
-				`EXISTS (
-					SELECT 1 FROM message_recipients mr
-					 WHERE mr.message_id = m.id
-					   AND mr.recipient_type = '%s'
-					   AND mr.participant_id = ANY(%s::bigint[])
-				)`, recipientType, bind(int64Array(ids))))
-		}
-	}
-	addRecipientGroups("to", f.ToGroups)
-	addRecipientGroups("cc", f.CcGroups)
-	addRecipientGroups("bcc", f.BccGroups)
-
-	if f.HasAttachment != nil {
-		clauses = append(clauses, "m.has_attachments = "+bind(*f.HasAttachment))
-	}
-	if f.After != nil {
-		clauses = append(clauses, "m.sent_at >= "+bind(*f.After))
-	}
-	if f.Before != nil {
-		clauses = append(clauses, "m.sent_at < "+bind(*f.Before))
-	}
-	if f.LargerThan != nil {
-		clauses = append(clauses, "m.size_estimate > "+bind(*f.LargerThan))
-	}
-	if f.SmallerThan != nil {
-		clauses = append(clauses, "m.size_estimate < "+bind(*f.SmallerThan))
-	}
-	for _, term := range f.SubjectSubstrings {
-		// Case-insensitive to match SQLite's default ASCII-insensitive
-		// LIKE and the store/query PostgreSQL search path. LOWER on both
-		// sides keeps ESCAPE semantics intact (escape chars are ASCII).
-		clauses = append(clauses, fmt.Sprintf(
-			`LOWER(m.subject) LIKE LOWER(%s) ESCAPE '\'`,
-			bind("%"+escapeLikeSubject(term)+"%")))
-	}
-	for _, ids := range f.LabelGroups {
-		if len(ids) == 0 {
-			continue
-		}
-		clauses = append(clauses, fmt.Sprintf(
-			`EXISTS (SELECT 1 FROM message_labels ml
-			          WHERE ml.message_id = m.id
-			            AND ml.label_id = ANY(%s::bigint[]))`,
-			bind(int64Array(ids))))
-	}
-
+	clauses := append([]string{store.LiveMessagesWhere("m", true)}, buildPGFilterClauses(f, bind)...)
 	query := `SELECT m.id FROM messages m WHERE ` + strings.Join(clauses, " AND ")
 	rows, err := b.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -759,15 +692,6 @@ func (b *Backend) filteredMessageIDs(ctx context.Context, f vector.Filter) ([]in
 		return nil, fmt.Errorf("iterate filter ids: %w", err)
 	}
 	return out, nil
-}
-
-// escapeLikeSubject escapes SQL LIKE special characters so they match
-// literally. Mirrors the sqlitevec helper of the same name.
-func escapeLikeSubject(s string) string {
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `%`, `\%`)
-	s = strings.ReplaceAll(s, `_`, `\_`)
-	return s
 }
 
 // Delete removes the given messages from the specified generation in

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil"
 )
@@ -27,21 +29,13 @@ func newAttachmentCorpus(t *testing.T) *attachmentCorpus {
 	st := testutil.NewTestStore(t)
 
 	srcA, err := st.GetOrCreateSource("gmail", "alice@example.com")
-	if err != nil {
-		t.Fatalf("GetOrCreateSource A: %v", err)
-	}
+	require.NoError(t, err, "GetOrCreateSource A")
 	srcB, err := st.GetOrCreateSource("gmail", "bob@example.com")
-	if err != nil {
-		t.Fatalf("GetOrCreateSource B: %v", err)
-	}
+	require.NoError(t, err, "GetOrCreateSource B")
 	convA, err := st.EnsureConversation(srcA.ID, "thread-A", "Thread A")
-	if err != nil {
-		t.Fatalf("EnsureConversation A: %v", err)
-	}
+	require.NoError(t, err, "EnsureConversation A")
 	convB, err := st.EnsureConversation(srcB.ID, "thread-B", "Thread B")
-	if err != nil {
-		t.Fatalf("EnsureConversation B: %v", err)
-	}
+	require.NoError(t, err, "EnsureConversation B")
 
 	return &attachmentCorpus{
 		t:       t,
@@ -63,9 +57,7 @@ func (c *attachmentCorpus) addMessage(gmailID string, sourceID, convID int64) in
 		MessageType:     "email",
 		SizeEstimate:    100,
 	})
-	if err != nil {
-		c.t.Fatalf("UpsertMessage(%s): %v", gmailID, err)
-	}
+	require.NoErrorf(c.t, err, "UpsertMessage(%s)", gmailID)
 	c.msgRows[gmailID] = id
 	return id
 }
@@ -73,22 +65,18 @@ func (c *attachmentCorpus) addMessage(gmailID string, sourceID, convID int64) in
 func (c *attachmentCorpus) addAttachment(gmailID, filename, hash string) {
 	c.t.Helper()
 	msgID, ok := c.msgRows[gmailID]
-	if !ok {
-		c.t.Fatalf("addAttachment: unknown gmail id %q", gmailID)
-	}
+	require.Truef(c.t, ok, "addAttachment: unknown gmail id %q", gmailID)
 	storagePath := hash[:2] + "/" + hash
-	if err := c.store.UpsertAttachment(msgID, filename, "application/pdf",
-		storagePath, hash, 100); err != nil {
-		c.t.Fatalf("UpsertAttachment(%s, %s): %v", gmailID, filename, err)
-	}
+	err := c.store.UpsertAttachment(msgID, filename, "application/pdf",
+		storagePath, hash, 100)
+	require.NoErrorf(c.t, err, "UpsertAttachment(%s, %s)", gmailID, filename)
 }
 
 func (c *attachmentCorpus) attachmentRowCount() int {
 	c.t.Helper()
 	var n int
-	if err := c.store.DB().QueryRow(`SELECT COUNT(*) FROM attachments`).Scan(&n); err != nil {
-		c.t.Fatalf("attachmentRowCount: %v", err)
-	}
+	err := c.store.DB().QueryRow(`SELECT COUNT(*) FROM attachments`).Scan(&n)
+	require.NoError(c.t, err, "attachmentRowCount")
 	return n
 }
 
@@ -104,9 +92,7 @@ func (c *attachmentCorpus) attachmentRowsForHash(hash string) int {
 		c.store.Rebind(`SELECT COUNT(*) FROM attachments WHERE content_hash = ?`),
 		hash,
 	).Scan(&n)
-	if err != nil {
-		c.t.Fatalf("attachmentRowsForHash(%s): %v", hash, err)
-	}
+	require.NoErrorf(c.t, err, "attachmentRowsForHash(%s)", hash)
 	return n
 }
 
@@ -135,24 +121,16 @@ func TestAttachment_E2E_MultiMessageDedup(t *testing.T) {
 	c.addAttachment("msg-3", "shared.pdf", hashShared)
 
 	// One row per message, all referencing the same hash.
-	if got := c.attachmentRowsForHash(hashShared); got != 3 {
-		t.Errorf("rows for hashShared = %d, want 3", got)
-	}
+	assert.Equal(t, 3, c.attachmentRowsForHash(hashShared), "rows for hashShared")
 
 	// Idempotent re-upsert: existing (message_id, content_hash) is a no-op.
 	c.addAttachment("msg-2", "shared.pdf", hashShared)
-	if got := c.attachmentRowsForHash(hashShared); got != 3 {
-		t.Errorf("rows for hashShared after re-upsert = %d, want 3", got)
-	}
+	assert.Equal(t, 3, c.attachmentRowsForHash(hashShared), "rows for hashShared after re-upsert")
 
 	// IsAttachmentPathReferenced reports the hash storage path as referenced.
 	referenced, err := c.store.IsAttachmentPathReferenced(hashShared[:2] + "/" + hashShared)
-	if err != nil {
-		t.Fatalf("IsAttachmentPathReferenced: %v", err)
-	}
-	if !referenced {
-		t.Error("expected referenced=true while messages still hold the hash")
-	}
+	require.NoError(t, err, "IsAttachmentPathReferenced")
+	assert.True(t, referenced, "expected referenced=true while messages still hold the hash")
 }
 
 // TestAttachment_E2E_CascadeOnMessageDelete verifies that deleting a message
@@ -170,42 +148,27 @@ func TestAttachment_E2E_CascadeOnMessageDelete(t *testing.T) {
 	c.addAttachment("msg-2", "shared.pdf", hashShared)
 	c.addAttachment("msg-3", "unique.pdf", hashUniqA)
 
-	if got := c.attachmentRowCount(); got != 3 {
-		t.Errorf("initial attachment count = %d, want 3", got)
-	}
+	assert.Equal(t, 3, c.attachmentRowCount(), "initial attachment count")
 
 	// Permanently delete msg-1; its attachment row cascades.
-	if err := c.store.MarkMessageDeletedByGmailID(true, "msg-1"); err != nil {
-		t.Fatalf("MarkMessageDeletedByGmailID(permanent, msg-1): %v", err)
-	}
+	err := c.store.MarkMessageDeletedByGmailID(true, "msg-1")
+	require.NoError(t, err, "MarkMessageDeletedByGmailID(permanent, msg-1)")
 
-	if got := c.attachmentRowsForHash(hashShared); got != 1 {
-		t.Errorf("rows for hashShared after delete = %d, want 1", got)
-	}
+	assert.Equal(t, 1, c.attachmentRowsForHash(hashShared), "rows for hashShared after delete")
 
 	// The shared storage path is still referenced (msg-2 holds it).
 	referenced, err := c.store.IsAttachmentPathReferenced(hashShared[:2] + "/" + hashShared)
-	if err != nil {
-		t.Fatalf("IsAttachmentPathReferenced: %v", err)
-	}
-	if !referenced {
-		t.Error("shared path should remain referenced via msg-2 after msg-1 delete")
-	}
+	require.NoError(t, err, "IsAttachmentPathReferenced")
+	assert.True(t, referenced, "shared path should remain referenced via msg-2 after msg-1 delete")
 
 	// Now delete the last referrer of hashShared.
-	if err := c.store.MarkMessageDeletedByGmailID(true, "msg-2"); err != nil {
-		t.Fatalf("MarkMessageDeletedByGmailID(permanent, msg-2): %v", err)
-	}
-	if got := c.attachmentRowsForHash(hashShared); got != 0 {
-		t.Errorf("rows for hashShared after both deleted = %d, want 0", got)
-	}
+	err = c.store.MarkMessageDeletedByGmailID(true, "msg-2")
+	require.NoError(t, err, "MarkMessageDeletedByGmailID(permanent, msg-2)")
+	assert.Equal(t, 0, c.attachmentRowsForHash(hashShared), "rows for hashShared after both deleted")
+
 	referenced, err = c.store.IsAttachmentPathReferenced(hashShared[:2] + "/" + hashShared)
-	if err != nil {
-		t.Fatalf("IsAttachmentPathReferenced: %v", err)
-	}
-	if referenced {
-		t.Error("shared path should be unreferenced after both messages deleted")
-	}
+	require.NoError(t, err, "IsAttachmentPathReferenced after both deleted")
+	assert.False(t, referenced, "shared path should be unreferenced after both messages deleted")
 }
 
 // TestAttachment_E2E_CrossSourceDedupPromotion verifies that
@@ -229,42 +192,31 @@ func TestAttachment_E2E_CrossSourceDedupPromotion(t *testing.T) {
 
 	// Before removing B: A's unique-set is just hashUniqA.
 	pathsA, err := c.store.AttachmentPathsUniqueToSource(c.srcA.ID)
-	if err != nil {
-		t.Fatalf("AttachmentPathsUniqueToSource(A): %v", err)
-	}
+	require.NoError(t, err, "AttachmentPathsUniqueToSource(A)")
 	wantA := hashUniqA[:2] + "/" + hashUniqA
-	if len(pathsA) != 1 || pathsA[0] != wantA {
-		t.Errorf("pathsA before B removal = %v, want [%s]", pathsA, wantA)
+	if assert.Len(t, pathsA, 1, "pathsA before B removal") {
+		assert.Equal(t, wantA, pathsA[0], "pathsA[0] before B removal")
 	}
 
 	// Symmetric: B has only unique-B as a unique path.
 	pathsB, err := c.store.AttachmentPathsUniqueToSource(c.srcB.ID)
-	if err != nil {
-		t.Fatalf("AttachmentPathsUniqueToSource(B): %v", err)
-	}
+	require.NoError(t, err, "AttachmentPathsUniqueToSource(B)")
 	wantB := hashUniqB[:2] + "/" + hashUniqB
-	if len(pathsB) != 1 || pathsB[0] != wantB {
-		t.Errorf("pathsB before A removal = %v, want [%s]", pathsB, wantB)
+	if assert.Len(t, pathsB, 1, "pathsB before A removal") {
+		assert.Equal(t, wantB, pathsB[0], "pathsB[0] before A removal")
 	}
 
 	// Remove source B. The shared hash is now unique to A.
-	if err := c.store.RemoveSource(c.srcB.ID); err != nil {
-		t.Fatalf("RemoveSource(B): %v", err)
-	}
+	err = c.store.RemoveSource(c.srcB.ID)
+	require.NoError(t, err, "RemoveSource(B)")
 
 	pathsA, err = c.store.AttachmentPathsUniqueToSource(c.srcA.ID)
-	if err != nil {
-		t.Fatalf("AttachmentPathsUniqueToSource(A) after B removal: %v", err)
-	}
+	require.NoError(t, err, "AttachmentPathsUniqueToSource(A) after B removal")
 	got := testutil.MakeSet(pathsA...)
 	for _, want := range []string{hashShared[:2] + "/" + hashShared, wantA} {
-		if !got[want] {
-			t.Errorf("paths missing %q after B removal; got %v", want, pathsA)
-		}
+		assert.Truef(t, got[want], "paths missing %q after B removal; got %v", want, pathsA)
 	}
-	if len(pathsA) != 2 {
-		t.Errorf("pathsA len after B removal = %d, want 2; got %v", len(pathsA), pathsA)
-	}
+	assert.Len(t, pathsA, 2, "pathsA len after B removal; got %v", pathsA)
 }
 
 // TestAttachment_E2E_RemoveSourceCascadesAttachmentRows verifies that
@@ -278,33 +230,20 @@ func TestAttachment_E2E_RemoveSourceCascadesAttachmentRows(t *testing.T) {
 	c.addAttachment("msg-a1", "shared.pdf", hashShared)
 	c.addAttachment("msg-b1", "shared.pdf", hashShared)
 
-	if got := c.attachmentRowCount(); got != 2 {
-		t.Errorf("initial attachment count = %d, want 2", got)
-	}
-	if got := c.attachmentRowsForHash(hashShared); got != 2 {
-		t.Errorf("initial rows for shared hash = %d, want 2", got)
-	}
+	assert.Equal(t, 2, c.attachmentRowCount(), "initial attachment count")
+	assert.Equal(t, 2, c.attachmentRowsForHash(hashShared), "initial rows for shared hash")
 
-	if err := c.store.RemoveSource(c.srcA.ID); err != nil {
-		t.Fatalf("RemoveSource(A): %v", err)
-	}
+	err := c.store.RemoveSource(c.srcA.ID)
+	require.NoError(t, err, "RemoveSource(A)")
 
-	if got := c.attachmentRowCount(); got != 1 {
-		t.Errorf("attachment count after A removed = %d, want 1", got)
-	}
-	if got := c.attachmentRowsForHash(hashShared); got != 1 {
-		t.Errorf("rows for shared hash after A removed = %d, want 1 (B keeps reference)", got)
-	}
+	assert.Equal(t, 1, c.attachmentRowCount(), "attachment count after A removed")
+	assert.Equal(t, 1, c.attachmentRowsForHash(hashShared), "rows for shared hash after A removed (B keeps reference)")
 
 	// IsAttachmentPathReferenced still reports the shared path as referenced
 	// (B's row).
 	referenced, err := c.store.IsAttachmentPathReferenced(hashShared[:2] + "/" + hashShared)
-	if err != nil {
-		t.Fatalf("IsAttachmentPathReferenced: %v", err)
-	}
-	if !referenced {
-		t.Error("shared path should remain referenced via source B")
-	}
+	require.NoError(t, err, "IsAttachmentPathReferenced")
+	assert.True(t, referenced, "shared path should remain referenced via source B")
 }
 
 // TestAttachment_E2E_OrphanCleanupLifecycle simulates the full orphan-cleanup
@@ -328,42 +267,28 @@ func TestAttachment_E2E_OrphanCleanupLifecycle(t *testing.T) {
 	// Pipeline step 1: collect candidate paths for source A *before* the
 	// cascade — matching remove_account.go's ordering.
 	candidates, err := c.store.AttachmentPathsUniqueToSource(c.srcA.ID)
-	if err != nil {
-		t.Fatalf("AttachmentPathsUniqueToSource(A): %v", err)
-	}
+	require.NoError(t, err, "AttachmentPathsUniqueToSource(A)")
 	wantUniqAPath := hashUniqA[:2] + "/" + hashUniqA
-	if len(candidates) != 1 || candidates[0] != wantUniqAPath {
-		t.Errorf("candidates for A = %v, want [%s]", candidates, wantUniqAPath)
+	if assert.Len(t, candidates, 1, "candidates for A") {
+		assert.Equal(t, wantUniqAPath, candidates[0], "candidates[0] for A")
 	}
 
 	// Pipeline step 2: cascade-delete source A.
 	hadActive, err := c.store.RemoveSourceSerialized(context.Background(), c.srcA.ID)
-	if err != nil {
-		t.Fatalf("RemoveSourceSerialized(A): %v", err)
-	}
-	if hadActive {
-		t.Error("hadActiveSync = true, want false (no sync running in fixture)")
-	}
+	require.NoError(t, err, "RemoveSourceSerialized(A)")
+	assert.False(t, hadActive, "hadActiveSync want false (no sync running in fixture)")
 
 	// Pipeline step 3: per-candidate reference recheck. The candidate path
 	// for A is now unreferenced (msg-a2 row is gone); the shared path is
 	// still referenced by source B.
 	referenced, err := c.store.IsAttachmentPathReferenced(wantUniqAPath)
-	if err != nil {
-		t.Fatalf("IsAttachmentPathReferenced(uniqA): %v", err)
-	}
-	if referenced {
-		t.Error("uniqA path should be unreferenced after source A removed")
-	}
+	require.NoError(t, err, "IsAttachmentPathReferenced(uniqA)")
+	assert.False(t, referenced, "uniqA path should be unreferenced after source A removed")
 
 	sharedPath := hashShared[:2] + "/" + hashShared
 	referenced, err = c.store.IsAttachmentPathReferenced(sharedPath)
-	if err != nil {
-		t.Fatalf("IsAttachmentPathReferenced(shared): %v", err)
-	}
-	if !referenced {
-		t.Error("shared path should remain referenced after source A removed")
-	}
+	require.NoError(t, err, "IsAttachmentPathReferenced(shared)")
+	assert.True(t, referenced, "shared path should remain referenced after source A removed")
 }
 
 // TestAttachment_E2E_NullAndEmptyHashesIgnored verifies that attachments with
@@ -386,22 +311,17 @@ func TestAttachment_E2E_NullAndEmptyHashesIgnored(t *testing.T) {
 		 VALUES (?, 'null-hash.pdf', 'application/pdf', 'nn/nullpath', NULL, 0, %s)`,
 		"CURRENT_TIMESTAMP",
 	)), c.msgRows["msg-a2"])
-	if err != nil {
-		t.Fatalf("insert null-hash attachment: %v", err)
-	}
+	require.NoError(t, err, "insert null-hash attachment")
 
 	// Attachment with empty storage_path — also excluded.
-	if err := c.store.UpsertAttachment(c.msgRows["msg-a3"], "empty.pdf",
-		"application/pdf", "", "emptypathhash", 0); err != nil {
-		t.Fatalf("UpsertAttachment(empty): %v", err)
-	}
+	err = c.store.UpsertAttachment(c.msgRows["msg-a3"], "empty.pdf",
+		"application/pdf", "", "emptypathhash", 0)
+	require.NoError(t, err, "UpsertAttachment(empty)")
 
 	paths, err := c.store.AttachmentPathsUniqueToSource(c.srcA.ID)
-	if err != nil {
-		t.Fatalf("AttachmentPathsUniqueToSource: %v", err)
-	}
+	require.NoError(t, err, "AttachmentPathsUniqueToSource")
 	want := hashUniqA[:2] + "/" + hashUniqA
-	if len(paths) != 1 || paths[0] != want {
-		t.Errorf("paths = %v, want [%s] only", paths, want)
+	if assert.Len(t, paths, 1, "paths want 1 only") {
+		assert.Equal(t, want, paths[0], "paths[0]")
 	}
 }
