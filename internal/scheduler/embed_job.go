@@ -18,6 +18,9 @@ type EmbedRunner interface {
 	ReclaimStale(ctx context.Context) (int, error)
 }
 
+// Compile-time check that the production worker satisfies EmbedRunner.
+var _ EmbedRunner = (*embed.Worker)(nil)
+
 // EmbedJob runs the vector-embedding worker. Each invocation prefers
 // an in-flight rebuild for the configured fingerprint over the
 // existing active generation, drains its queue via RunOnce, and
