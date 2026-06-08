@@ -120,8 +120,9 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
 		// Use an inner SELECT with ORDER BY <=> LIMIT so pgvector can
 		// apply the HNSW index before the outer GROUP BY collapses
 		// multi-chunk messages. The filtered CTE already constrains the
-		// candidate set; the inner subquery fetches (KPerSignal+1)*maxChunks
-		// chunks in ANN order (HNSW-eligible), then the outer GROUP BY picks
+		// candidate set; the inner subquery fetches
+		// (KPerSignal+1)*fusedANNChunksPerMessage chunks in ANN order
+		// (HNSW-eligible), then the outer GROUP BY picks
 		// the best-scoring chunk per message via MIN(distance) and limits to
 		// KPerSignal+1 distinct messages. This ensures the outer LIMIT is
 		// applied after dedup, not before.
