@@ -257,10 +257,22 @@ func hydrateHybridResults(ctx context.Context, db *sql.DB, rebind func(string) s
 	// whose row was soft-deleted between ranking and hydration,
 	// returning a result list shorter than the ranked hits. Hydrate
 	// whatever was ranked.
+	//
+	// Sender hydration: email messages store the sender in
+	// message_recipients (recipient_type='from'); chat/SMS messages
+	// store it via messages.sender_id. COALESCE the subquery result
+	// first so that the message_recipients path wins for email
+	// (matching the main query engine's behaviour) and falls back to
+	// sender_id for chat/SMS sources.
 	q := rebind(fmt.Sprintf(`
 		SELECT m.id, COALESCE(m.subject,''), COALESCE(p.email_address,''), m.sent_at
 		FROM messages m
-		LEFT JOIN participants p ON p.id = m.sender_id
+		LEFT JOIN participants p ON p.id = COALESCE(
+			(SELECT mr.participant_id FROM message_recipients mr
+			 WHERE mr.message_id = m.id AND mr.recipient_type = 'from'
+			 ORDER BY mr.id LIMIT 1),
+			m.sender_id
+		)
 		WHERE m.id IN (%s)`, strings.Join(placeholders, ",")))
 	rows, err := db.QueryContext(ctx, q, args...)
 	if err != nil {

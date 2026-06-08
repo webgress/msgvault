@@ -179,12 +179,16 @@ func runEmbeddingsActivate(cmd *cobra.Command, args []string) error {
 func openEmbeddingsMetadataDB() (*sql.DB, func(string) string, func(), error) {
 	dsn := cfg.DatabaseDSN()
 	if store.IsPostgresURL(dsn) {
-		db, err := sql.Open("pgx", dsn)
+		// Use the store-level PG opener so that connection runtime params
+		// (statement_timeout) and the pgx stdlib registration are applied
+		// consistently with the rest of the codebase. Raw sql.Open("pgx",
+		// dsn) bypasses those settings.
+		db, cleanup, err := store.OpenPostgresDB(dsn)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("open postgres for embeddings metadata: %w", err)
 		}
 		rebind := (&store.PostgreSQLDialect{}).Rebind
-		return db, rebind, func() { _ = db.Close() }, nil
+		return db, rebind, func() { _ = db.Close(); cleanup() }, nil
 	}
 
 	vecPath := cfg.Vector.DBPath
