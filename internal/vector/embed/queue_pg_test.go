@@ -230,17 +230,6 @@ func TestQueuePG_Complete_AfterReclaim_PreservesNewClaim(t *testing.T) {
 	assert.Equal(t, 0, remaining, "pending rows after B's Complete")
 }
 
-// openPGQueueDB2 opens a second independent *sql.DB connection to the same
-// scoped schema that db was created against. The second connection uses the
-// search_path embedded in testURL so it targets the same isolated schema.
-func openPGQueueDB2(t *testing.T, testURL string) *sql.DB {
-	t.Helper()
-	db2, err := sql.Open("pgx", testURL)
-	require.NoError(t, err, "open second db connection")
-	t.Cleanup(func() { _ = db2.Close() })
-	return db2
-}
-
 // TestQueuePG_ConcurrentClaim_SkipLocked verifies that FOR UPDATE SKIP LOCKED
 // prevents two concurrent claimers from double-claiming the same rows. Each
 // claimer runs on a separate *sql.DB (independent connection pool) so the
