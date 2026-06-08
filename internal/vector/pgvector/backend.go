@@ -45,8 +45,7 @@ type Options struct {
 // with the pgvector extension. The same *sql.DB also serves the main
 // msgvault schema (messages, message_recipients, message_labels).
 type Backend struct {
-	db  *sql.DB
-	dim int
+	db *sql.DB
 }
 
 // Open verifies the database is reachable, applies the embedding schema
@@ -62,7 +61,7 @@ func Open(ctx context.Context, opts Options) (*Backend, error) {
 			return nil, fmt.Errorf("pgvector migrate: %w", err)
 		}
 	}
-	return &Backend{db: opts.DB, dim: opts.Dimension}, nil
+	return &Backend{db: opts.DB}, nil
 }
 
 // Close is a no-op for the pgvector backend: the *sql.DB handle is
@@ -607,16 +606,17 @@ func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec 
 			               (e.embedding::vector(%[1]d)) <=> $1::vector AS distance
 			          FROM embeddings e
 			         WHERE e.generation_id = $2
+			           AND e.dimension = $3
 			           AND EXISTS (
 			                SELECT 1 FROM messages m
 			                 WHERE m.id = e.message_id AND %[2]s)
 			         ORDER BY e.embedding::vector(%[1]d) <=> $1::vector
-			         LIMIT $3
+			         LIMIT $4
 			       ) ann
 			 GROUP BY ann.message_id
 			 ORDER BY distance
-			 LIMIT $4`, dim, store.LiveMessagesWhere("m", true))
-		return b.scanHits(ctx, stmt, queryVecLit, int64(gen), k*overFetch, k)
+			 LIMIT $5`, dim, store.LiveMessagesWhere("m", true))
+		return b.scanHits(ctx, stmt, queryVecLit, int64(gen), int64(dim), k*overFetch, k)
 	}
 
 	ids, err := b.filteredMessageIDs(ctx, filter)
@@ -639,14 +639,15 @@ func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec 
 		               (e.embedding::vector(%d)) <=> $1::vector AS distance
 		          FROM embeddings e
 		         WHERE e.generation_id = $2
-		           AND e.message_id = ANY($3::bigint[])
+		           AND e.dimension = $3
+		           AND e.message_id = ANY($4::bigint[])
 		         ORDER BY e.embedding::vector(%d) <=> $1::vector
-		         LIMIT $4
+		         LIMIT $5
 		       ) ann
 		 GROUP BY ann.message_id
 		 ORDER BY distance
-		 LIMIT $5`, dim, dim)
-	return b.scanHits(ctx, stmt, queryVecLit, int64(gen), int64Array(ids), k*overFetch, k)
+		 LIMIT $6`, dim, dim)
+	return b.scanHits(ctx, stmt, queryVecLit, int64(gen), int64(dim), int64Array(ids), k*overFetch, k)
 }
 
 func (b *Backend) scanHits(ctx context.Context, query string, args ...any) ([]vector.Hit, error) {
