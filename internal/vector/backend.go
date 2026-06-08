@@ -72,10 +72,11 @@ type Chunk struct {
 //   - Sender/To/Cc/Bcc/LabelGroups are AND-of-OR groups: each inner
 //     slice is one search-token resolution (substring → matching IDs).
 //     SenderGroups is at the message level too — multiple `from`
-//     recipient rows on a single message can satisfy different tokens,
-//     and the message's sender_id is also considered for each group
-//     (legacy rows where sender_id is NULL fall back to a `from`
-//     recipient row).
+//     recipient rows on a single message can satisfy different tokens.
+//     Matching is solely against `from` recipient rows in
+//     message_recipients; messages.sender_id is intentionally NOT
+//     consulted, mirroring the canonical FTS filter in
+//     internal/store/api.go so the vector and SQLite paths agree.
 //   - SubjectSubstrings each add one `m.subject LIKE ? ESCAPE '\'`
 //     condition, ANDed together (all substrings must match).
 //   - After/Before are half-open against m.sent_at:
