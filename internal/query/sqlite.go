@@ -379,38 +379,33 @@ func (e *SQLiteEngine) buildFilterJoinsAndConditions(filter MessageFilter, table
 		))`, participantNameExpr("p_sn"), participantNameExpr("p_ds")))
 	}
 
-	// Recipient filter
+	// Recipient filter — use EXISTS to avoid 1:N join multiplication.
 	if filter.Recipient != "" {
-		joins = append(joins, `
-			JOIN message_recipients mr_filter_to ON mr_filter_to.message_id = m.id AND mr_filter_to.recipient_type IN ('to', 'cc', 'bcc')
+		conditions = append(conditions, `EXISTS (
+			SELECT 1 FROM message_recipients mr_filter_to
 			JOIN participants p_filter_to ON p_filter_to.id = mr_filter_to.participant_id
-		`)
-		conditions = append(conditions, "p_filter_to.email_address = ?")
+			WHERE mr_filter_to.message_id = m.id
+			  AND mr_filter_to.recipient_type IN ('to', 'cc', 'bcc')
+			  AND p_filter_to.email_address = ?
+		)`)
 		args = append(args, filter.Recipient)
 	} else if filter.MatchesEmpty(ViewRecipients) {
-		joins = append(joins, `
-			LEFT JOIN message_recipients mr_filter_to ON mr_filter_to.message_id = m.id AND mr_filter_to.recipient_type IN ('to', 'cc', 'bcc')
-		`)
-		conditions = append(conditions, "mr_filter_to.id IS NULL")
+		conditions = append(conditions, `NOT EXISTS (
+			SELECT 1 FROM message_recipients mr_filter_to
+			WHERE mr_filter_to.message_id = m.id
+			  AND mr_filter_to.recipient_type IN ('to', 'cc', 'bcc')
+		)`)
 	}
 
-	// Recipient name filter — reuses the Recipient filter's join when present,
-	// ensuring both predicates apply to the same participant row.
+	// Recipient name filter — use EXISTS to avoid 1:N join multiplication.
 	if filter.RecipientName != "" {
-		if filter.Recipient == "" && filter.MatchesEmpty(ViewRecipients) {
-			// MatchEmptyRecipient LEFT JOINs mr without participants — add
-			// the participants join so the p_filter_to alias is available.
-			// (This combination is contradictory and will return 0 rows.)
-			joins = append(joins, `
-				JOIN participants p_filter_to ON p_filter_to.id = mr_filter_to.participant_id
-			`)
-		} else if filter.Recipient == "" && !filter.MatchesEmpty(ViewRecipients) {
-			joins = append(joins, `
-				JOIN message_recipients mr_filter_to ON mr_filter_to.message_id = m.id AND mr_filter_to.recipient_type IN ('to', 'cc', 'bcc')
-				JOIN participants p_filter_to ON p_filter_to.id = mr_filter_to.participant_id
-			`)
-		}
-		conditions = append(conditions, participantNameExpr("p_filter_to")+" = ?")
+		conditions = append(conditions, fmt.Sprintf(`EXISTS (
+			SELECT 1 FROM message_recipients mr_filter_to
+			JOIN participants p_filter_to ON p_filter_to.id = mr_filter_to.participant_id
+			WHERE mr_filter_to.message_id = m.id
+			  AND mr_filter_to.recipient_type IN ('to', 'cc', 'bcc')
+			  AND %s = ?
+		)`, participantNameExpr("p_filter_to")))
 		args = append(args, filter.RecipientName)
 	} else if filter.MatchesEmpty(ViewRecipientNames) {
 		conditions = append(conditions, fmt.Sprintf(`NOT EXISTS (
@@ -443,13 +438,14 @@ func (e *SQLiteEngine) buildFilterJoinsAndConditions(filter MessageFilter, table
 		conditions = append(conditions, "(p_filter_from.domain IS NULL OR p_filter_from.domain = '')")
 	}
 
-	// Label filter - case-insensitive exact match
+	// Label filter — use EXISTS to avoid 1:N join multiplication.
 	if filter.Label != "" {
-		joins = append(joins, `
-			JOIN message_labels ml_filter ON ml_filter.message_id = m.id
+		conditions = append(conditions, `EXISTS (
+			SELECT 1 FROM message_labels ml_filter
 			JOIN labels l_filter ON l_filter.id = ml_filter.label_id
-		`)
-		conditions = append(conditions, "LOWER(l_filter.name) = LOWER(?)")
+			WHERE ml_filter.message_id = m.id
+			  AND LOWER(l_filter.name) = LOWER(?)
+		)`)
 		args = append(args, filter.Label)
 	} else if filter.MatchesEmpty(ViewLabels) {
 		conditions = append(conditions, "NOT EXISTS (SELECT 1 FROM message_labels ml WHERE ml.message_id = m.id)")
@@ -638,12 +634,10 @@ func (e *SQLiteEngine) executeAggregateQuery(ctx context.Context, query string, 
 func (e *SQLiteEngine) ListMessages(ctx context.Context, filter MessageFilter) ([]MessageSummary, error) {
 	filterJoins, conditions, args := e.buildFilterJoinsAndConditions(filter, "m")
 
-	// Build ORDER BY with validation. PostgreSQL requires every
-	// ORDER BY expression under SELECT DISTINCT to match an expression
-	// in the SELECT list (textually equivalent or by position) — so the
-	// size and subject sorts must reference the same COALESCE wrapper
-	// used in the SELECT, not the raw column. Raw m.sent_at is already
-	// in the SELECT for the date sort.
+	// Build ORDER BY with validation. Filter joins use EXISTS subqueries
+	// (never plain JOINs) so no row multiplication occurs and SELECT DISTINCT
+	// is not needed. The only JOINs in the SELECT are the LEFT JOINs for
+	// display (mr_sender, p_sender, conv) which are each 1:1 per message.
 	var orderBy string
 	switch filter.Sorting.Field {
 	case MessageSortByDate:
@@ -672,7 +666,7 @@ func (e *SQLiteEngine) ListMessages(ctx context.Context, filter MessageFilter) (
 	}
 
 	query := fmt.Sprintf(`
-		SELECT DISTINCT
+		SELECT
 			m.id,
 			m.source_message_id,
 			m.conversation_id,
@@ -974,8 +968,11 @@ func (e *SQLiteEngine) GetTotalStats(ctx context.Context, opts StatsOptions) (*T
 		joinClause += strings.Join(searchJoins, "\n")
 	}
 
-	// Message stats — when search joins are present, use a subquery to get
-	// distinct matching IDs first, avoiding duplicates from 1:N joins.
+	// Message stats — when search joins are present (e.g. FTS JOIN), use a
+	// subquery so the outer COUNT sees only messages rows. The search joins
+	// from buildSearchQueryParts are all EXISTS-based (no 1:N multiplication);
+	// the FTS JOIN is 1:1. SELECT without DISTINCT is correct and avoids the
+	// PostgreSQL restriction that bans SELECT DISTINCT in subqueries with ORDER BY.
 	var msgQuery string
 	if joinClause != "" {
 		msgQuery = fmt.Sprintf(`
@@ -984,7 +981,7 @@ func (e *SQLiteEngine) GetTotalStats(ctx context.Context, opts StatsOptions) (*T
 				COALESCE(SUM(size_estimate), 0)
 			FROM messages
 			WHERE id IN (
-				SELECT DISTINCT m.id FROM messages m
+				SELECT m.id FROM messages m
 				%s
 				WHERE %s
 			)
@@ -1003,15 +1000,14 @@ func (e *SQLiteEngine) GetTotalStats(ctx context.Context, opts StatsOptions) (*T
 		return nil, fmt.Errorf("message stats: %w", err)
 	}
 
-	// Attachment stats — use IN subquery only when search joins are present
-	// (to de-duplicate 1:N join rows). Without joins, a direct query is faster.
+	// Attachment stats — use IN subquery only when search joins are present.
 	var attQuery string
 	if joinClause != "" {
 		attQuery = fmt.Sprintf(`
 			SELECT COUNT(*), COALESCE(SUM(a.size), 0)
 			FROM attachments a
 			WHERE a.message_id IN (
-				SELECT DISTINCT m.id FROM messages m
+				SELECT m.id FROM messages m
 				%s
 				WHERE %s
 			)
@@ -1452,8 +1448,12 @@ func (e *SQLiteEngine) executeSearchQuery(ctx context.Context, conditions []stri
 		whereClause = "1=1"
 	}
 
+	// All filter conditions in buildSearchQueryParts use EXISTS subqueries,
+	// never plain JOINs, so no row multiplication occurs. The display LEFT JOINs
+	// below (mr_sender, p_sender, conv) are each 1:1 per message. SELECT DISTINCT
+	// is therefore not needed and would break PostgreSQL ORDER BY semantics.
 	query := fmt.Sprintf(`
-		SELECT DISTINCT
+		SELECT
 			m.id,
 			m.source_message_id,
 			m.conversation_id,

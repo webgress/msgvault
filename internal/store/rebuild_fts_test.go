@@ -2,6 +2,8 @@ package store_test
 
 import (
 	"database/sql"
+	"os"
+	"strings"
 	"testing"
 
 	assertpkg "github.com/stretchr/testify/assert"
@@ -11,12 +13,42 @@ import (
 	"go.kenn.io/msgvault/internal/testutil/storetest"
 )
 
+// isPostgresTest reports whether the test is running against PostgreSQL.
+func isPostgresTest() bool {
+	testDB := os.Getenv("MSGVAULT_TEST_DB")
+	return strings.HasPrefix(testDB, "postgres://") || strings.HasPrefix(testDB, "postgresql://")
+}
+
+// assertFTSContains verifies that exactly wantCount messages match the given
+// term via the backend-appropriate FTS query. On SQLite it uses the FTS5
+// virtual table; on PostgreSQL it queries the tsvector column inline.
+func assertFTSContains(t *testing.T, db *sql.DB, term string, wantCount int) {
+	t.Helper()
+	assert := assertpkg.New(t)
+	require := requirepkg.New(t)
+	var count int
+	if isPostgresTest() {
+		// PostgreSQL FTS is via the search_fts tsvector column.
+		require.NoError(db.QueryRow(
+			"SELECT COUNT(*) FROM messages WHERE search_fts @@ websearch_to_tsquery('simple', $1)",
+			term).Scan(&count),
+			"PG FTS query for %q", term)
+	} else {
+		// SQLite FTS5 virtual table.
+		require.NoError(db.QueryRow(
+			"SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?",
+			term).Scan(&count),
+			"SQLite FTS MATCH %q", term)
+	}
+	assert.Equal(wantCount, count, "FTS match count for %q", term)
+}
+
 // TestStore_RebuildFTS_HappyPath verifies RebuildFTS on a healthy database
 // recreates the FTS index with correct searchable content.
+// Runs on both SQLite and PostgreSQL — PG verification uses the tsvector column.
 func TestStore_RebuildFTS_HappyPath(t *testing.T) {
 	require := requirepkg.New(t)
 	assert := assertpkg.New(t)
-	testutil.SkipIfPostgres(t, "RebuildFTS is SQLite-specific (drop/recreate messages_fts vtable); PG RebuildFTS is not yet implemented (PR4 scope)")
 	f := storetest.New(t)
 	if !f.Store.FTS5Available() {
 		t.Skip("FTS5 not available")
@@ -40,16 +72,8 @@ func TestStore_RebuildFTS_HappyPath(t *testing.T) {
 	require.NoError(err, "RebuildFTS")
 	assert.Equal(int64(2), n, "RebuildFTS rows")
 
-	var count int
-	require.NoError(f.Store.DB().QueryRow(
-		"SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'banana'").Scan(&count),
-		"FTS MATCH banana")
-	assert.Equal(1, count, "match 'banana'")
-
-	require.NoError(f.Store.DB().QueryRow(
-		"SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'alice'").Scan(&count),
-		"FTS MATCH alice")
-	assert.Equal(1, count, "match 'alice'")
+	assertFTSContains(t, f.Store.DB(), "banana", 1)
+	assertFTSContains(t, f.Store.DB(), "alice", 1)
 }
 
 // TestStore_RebuildFTS_BypassesAvailabilityFlag verifies the critical
@@ -57,10 +81,11 @@ func TestStore_RebuildFTS_HappyPath(t *testing.T) {
 // FTS5 shadow table causes the availability probe to fail, which is exactly
 // when the rebuild is needed — BackfillFTS would short-circuit here, but
 // RebuildFTS must not.
+// Runs on both SQLite and PostgreSQL — the availability-flag bypass is
+// a Store-level concern independent of dialect.
 func TestStore_RebuildFTS_BypassesAvailabilityFlag(t *testing.T) {
 	require := requirepkg.New(t)
 	assert := assertpkg.New(t)
-	testutil.SkipIfPostgres(t, "RebuildFTS is SQLite-specific (drop/recreate messages_fts vtable); PG RebuildFTS is not yet implemented (PR4 scope)")
 	f := storetest.New(t)
 	if !f.Store.FTS5Available() {
 		t.Skip("FTS5 not available")
@@ -72,7 +97,8 @@ func TestStore_RebuildFTS_BypassesAvailabilityFlag(t *testing.T) {
 		"UpsertMessageBody")
 
 	// Force the cached flag false to simulate a probe that saw a corrupt
-	// shadow table and returned false at InitSchema time.
+	// shadow table (SQLite) or a missing column (PG) and returned false at
+	// InitSchema time.
 	store.SetFTS5AvailableForTest(f.Store, false)
 
 	n, err := f.Store.RebuildFTS(nil)
@@ -81,20 +107,19 @@ func TestStore_RebuildFTS_BypassesAvailabilityFlag(t *testing.T) {
 
 	assert.True(f.Store.FTS5Available(), "FTS5Available() after rebuild")
 
-	var count int
-	require.NoError(f.Store.DB().QueryRow(
-		"SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'cherry'").Scan(&count),
-		"FTS MATCH cherry")
-	assert.Equal(1, count, "match 'cherry'")
+	assertFTSContains(t, f.Store.DB(), "cherry", 1)
 }
 
 // TestStore_RebuildFTS_AfterTableDropped verifies that RebuildFTS recreates
 // messages_fts from scratch when the table is missing entirely — the
 // post-DROP state from the manual recovery procedure in issue #287.
+// This test is SQLite-only: it drops the messages_fts virtual table, which
+// has no equivalent on PostgreSQL (PG stores FTS inline on messages.search_fts;
+// the PG DROP INDEX + recreate path is exercised by FTSRebuildSchema directly).
 func TestStore_RebuildFTS_AfterTableDropped(t *testing.T) {
 	require := requirepkg.New(t)
 	assert := assertpkg.New(t)
-	testutil.SkipIfPostgres(t, "RebuildFTS is SQLite-specific (drop/recreate messages_fts vtable); PG RebuildFTS is not yet implemented (PR4 scope)")
+	testutil.SkipIfPostgres(t, "SQLite-only: drops the messages_fts virtual table; PG FTS is a column on messages, not a separate table — the PG DROP INDEX path is covered by dialect_pg tests")
 	f := storetest.New(t)
 	if !f.Store.FTS5Available() {
 		t.Skip("FTS5 not available")
@@ -121,10 +146,10 @@ func TestStore_RebuildFTS_AfterTableDropped(t *testing.T) {
 
 // TestStore_RebuildFTS_ReportsProgress verifies the progress callback is
 // invoked with monotonic (done, total) values.
+// Runs on both SQLite and PostgreSQL — progress reporting is dialect-agnostic.
 func TestStore_RebuildFTS_ReportsProgress(t *testing.T) {
 	require := requirepkg.New(t)
 	assert := assertpkg.New(t)
-	testutil.SkipIfPostgres(t, "RebuildFTS is SQLite-specific (drop/recreate messages_fts vtable); PG RebuildFTS is not yet implemented (PR4 scope)")
 	f := storetest.New(t)
 	if !f.Store.FTS5Available() {
 		t.Skip("FTS5 not available")
