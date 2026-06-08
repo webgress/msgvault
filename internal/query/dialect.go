@@ -141,13 +141,13 @@ func (PostgreSQLQueryDialect) BoolTrueExpr(col string) string { return col }
 func (PostgreSQLQueryDialect) TimeTruncExpression(column string, granularity string) string {
 	switch granularity {
 	case "year":
-		return fmt.Sprintf("to_char(%s, 'YYYY')", column)
+		return fmt.Sprintf("to_char(%s AT TIME ZONE 'UTC', 'YYYY')", column)
 	case "month":
-		return fmt.Sprintf("to_char(%s, 'YYYY-MM')", column)
+		return fmt.Sprintf("to_char(%s AT TIME ZONE 'UTC', 'YYYY-MM')", column)
 	case "day":
-		return fmt.Sprintf("to_char(%s, 'YYYY-MM-DD')", column)
+		return fmt.Sprintf("to_char(%s AT TIME ZONE 'UTC', 'YYYY-MM-DD')", column)
 	default:
-		return fmt.Sprintf("to_char(%s, 'YYYY-MM')", column)
+		return fmt.Sprintf("to_char(%s AT TIME ZONE 'UTC', 'YYYY-MM')", column)
 	}
 }
 
