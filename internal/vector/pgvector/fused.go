@@ -101,15 +101,26 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
 	if useANN {
 		vecArg := bind(vectorLiteral(req.QueryVec))
 		genArg := bind(int64(req.Generation))
+		// maxChunksPerMessage is the upper bound on how many chunks a single
+		// message may contribute to the inner ANN scan. The inner scan fetches
+		// (KPerSignal+1)*maxChunksPerMessage chunks so that after GROUP BY
+		// deduplication the outer result still contains at least KPerSignal+1
+		// distinct messages with high probability. Without this headroom,
+		// multi-chunk messages could crowd out distinct candidates before the
+		// GROUP BY runs.
+		const maxChunksPerMessage = 8
+		innerChunks := kPlus1 * maxChunksPerMessage
+		innerArg := bind(innerChunks)
 		kp1Arg := bind(kPlus1)
 		kArg := bind(req.KPerSignal)
 		// Use an inner SELECT with ORDER BY <=> LIMIT so pgvector can
 		// apply the HNSW index before the outer GROUP BY collapses
 		// multi-chunk messages. The filtered CTE already constrains the
-		// candidate set; the inner subquery fetches KPerSignal+1 chunks
-		// in ANN order (HNSW-eligible), then the outer GROUP BY picks the
-		// best-scoring chunk per message via MIN(distance). This gives
-		// the same dedup semantics as Search() while preserving HNSW use.
+		// candidate set; the inner subquery fetches (KPerSignal+1)*maxChunks
+		// chunks in ANN order (HNSW-eligible), then the outer GROUP BY picks
+		// the best-scoring chunk per message via MIN(distance) and limits to
+		// KPerSignal+1 distinct messages. This ensures the outer LIMIT is
+		// applied after dedup, not before.
 		ctes = append(ctes,
 			fmt.Sprintf(`ann_pool AS (
     SELECT ann.message_id,
@@ -125,8 +136,8 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
            ) ann
      GROUP BY ann.message_id
      ORDER BY distance
-     LIMIT %[4]s
-)`, dim, vecArg, genArg, kp1Arg),
+     LIMIT %[5]s
+)`, dim, vecArg, genArg, innerArg, kp1Arg),
 			fmt.Sprintf(`ann_ranked AS (
     SELECT message_id, distance,
            ROW_NUMBER() OVER (ORDER BY distance ASC, message_id ASC) AS rnk

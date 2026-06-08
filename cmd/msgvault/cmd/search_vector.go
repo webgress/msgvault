@@ -215,8 +215,7 @@ func runHybridSearch(cmd *cobra.Command, queryStr, mode string, explain bool, sc
 	if searchJSON {
 		return outputHybridResultsJSON(results, meta, explain)
 	}
-	outputHybridResultsTable(results, meta, explain)
-	return nil
+	return outputHybridResultsTable(results, meta, explain)
 }
 
 type hybridResultRow struct {
@@ -330,12 +329,12 @@ func hydrateHybridResults(ctx context.Context, db *sql.DB, rebind func(string) s
 	return compact, nil
 }
 
-func outputHybridResultsTable(results []hybridResultRow, meta hybrid.ResultMeta, explain bool) {
+func outputHybridResultsTable(results []hybridResultRow, meta hybrid.ResultMeta, explain bool) error {
 	if len(results) == 0 {
 		fmt.Println("No messages found.")
 		fmt.Printf("\nGeneration #%d (%s, fingerprint=%q)\n",
 			int64(meta.Generation.ID), meta.Generation.State, meta.Generation.Fingerprint)
-		return
+		return nil
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
@@ -362,9 +361,12 @@ func outputHybridResultsTable(results []hybridResultRow, meta hybrid.ResultMeta,
 				r.MessageID, date, from, subject)
 		}
 	}
-	_ = w.Flush()
+	if err := w.Flush(); err != nil {
+		return fmt.Errorf("flush table output: %w", err)
+	}
 	fmt.Printf("\nShowing %d results (generation #%d %s, fingerprint=%q)\n",
 		len(results), int64(meta.Generation.ID), meta.Generation.State, meta.Generation.Fingerprint)
+	return nil
 }
 
 func outputHybridResultsJSON(results []hybridResultRow, meta hybrid.ResultMeta, explain bool) error {
