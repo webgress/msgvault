@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/gmail"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil"
@@ -38,21 +40,13 @@ func newE2EFixture(t *testing.T) *e2eFixture {
 	st := testutil.NewTestStore(t)
 
 	srcA, err := st.GetOrCreateSource("gmail", "alice@example.com")
-	if err != nil {
-		t.Fatalf("GetOrCreateSource A: %v", err)
-	}
+	require.NoError(t, err, "GetOrCreateSource A")
 	srcB, err := st.GetOrCreateSource("gmail", "bob@example.com")
-	if err != nil {
-		t.Fatalf("GetOrCreateSource B: %v", err)
-	}
+	require.NoError(t, err, "GetOrCreateSource B")
 	convA, err := st.EnsureConversation(srcA.ID, "thread-A", "Thread A")
-	if err != nil {
-		t.Fatalf("EnsureConversation A: %v", err)
-	}
+	require.NoError(t, err, "EnsureConversation A")
 	convB, err := st.EnsureConversation(srcB.ID, "thread-B", "Thread B")
-	if err != nil {
-		t.Fatalf("EnsureConversation B: %v", err)
-	}
+	require.NoError(t, err, "EnsureConversation B")
 
 	f := &e2eFixture{
 		t:       t,
@@ -92,22 +86,17 @@ func (f *e2eFixture) addMessage(gmailID string, sourceID, convID int64) {
 		MessageType:     "email",
 		SizeEstimate:    1024,
 	})
-	if err != nil {
-		f.t.Fatalf("UpsertMessage(%s): %v", gmailID, err)
-	}
+	require.NoErrorf(f.t, err, "UpsertMessage(%s)", gmailID)
 	f.msgIDs[gmailID] = id
 }
 
 func (f *e2eFixture) upsertAttachment(gmailID, filename, storagePath, contentHash string) {
 	f.t.Helper()
 	msgID, ok := f.msgIDs[gmailID]
-	if !ok {
-		f.t.Fatalf("upsertAttachment: unknown gmail ID %q", gmailID)
-	}
-	if err := f.store.UpsertAttachment(msgID, filename, "application/pdf",
-		storagePath, contentHash, 100); err != nil {
-		f.t.Fatalf("UpsertAttachment(%s, %s): %v", gmailID, filename, err)
-	}
+	require.Truef(f.t, ok, "upsertAttachment: unknown gmail ID %q", gmailID)
+	err := f.store.UpsertAttachment(msgID, filename, "application/pdf",
+		storagePath, contentHash, 100)
+	require.NoErrorf(f.t, err, "UpsertAttachment(%s, %s)", gmailID, filename)
 }
 
 func (f *e2eFixture) countLive(sourceID int64) int {
@@ -117,9 +106,7 @@ func (f *e2eFixture) countLive(sourceID int64) int {
 		`SELECT COUNT(*) FROM messages WHERE source_id = ? AND `+
 			store.LiveMessagesWhere("", true),
 	), sourceID).Scan(&n)
-	if err != nil {
-		f.t.Fatalf("countLive(%d): %v", sourceID, err)
-	}
+	require.NoErrorf(f.t, err, "countLive(%d)", sourceID)
 	return n
 }
 
@@ -130,9 +117,7 @@ func (f *e2eFixture) countTotal(sourceID int64) int {
 		f.store.Rebind(`SELECT COUNT(*) FROM messages WHERE source_id = ?`),
 		sourceID,
 	).Scan(&n)
-	if err != nil {
-		f.t.Fatalf("countTotal(%d): %v", sourceID, err)
-	}
+	require.NoErrorf(f.t, err, "countTotal(%d)", sourceID)
 	return n
 }
 
@@ -144,9 +129,7 @@ func (f *e2eFixture) attachmentRowsForMessage(gmailID string) int {
 		 JOIN messages m ON m.id = a.message_id
 		 WHERE m.source_message_id = ?`,
 	), gmailID).Scan(&n)
-	if err != nil {
-		f.t.Fatalf("attachmentRowsForMessage(%s): %v", gmailID, err)
-	}
+	require.NoErrorf(f.t, err, "attachmentRowsForMessage(%s)", gmailID)
 	return n
 }
 
@@ -163,37 +146,24 @@ func TestExecutor_E2E_TrashOnlyMarksTargetSource(t *testing.T) {
 	manifest := tc.CreateManifest("trash-source-a",
 		[]string{"msg-a1", "msg-a2", "msg-a3"})
 
-	if err := tc.Exec.Execute(context.Background(), manifest.ID, &ExecuteOptions{
+	err := tc.Exec.Execute(context.Background(), manifest.ID, &ExecuteOptions{
 		Method:    MethodTrash,
 		BatchSize: 100,
 		Resume:    true,
-	}); err != nil {
-		t.Fatalf("Execute: %v", err)
-	}
+	})
+	require.NoError(t, err, "Execute")
 
 	// All A messages are now marked deleted_from_source_at; B is untouched.
-	if got := f.countLive(f.sourceA.ID); got != 0 {
-		t.Errorf("source A live count = %d, want 0", got)
-	}
-	if got := f.countLive(f.sourceB.ID); got != 2 {
-		t.Errorf("source B live count = %d, want 2 (unaffected)", got)
-	}
-	if got := f.countTotal(f.sourceA.ID); got != 3 {
-		t.Errorf("source A row count after trash = %d, want 3 (soft delete)", got)
-	}
+	assert.Equal(t, 0, f.countLive(f.sourceA.ID), "source A live count")
+	assert.Equal(t, 2, f.countLive(f.sourceB.ID), "source B live count (unaffected)")
+	assert.Equal(t, 3, f.countTotal(f.sourceA.ID), "source A row count after trash (soft delete)")
 
 	// Attachment rows are untouched on trash (only permanent delete cascades).
-	if got := f.attachmentRowsForMessage("msg-a1"); got != 1 {
-		t.Errorf("msg-a1 attachment rows after trash = %d, want 1", got)
-	}
+	assert.Equal(t, 1, f.attachmentRowsForMessage("msg-a1"), "msg-a1 attachment rows after trash")
 
 	// Mock Gmail was called for each ID exactly once via TrashMessage.
-	if got := len(tc.MockAPI.TrashCalls); got != 3 {
-		t.Errorf("TrashCalls = %d, want 3", got)
-	}
-	if got := len(tc.MockAPI.DeleteCalls); got != 0 {
-		t.Errorf("DeleteCalls = %d, want 0 (trash method)", got)
-	}
+	assert.Equal(t, 3, len(tc.MockAPI.TrashCalls), "TrashCalls")
+	assert.Equal(t, 0, len(tc.MockAPI.DeleteCalls), "DeleteCalls (trash method)")
 }
 
 // TestExecutor_E2E_PermanentDeleteCascadesAttachments verifies that
@@ -207,33 +177,22 @@ func TestExecutor_E2E_PermanentDeleteCascadesAttachments(t *testing.T) {
 	manifest := tc.CreateManifest("delete-a1-a2",
 		[]string{"msg-a1", "msg-a2"})
 
-	if err := tc.Exec.Execute(context.Background(), manifest.ID, &ExecuteOptions{
+	err := tc.Exec.Execute(context.Background(), manifest.ID, &ExecuteOptions{
 		Method:    MethodDelete,
 		BatchSize: 100,
 		Resume:    true,
-	}); err != nil {
-		t.Fatalf("Execute: %v", err)
-	}
+	})
+	require.NoError(t, err, "Execute")
 
 	// msg-a1 and msg-a2 rows are gone (permanent).
-	if got := f.countTotal(f.sourceA.ID); got != 1 {
-		t.Errorf("source A row count after permanent delete = %d, want 1", got)
-	}
+	assert.Equal(t, 1, f.countTotal(f.sourceA.ID), "source A row count after permanent delete")
 	// Attachments for those messages cascade away.
-	if got := f.attachmentRowsForMessage("msg-a1"); got != 0 {
-		t.Errorf("msg-a1 attachment rows after delete = %d, want 0", got)
-	}
-	if got := f.attachmentRowsForMessage("msg-a2"); got != 0 {
-		t.Errorf("msg-a2 attachment rows after delete = %d, want 0", got)
-	}
+	assert.Equal(t, 0, f.attachmentRowsForMessage("msg-a1"), "msg-a1 attachment rows after delete")
+	assert.Equal(t, 0, f.attachmentRowsForMessage("msg-a2"), "msg-a2 attachment rows after delete")
 	// Source B's row referencing the same shared content_hash survives.
-	if got := f.attachmentRowsForMessage("msg-b1"); got != 1 {
-		t.Errorf("msg-b1 attachment rows after delete = %d, want 1 (cross-source shared)", got)
-	}
+	assert.Equal(t, 1, f.attachmentRowsForMessage("msg-b1"), "msg-b1 attachment rows (cross-source shared)")
 
-	if got := len(tc.MockAPI.DeleteCalls); got != 2 {
-		t.Errorf("DeleteCalls = %d, want 2", got)
-	}
+	assert.Equal(t, 2, len(tc.MockAPI.DeleteCalls), "DeleteCalls")
 }
 
 // TestExecutor_E2E_BatchDeleteMarksDBAcrossSources verifies that the batch
@@ -248,26 +207,17 @@ func TestExecutor_E2E_BatchDeleteMarksDBAcrossSources(t *testing.T) {
 	manifest := tc.CreateManifest("batch-cross-source",
 		[]string{"msg-a1", "msg-b1"})
 
-	if err := tc.Exec.ExecuteBatch(context.Background(), manifest.ID); err != nil {
-		t.Fatalf("ExecuteBatch: %v", err)
-	}
+	err := tc.Exec.ExecuteBatch(context.Background(), manifest.ID)
+	require.NoError(t, err, "ExecuteBatch")
 
 	// Both sources see one of their messages soft-deleted.
-	if got := f.countLive(f.sourceA.ID); got != 2 {
-		t.Errorf("source A live count = %d, want 2 (msg-a1 deleted, a2+a3 remain)", got)
-	}
-	if got := f.countLive(f.sourceB.ID); got != 1 {
-		t.Errorf("source B live count = %d, want 1 (msg-b1 deleted)", got)
-	}
+	assert.Equal(t, 2, f.countLive(f.sourceA.ID), "source A live count (msg-a1 deleted, a2+a3 remain)")
+	assert.Equal(t, 1, f.countLive(f.sourceB.ID), "source B live count (msg-b1 deleted)")
 
 	// Batch path doesn't cascade attachments — it sets deleted_from_source_at.
-	if got := f.attachmentRowsForMessage("msg-a1"); got != 1 {
-		t.Errorf("msg-a1 attachment rows after batch trash = %d, want 1", got)
-	}
+	assert.Equal(t, 1, f.attachmentRowsForMessage("msg-a1"), "msg-a1 attachment rows after batch trash")
 
-	if got := len(tc.MockAPI.BatchDeleteCalls); got != 1 {
-		t.Errorf("BatchDeleteCalls = %d, want 1", got)
-	}
+	assert.Equal(t, 1, len(tc.MockAPI.BatchDeleteCalls), "BatchDeleteCalls")
 }
 
 // TestExecutor_E2E_PermanentDeletePreservesOtherSourceAttachmentFile
@@ -282,34 +232,25 @@ func TestExecutor_E2E_PermanentDeletePreservesOtherSourceAttachmentFile(t *testi
 	// Permanently delete msg-a1 (shared hash) and msg-a2 (unique to A).
 	manifest := tc.CreateManifest("perm-delete-a1-a2",
 		[]string{"msg-a1", "msg-a2"})
-	if err := tc.Exec.Execute(context.Background(), manifest.ID, &ExecuteOptions{
+	err := tc.Exec.Execute(context.Background(), manifest.ID, &ExecuteOptions{
 		Method:    MethodDelete,
 		BatchSize: 100,
 		Resume:    true,
-	}); err != nil {
-		t.Fatalf("Execute: %v", err)
-	}
+	})
+	require.NoError(t, err, "Execute")
 
 	// After deletion, source A still has msg-a3 (no attachments).
 	// AttachmentPathsUniqueToSource(A) should be empty: the only remaining
 	// candidate path would have been msg-a2's, but its row is gone.
 	pathsA, err := f.store.AttachmentPathsUniqueToSource(f.sourceA.ID)
-	if err != nil {
-		t.Fatalf("AttachmentPathsUniqueToSource(A): %v", err)
-	}
-	if len(pathsA) != 0 {
-		t.Errorf("source A unique paths after delete = %v, want empty", pathsA)
-	}
+	require.NoError(t, err, "AttachmentPathsUniqueToSource(A)")
+	assert.Empty(t, pathsA, "source A unique paths after delete")
 
 	// Source B's unique-b path is still uniquely owned by B; shared is
 	// also unique to B now that A's reference is gone.
 	pathsB, err := f.store.AttachmentPathsUniqueToSource(f.sourceB.ID)
-	if err != nil {
-		t.Fatalf("AttachmentPathsUniqueToSource(B): %v", err)
-	}
-	if len(pathsB) != 2 {
-		t.Errorf("source B unique paths after A's permanent delete = %v, want 2 entries (shared became unique to B)", pathsB)
-	}
+	require.NoError(t, err, "AttachmentPathsUniqueToSource(B)")
+	assert.Len(t, pathsB, 2, "source B unique paths after A's permanent delete (shared became unique to B)")
 }
 
 // e2eContext bridges the e2eFixture to the executor test plumbing.
@@ -323,9 +264,7 @@ func newE2EContext(t *testing.T, f *e2eFixture) *e2eContext {
 	t.Helper()
 	tmpDir := t.TempDir()
 	mgr, err := NewManager(tmpDir)
-	if err != nil {
-		t.Fatalf("NewManager: %v", err)
-	}
+	require.NoError(t, err, "NewManager")
 	progress := &trackingProgress{}
 	mockAPI := gmail.NewDeletionMockAPI()
 	exec := NewExecutor(mgr, f.store, mockAPI).WithProgress(progress)
