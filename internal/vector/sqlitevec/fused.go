@@ -456,9 +456,10 @@ func idsToJSON(ids []int64) (sql.NullString, error) {
 
 // senderGroupClauses produces the SQL fragment and named args for
 // repeated `from:` operators. Each group becomes its own clause
-// AND'd together, and within a group the message satisfies it via
-// `m.sender_id IN (group)` OR a 'from' row in message_recipients
-// (the legacy fallback for rows where messages.sender_id is NULL).
+// AND'd together, and within a group the message satisfies it via a
+// 'from' row in message_recipients whose participant_id is in the
+// group (messages.sender_id is intentionally NOT consulted — see the
+// inline note at the EXISTS clause below).
 // Mirrors the existing SQLite search path in internal/store/api.go,
 // which emits one EXISTS per `from:` token at the message level so
 // a message with multiple `from` recipients can satisfy multiple
