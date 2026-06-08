@@ -10,6 +10,7 @@ import (
 	assertpkg "github.com/stretchr/testify/assert"
 	requirepkg "github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
 )
 
@@ -56,7 +57,7 @@ func TestListEmbeddingGenerationsIncludesActiveAndBuilding(t *testing.T) {
 	assert := assertpkg.New(t)
 	db := newEmbeddingMetadataTestDB(t)
 
-	rows, err := listEmbeddingGenerations(t.Context(), db)
+	rows, err := listEmbeddingGenerations(t.Context(), db, sqliteRebind)
 	require.NoError(err)
 	require.Len(rows, 2)
 
@@ -79,7 +80,7 @@ func TestActivateEmbeddingGenerationRetiresPreviousActive(t *testing.T) {
 	_, err := db.ExecContext(ctx, `DELETE FROM pending_embeddings WHERE generation_id = 2`)
 	require.NoError(err)
 
-	require.NoError(activateEmbeddingGeneration(ctx, db, 2, false))
+	require.NoError(activateEmbeddingGeneration(ctx, db, sqliteRebind, 2, false))
 
 	active := mustGetEmbeddingGeneration(ctx, t, db, 2)
 	assert.Equal(vector.GenerationActive, active.State)
@@ -116,14 +117,14 @@ func TestActivateEmbeddingGenerationProtectsPendingRace(t *testing.T) {
 	db := newEmbeddingMetadataTestDB(t)
 	ctx := t.Context()
 
-	err := activateEmbeddingGeneration(ctx, db, 2, false)
+	err := activateEmbeddingGeneration(ctx, db, sqliteRebind, 2, false)
 	require.Error(err)
 	assert.Contains(err.Error(), "pending embedding rows")
 
 	building := mustGetEmbeddingGeneration(ctx, t, db, 2)
 	assert.Equal(vector.GenerationBuilding, building.State)
 
-	require.NoError(activateEmbeddingGeneration(ctx, db, 2, true))
+	require.NoError(activateEmbeddingGeneration(ctx, db, sqliteRebind, 2, true))
 	active := mustGetEmbeddingGeneration(ctx, t, db, 2)
 	assert.Equal(vector.GenerationActive, active.State)
 }
@@ -140,14 +141,14 @@ UPDATE index_generations SET seeded_at = NULL WHERE id = 2;
 `)
 	require.NoError(err)
 
-	err = activateEmbeddingGeneration(ctx, db, 2, false)
+	err = activateEmbeddingGeneration(ctx, db, sqliteRebind, 2, false)
 	require.Error(err)
 	assert.Contains(err.Error(), "finished seeding")
 
 	building := mustGetEmbeddingGeneration(ctx, t, db, 2)
 	assert.Equal(vector.GenerationBuilding, building.State)
 
-	require.NoError(activateEmbeddingGeneration(ctx, db, 2, true))
+	require.NoError(activateEmbeddingGeneration(ctx, db, sqliteRebind, 2, true))
 	active := mustGetEmbeddingGeneration(ctx, t, db, 2)
 	assert.Equal(vector.GenerationActive, active.State)
 }
@@ -192,14 +193,14 @@ func TestRetireEmbeddingGenerationProtectsActiveRace(t *testing.T) {
 	db := newEmbeddingMetadataTestDB(t)
 	ctx := t.Context()
 
-	err := retireEmbeddingGeneration(ctx, db, 1, false)
+	err := retireEmbeddingGeneration(ctx, db, sqliteRebind, 1, false)
 	require.Error(err)
 	assert.Contains(err.Error(), "force-active")
 
 	active := mustGetEmbeddingGeneration(ctx, t, db, 1)
 	assert.Equal(vector.GenerationActive, active.State)
 
-	require.NoError(retireEmbeddingGeneration(ctx, db, 1, true))
+	require.NoError(retireEmbeddingGeneration(ctx, db, sqliteRebind, 1, true))
 	retired := mustGetEmbeddingGeneration(ctx, t, db, 1)
 	assert.Equal(vector.GenerationRetired, retired.State)
 }
@@ -279,9 +280,13 @@ func newTestConfigForFingerprint(vecPath string) *config.Config {
 	}
 }
 
+// sqliteRebind is the identity rebind function used by tests that operate
+// directly against SQLite. It mirrors (&store.SQLiteDialect{}).Rebind.
+var sqliteRebind = (&store.SQLiteDialect{}).Rebind
+
 func mustGetEmbeddingGeneration(ctx context.Context, t *testing.T, db *sql.DB, gen vector.GenerationID) embeddingGenerationRow {
 	t.Helper()
-	row, err := getEmbeddingGeneration(ctx, db, gen)
+	row, err := getEmbeddingGeneration(ctx, db, sqliteRebind, gen)
 	requirepkg.NoError(t, err)
 	return row
 }

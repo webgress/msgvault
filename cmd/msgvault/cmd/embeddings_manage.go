@@ -12,8 +12,10 @@ import (
 	"text/tabwriter"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3" // SQLite driver for vectors.db metadata commands.
+	_ "github.com/jackc/pgx/v5/stdlib" // pgx driver for PostgreSQL metadata commands.
+	_ "github.com/mattn/go-sqlite3"    // SQLite driver for vectors.db metadata commands.
 	"github.com/spf13/cobra"
+	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
 )
 
@@ -32,13 +34,13 @@ type embeddingGenerationRow struct {
 }
 
 func runEmbeddingsList(cmd *cobra.Command, _ []string) error {
-	db, closeDB, err := openEmbeddingsMetadataDB()
+	db, rebind, closeDB, err := openEmbeddingsMetadataDB()
 	if err != nil {
 		return err
 	}
 	defer closeDB()
 
-	rows, err := listEmbeddingGenerations(cmd.Context(), db)
+	rows, err := listEmbeddingGenerations(cmd.Context(), db, rebind)
 	if err != nil {
 		return err
 	}
@@ -75,13 +77,13 @@ func runEmbeddingsRetire(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	db, closeDB, err := openEmbeddingsMetadataDB()
+	db, rebind, closeDB, err := openEmbeddingsMetadataDB()
 	if err != nil {
 		return err
 	}
 	defer closeDB()
 
-	row, err := getEmbeddingGeneration(cmd.Context(), db, gen)
+	row, err := getEmbeddingGeneration(cmd.Context(), db, rebind, gen)
 	if err != nil {
 		return err
 	}
@@ -102,7 +104,7 @@ func runEmbeddingsRetire(cmd *cobra.Command, args []string) error {
 			return errors.New("aborted")
 		}
 	}
-	if err := retireEmbeddingGeneration(cmd.Context(), db, gen, embeddingsRetireForceActive); err != nil {
+	if err := retireEmbeddingGeneration(cmd.Context(), db, rebind, gen, embeddingsRetireForceActive); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Generation %d retired.\n", gen)
@@ -115,13 +117,13 @@ func runEmbeddingsActivate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	db, closeDB, err := openEmbeddingsMetadataDB()
+	db, rebind, closeDB, err := openEmbeddingsMetadataDB()
 	if err != nil {
 		return err
 	}
 	defer closeDB()
 
-	row, err := getEmbeddingGeneration(cmd.Context(), db, gen)
+	row, err := getEmbeddingGeneration(cmd.Context(), db, rebind, gen)
 	if err != nil {
 		return err
 	}
@@ -142,7 +144,7 @@ func runEmbeddingsActivate(cmd *cobra.Command, args []string) error {
 			gen)
 	}
 
-	active, hasActive, err := activeEmbeddingGeneration(cmd.Context(), db)
+	active, hasActive, err := activeEmbeddingGeneration(cmd.Context(), db, rebind)
 	if err != nil {
 		return err
 	}
@@ -157,29 +159,50 @@ func runEmbeddingsActivate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	if err := activateEmbeddingGeneration(cmd.Context(), db, gen, embeddingsActivateForce); err != nil {
+	if err := activateEmbeddingGeneration(cmd.Context(), db, rebind, gen, embeddingsActivateForce); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Generation %d activated.\n", gen)
 	return nil
 }
 
-func openEmbeddingsMetadataDB() (*sql.DB, func(), error) {
+// openEmbeddingsMetadataDB opens the database that holds embedding generation
+// metadata and returns a handle, a rebind function for SQL placeholders, a
+// close callback, and any error.
+//
+// On PostgreSQL deployments the embedding tables live in the main Postgres
+// database alongside messages — there is no separate vectors.db. On SQLite
+// deployments the metadata lives in vectors.db as before.
+//
+// rebind converts ? placeholders to $1, $2, … for PostgreSQL; it is the
+// identity function for SQLite so all query helpers can use it unconditionally.
+func openEmbeddingsMetadataDB() (*sql.DB, func(string) string, func(), error) {
+	dsn := cfg.DatabaseDSN()
+	if store.IsPostgresURL(dsn) {
+		db, err := sql.Open("pgx", dsn)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("open postgres for embeddings metadata: %w", err)
+		}
+		rebind := (&store.PostgreSQLDialect{}).Rebind
+		return db, rebind, func() { _ = db.Close() }, nil
+	}
+
 	vecPath := cfg.Vector.DBPath
 	if vecPath == "" {
 		vecPath = filepath.Join(cfg.Data.DataDir, "vectors.db")
 	}
 	if _, err := os.Stat(vecPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil, fmt.Errorf("vectors.db not found at %s", vecPath)
+			return nil, nil, nil, fmt.Errorf("vectors.db not found at %s", vecPath)
 		}
-		return nil, nil, fmt.Errorf("stat vectors.db: %w", err)
+		return nil, nil, nil, fmt.Errorf("stat vectors.db: %w", err)
 	}
 	db, err := sql.Open("sqlite3", sqliteDSNWithBusyTimeout(vecPath))
 	if err != nil {
-		return nil, nil, fmt.Errorf("open vectors.db: %w", err)
+		return nil, nil, nil, fmt.Errorf("open vectors.db: %w", err)
 	}
-	return db, func() { _ = db.Close() }, nil
+	rebind := (&store.SQLiteDialect{}).Rebind
+	return db, rebind, func() { _ = db.Close() }, nil
 }
 
 func sqliteDSNWithBusyTimeout(path string) string {
@@ -198,7 +221,9 @@ func parseGenerationID(s string) (vector.GenerationID, error) {
 	return vector.GenerationID(id), nil
 }
 
-func listEmbeddingGenerations(ctx context.Context, db *sql.DB) ([]embeddingGenerationRow, error) {
+func listEmbeddingGenerations(ctx context.Context, db *sql.DB, rebind func(string) string) ([]embeddingGenerationRow, error) {
+	// No ? placeholders in this query; rebind is a no-op here but kept for
+	// symmetry so all helpers share the same signature.
 	rows, err := db.QueryContext(ctx, `
 		SELECT g.id, g.model, g.dimension, g.fingerprint, g.state,
 		       g.started_at, g.completed_at, g.activated_at, g.message_count,
@@ -226,15 +251,15 @@ func listEmbeddingGenerations(ctx context.Context, db *sql.DB) ([]embeddingGener
 	return out, nil
 }
 
-func getEmbeddingGeneration(ctx context.Context, db *sql.DB, gen vector.GenerationID) (embeddingGenerationRow, error) {
-	row := db.QueryRowContext(ctx, `
+func getEmbeddingGeneration(ctx context.Context, db *sql.DB, rebind func(string) string, gen vector.GenerationID) (embeddingGenerationRow, error) {
+	row := db.QueryRowContext(ctx, rebind(`
 		SELECT g.id, g.model, g.dimension, g.fingerprint, g.state,
 		       g.started_at, g.completed_at, g.activated_at, g.message_count,
 		       g.seeded_at, COUNT(p.message_id) AS pending_count
 		  FROM index_generations g
 		  LEFT JOIN pending_embeddings p ON p.generation_id = g.id
 		 WHERE g.id = ?
-		 GROUP BY g.id`, int64(gen))
+		 GROUP BY g.id`), int64(gen))
 	g, err := scanEmbeddingGeneration(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return embeddingGenerationRow{}, fmt.Errorf("%w: %d", vector.ErrUnknownGeneration, gen)
@@ -245,15 +270,15 @@ func getEmbeddingGeneration(ctx context.Context, db *sql.DB, gen vector.Generati
 	return g, nil
 }
 
-func activeEmbeddingGeneration(ctx context.Context, db *sql.DB) (embeddingGenerationRow, bool, error) {
-	row := db.QueryRowContext(ctx, `
+func activeEmbeddingGeneration(ctx context.Context, db *sql.DB, rebind func(string) string) (embeddingGenerationRow, bool, error) {
+	row := db.QueryRowContext(ctx, rebind(`
 		SELECT g.id, g.model, g.dimension, g.fingerprint, g.state,
 		       g.started_at, g.completed_at, g.activated_at, g.message_count,
 		       g.seeded_at, COUNT(p.message_id) AS pending_count
 		  FROM index_generations g
 		  LEFT JOIN pending_embeddings p ON p.generation_id = g.id
 		 WHERE g.state = ?
-		 GROUP BY g.id`, string(vector.GenerationActive))
+		 GROUP BY g.id`), string(vector.GenerationActive))
 	g, err := scanEmbeddingGeneration(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return embeddingGenerationRow{}, false, nil
@@ -264,7 +289,7 @@ func activeEmbeddingGeneration(ctx context.Context, db *sql.DB) (embeddingGenera
 	return g, true, nil
 }
 
-func retireEmbeddingGeneration(ctx context.Context, db *sql.DB, gen vector.GenerationID, forceActive bool) error {
+func retireEmbeddingGeneration(ctx context.Context, db *sql.DB, rebind func(string) string, gen vector.GenerationID, forceActive bool) error {
 	stateFilter := `state = ?`
 	args := []any{string(vector.GenerationBuilding), int64(gen)}
 	if forceActive {
@@ -272,7 +297,7 @@ func retireEmbeddingGeneration(ctx context.Context, db *sql.DB, gen vector.Gener
 		args = []any{string(vector.GenerationBuilding), string(vector.GenerationActive), int64(gen)}
 	}
 	res, err := db.ExecContext(ctx,
-		`UPDATE index_generations SET state = 'retired' WHERE `+stateFilter+` AND id = ?`, args...)
+		rebind(`UPDATE index_generations SET state = 'retired' WHERE `+stateFilter+` AND id = ?`), args...)
 	if err != nil {
 		return fmt.Errorf("retire generation %d: %w", gen, err)
 	}
@@ -281,7 +306,7 @@ func retireEmbeddingGeneration(ctx context.Context, db *sql.DB, gen vector.Gener
 		return nil
 	}
 
-	row, err := getEmbeddingGeneration(ctx, db, gen)
+	row, err := getEmbeddingGeneration(ctx, db, rebind, gen)
 	if err != nil {
 		return err
 	}
@@ -294,7 +319,7 @@ func retireEmbeddingGeneration(ctx context.Context, db *sql.DB, gen vector.Gener
 	return fmt.Errorf("generation %d could not be retired from %q state", gen, row.State)
 }
 
-func activateEmbeddingGeneration(ctx context.Context, db *sql.DB, gen vector.GenerationID, force bool) error {
+func activateEmbeddingGeneration(ctx context.Context, db *sql.DB, rebind func(string) string, gen vector.GenerationID, force bool) error {
 	now := time.Now().Unix()
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -303,19 +328,19 @@ func activateEmbeddingGeneration(ctx context.Context, db *sql.DB, gen vector.Gen
 	defer func() { _ = tx.Rollback() }()
 
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE index_generations
+		rebind(`UPDATE index_generations
 		 SET state = 'retired', completed_at = COALESCE(completed_at, ?)
-		 WHERE state = 'active'`, now); err != nil {
+		 WHERE state = 'active'`), now); err != nil {
 		return fmt.Errorf("retire previous active: %w", err)
 	}
 	res, err := tx.ExecContext(ctx,
-		`UPDATE index_generations
+		rebind(`UPDATE index_generations
 		 SET state = 'active', activated_at = ?, completed_at = COALESCE(completed_at, ?)
 		 WHERE id = ? AND state = 'building'
 		   AND (? OR seeded_at IS NOT NULL)
 		   AND (? OR NOT EXISTS (
 		       SELECT 1 FROM pending_embeddings WHERE generation_id = ?
-		   ))`, now, now, int64(gen), force, force, int64(gen))
+		   ))`), now, now, int64(gen), force, force, int64(gen))
 	if err != nil {
 		return fmt.Errorf("activate generation %d: %w", gen, err)
 	}
@@ -323,7 +348,7 @@ func activateEmbeddingGeneration(ctx context.Context, db *sql.DB, gen vector.Gen
 	if n == 0 {
 		var pending int64
 		if err := tx.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM pending_embeddings WHERE generation_id = ?`, int64(gen)).Scan(&pending); err != nil {
+			rebind(`SELECT COUNT(*) FROM pending_embeddings WHERE generation_id = ?`), int64(gen)).Scan(&pending); err != nil {
 			return fmt.Errorf("count pending rows for generation %d: %w", gen, err)
 		}
 		if pending > 0 && !force {
@@ -333,7 +358,7 @@ func activateEmbeddingGeneration(ctx context.Context, db *sql.DB, gen vector.Gen
 		var state vector.GenerationState
 		var seededAt sql.NullInt64
 		if err := tx.QueryRowContext(ctx,
-			`SELECT state, seeded_at FROM index_generations WHERE id = ?`, int64(gen)).Scan(&state, &seededAt); err != nil {
+			rebind(`SELECT state, seeded_at FROM index_generations WHERE id = ?`), int64(gen)).Scan(&state, &seededAt); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return fmt.Errorf("%w: %d", vector.ErrUnknownGeneration, gen)
 			}
