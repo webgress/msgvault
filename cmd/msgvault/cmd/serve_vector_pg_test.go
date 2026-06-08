@@ -79,7 +79,7 @@ func TestSetupVectorFeatures_SucceedsOnPostgres(t *testing.T) {
 	cfg.Vector.Embeddings.Dimension = 768
 	cfg.Vector.Embeddings.BatchSize = 32
 
-	vf, err := setupVectorFeatures(context.Background(), db, dsn)
+	vf, err := setupVectorFeatures(context.Background(), db, dsn, false)
 	require.NoError(t, err, "setupVectorFeatures on postgres DSN must succeed with pgvector built in")
 	require.NotNil(t, vf, "vectorFeatures")
 	t.Cleanup(func() {

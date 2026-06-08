@@ -24,7 +24,7 @@ import (
 // mainDB is the already-opened handle to msgvault.db; mainPath is the
 // filesystem path used by FusedSearch to ATTACH vectors.db on a fresh
 // connection.
-func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string) (*vectorFeatures, error) {
+func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string, readOnly bool) (*vectorFeatures, error) {
 	if !cfg.Vector.Enabled {
 		return nil, nil //nolint:nilnil // vector disabled: callers nil-check vf; (nil, nil) means "no features, no error"
 	}
@@ -51,8 +51,9 @@ func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string) (
 		// Same database handle as the main store: pgvector embeddings
 		// live alongside messages, so there is no separate vectors.db.
 		pgb, err := pgvector.Open(ctx, pgvector.Options{
-			DB:        mainDB,
-			Dimension: cfg.Vector.Embeddings.Dimension,
+			DB:          mainDB,
+			Dimension:   cfg.Vector.Embeddings.Dimension,
+			SkipMigrate: readOnly,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("open pgvector backend: %w", err)
