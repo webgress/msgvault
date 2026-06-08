@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"go.kenn.io/msgvault/internal/sync"
 	"go.kenn.io/msgvault/internal/vector"
 )
 
@@ -25,6 +26,10 @@ import (
 // amortizing the per-statement overhead (a 5,000-ID batch becomes 10
 // statements, not 5,000 single-row inserts).
 const enqueueChunkRows = 500
+
+// Compile-time assertion that *Enqueuer satisfies the sync.EmbedEnqueuer
+// interface expected by internal/sync.Syncer.
+var _ sync.EmbedEnqueuer = (*Enqueuer)(nil)
 
 // Enqueuer inserts message IDs into pending_embeddings for every
 // non-retired generation. Implements the EmbedEnqueuer interface

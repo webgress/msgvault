@@ -7,7 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"math"
 	"sort"
 	"strings"
@@ -103,25 +103,30 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
 		genArg := bind(int64(req.Generation))
 		kp1Arg := bind(kPlus1)
 		kArg := bind(req.KPerSignal)
-		// Collapse the per-chunk embedding rows to one row per message
-		// before pooling. The embeddings PK is
-		// (generation_id, message_id, chunk_index), so a multi-chunk
-		// message has several rows; without GROUP BY the FULL OUTER JOIN
-		// against fts_ranked would see duplicate message_ids and
-		// double-count them. MIN(distance) keeps the best-scoring chunk
-		// per message — the exact dedup pattern Search() uses — and the
-		// pool cap (LIMIT KPerSignal+1) then applies to deduped rows.
+		// Use an inner SELECT with ORDER BY <=> LIMIT so pgvector can
+		// apply the HNSW index before the outer GROUP BY collapses
+		// multi-chunk messages. The filtered CTE already constrains the
+		// candidate set; the inner subquery fetches KPerSignal+1 chunks
+		// in ANN order (HNSW-eligible), then the outer GROUP BY picks the
+		// best-scoring chunk per message via MIN(distance). This gives
+		// the same dedup semantics as Search() while preserving HNSW use.
 		ctes = append(ctes,
 			fmt.Sprintf(`ann_pool AS (
-    SELECT e.message_id,
-           MIN((e.embedding::vector(%d)) <=> %s::vector) AS distance
-      FROM embeddings e
-      JOIN filtered f ON f.id = e.message_id
-     WHERE e.generation_id = %s AND e.dimension = %d
-     GROUP BY e.message_id
+    SELECT ann.message_id,
+           MIN(ann.distance) AS distance
+      FROM (
+            SELECT e.message_id,
+                   (e.embedding::vector(%[1]d)) <=> %[2]s::vector AS distance
+              FROM embeddings e
+              JOIN filtered f ON f.id = e.message_id
+             WHERE e.generation_id = %[3]s AND e.dimension = %[1]d
+             ORDER BY e.embedding::vector(%[1]d) <=> %[2]s::vector
+             LIMIT %[4]s
+           ) ann
+     GROUP BY ann.message_id
      ORDER BY distance
-     LIMIT %s
-)`, dim, vecArg, genArg, dim, kp1Arg),
+     LIMIT %[4]s
+)`, dim, vecArg, genArg, kp1Arg),
 			fmt.Sprintf(`ann_ranked AS (
     SELECT message_id, distance,
            ROW_NUMBER() OVER (ORDER BY distance ASC, message_id ASC) AS rnk
@@ -280,7 +285,7 @@ func (b *Backend) applySubjectBoost(ctx context.Context, hits []vector.FusedHit,
 	}
 	subjects, err := b.batchGetSubjects(ctx, ids)
 	if err != nil {
-		log.Printf("[warn] pgvector: applySubjectBoost: subject hydration failed, returning unboosted order: %v", err)
+		slog.Default().Warn("pgvector: applySubjectBoost: subject hydration failed, returning unboosted order", "err", err)
 		return
 	}
 	for i := range hits {

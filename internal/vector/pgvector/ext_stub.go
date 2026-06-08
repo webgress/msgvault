@@ -44,36 +44,57 @@ func (b *Backend) Close() error { return nil }
 // DB returns nil for the stub.
 func (b *Backend) DB() *sql.DB { return nil }
 
+// CreateGeneration always returns ErrNotBuilt in non-pgvector builds.
 func (b *Backend) CreateGeneration(_ context.Context, _ string, _ int, _ string) (vector.GenerationID, error) {
 	return 0, ErrNotBuilt
 }
+
+// ActivateGeneration always returns ErrNotBuilt in non-pgvector builds.
 func (b *Backend) ActivateGeneration(_ context.Context, _ vector.GenerationID) error {
 	return ErrNotBuilt
 }
+
+// RetireGeneration always returns ErrNotBuilt in non-pgvector builds.
 func (b *Backend) RetireGeneration(_ context.Context, _ vector.GenerationID) error {
 	return ErrNotBuilt
 }
+
+// ActiveGeneration always returns ErrNotBuilt in non-pgvector builds.
 func (b *Backend) ActiveGeneration(_ context.Context) (vector.Generation, error) {
 	return vector.Generation{}, ErrNotBuilt
 }
+
+// BuildingGeneration always returns ErrNotBuilt in non-pgvector builds.
 func (b *Backend) BuildingGeneration(_ context.Context) (*vector.Generation, error) {
 	return nil, ErrNotBuilt
 }
+
+// Upsert always returns ErrNotBuilt in non-pgvector builds.
 func (b *Backend) Upsert(_ context.Context, _ vector.GenerationID, _ []vector.Chunk) error {
 	return ErrNotBuilt
 }
+
+// Search always returns ErrNotBuilt in non-pgvector builds.
 func (b *Backend) Search(_ context.Context, _ vector.GenerationID, _ []float32, _ int, _ vector.Filter) ([]vector.Hit, error) {
 	return nil, ErrNotBuilt
 }
+
+// Delete always returns ErrNotBuilt in non-pgvector builds.
 func (b *Backend) Delete(_ context.Context, _ vector.GenerationID, _ []int64) error {
 	return ErrNotBuilt
 }
+
+// Stats always returns ErrNotBuilt in non-pgvector builds.
 func (b *Backend) Stats(_ context.Context, _ vector.GenerationID) (vector.Stats, error) {
 	return vector.Stats{}, ErrNotBuilt
 }
+
+// EnsureSeeded always returns ErrNotBuilt in non-pgvector builds.
 func (b *Backend) EnsureSeeded(_ context.Context, _ vector.GenerationID) error {
 	return ErrNotBuilt
 }
+
+// LoadVector always returns ErrNotBuilt in non-pgvector builds.
 func (b *Backend) LoadVector(_ context.Context, _ int64) ([]float32, error) {
 	return nil, ErrNotBuilt
 }
