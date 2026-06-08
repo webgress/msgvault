@@ -30,7 +30,7 @@ func TestSetupVectorFeatures_PostgresWithoutPgvectorTag(t *testing.T) {
 	cfg.Vector.Embeddings.Dimension = 768
 	cfg.Vector.Embeddings.BatchSize = 32
 
-	_, err := setupVectorFeatures(context.Background(), nil, "postgres://user@host/db")
+	_, err := setupVectorFeatures(context.Background(), nil, "postgres://user@host/db", false)
 	require.Error(t, err, "setupVectorFeatures with postgres DSN and no pgvector tag")
 	// Must come from the stub, not the removed up-front refusal.
 	assert.Contains(t, err.Error(), "pgvector support not compiled in",

@@ -34,6 +34,11 @@ type Options struct {
 	// per-dimension HNSW index on first migration. Optional; if zero
 	// the index is created on first CreateGeneration.
 	Dimension int
+	// SkipMigrate suppresses the automatic schema migration on Open.
+	// Set this when the caller holds a read-only connection (e.g. the
+	// MCP server), where CREATE EXTENSION and DDL statements are
+	// rejected by PostgreSQL with SQLSTATE 25006.
+	SkipMigrate bool
 }
 
 // Backend implements vector.Backend against a PostgreSQL database
@@ -52,8 +57,10 @@ func Open(ctx context.Context, opts Options) (*Backend, error) {
 	if opts.DB == nil {
 		return nil, errors.New("pgvector.Open: Options.DB is required")
 	}
-	if err := Migrate(ctx, opts.DB, opts.Dimension); err != nil {
-		return nil, fmt.Errorf("pgvector migrate: %w", err)
+	if !opts.SkipMigrate {
+		if err := Migrate(ctx, opts.DB, opts.Dimension); err != nil {
+			return nil, fmt.Errorf("pgvector migrate: %w", err)
+		}
 	}
 	return &Backend{db: opts.DB, dim: opts.Dimension}, nil
 }

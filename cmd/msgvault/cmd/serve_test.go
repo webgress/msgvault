@@ -122,7 +122,7 @@ func TestSetupVectorFeatures_Disabled(t *testing.T) {
 	cfg = &config.Config{}
 	cfg.Vector.Enabled = false
 
-	vf, err := setupVectorFeatures(context.Background(), nil, "")
+	vf, err := setupVectorFeatures(context.Background(), nil, "", false)
 	requirepkg.NoError(t, err, "setupVectorFeatures")
 	assertpkg.Nil(t, vf, "setupVectorFeatures should be nil when disabled")
 }
