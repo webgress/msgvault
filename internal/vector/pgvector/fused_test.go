@@ -371,6 +371,26 @@ func TestFusedSearch_FilterBySender(t *testing.T) {
 	assert.Equal(t, int64(1), hits[0].MessageID, "want exactly msg 1 (only from=99)")
 }
 
+// TestFusedSearch_FilterBySender_NoMatch verifies the negative parity: a
+// SenderGroups filter whose participant_id is NOT linked as a from-recipient
+// on any message correctly returns zero hits. This guards against the filter
+// accidentally degrading to an unfiltered search when the participant is absent.
+func TestFusedSearch_FilterBySender_NoMatch(t *testing.T) {
+	f := seedThree(t)
+	// participant_id=777 is not a from-recipient on any of the three seeded
+	// messages — the filter should exclude every candidate.
+	hits, _, err := f.b.FusedSearch(f.ctx, vector.FusedRequest{
+		FTSQuery:   "quantum",
+		Generation: f.gen,
+		KPerSignal: 10,
+		Limit:      10,
+		RRFK:       60,
+		Filter:     vector.Filter{SenderGroups: [][]int64{{777}}},
+	})
+	require.NoError(t, err, "FusedSearch")
+	assert.Empty(t, hits, "expected zero hits: participant 777 is not a from-recipient")
+}
+
 func TestFusedSearch_HasAttachment(t *testing.T) {
 	f := seedThree(t)
 	yes := true

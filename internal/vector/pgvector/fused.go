@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"sort"
 	"strings"
@@ -343,6 +344,7 @@ func (b *Backend) applySubjectBoost(ctx context.Context, hits []vector.FusedHit,
 	}
 	subjects, err := b.batchGetSubjects(ctx, ids)
 	if err != nil {
+		log.Printf("[warn] pgvector: applySubjectBoost: subject hydration failed, returning unboosted order: %v", err)
 		return
 	}
 	for i := range hits {
