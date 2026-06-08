@@ -636,8 +636,8 @@ func (e *SQLiteEngine) ListMessages(ctx context.Context, filter MessageFilter) (
 
 	// Build ORDER BY with validation. Filter joins use EXISTS subqueries
 	// (never plain JOINs) so no row multiplication occurs and SELECT DISTINCT
-	// is not needed. The only JOINs in the SELECT are the LEFT JOINs for
-	// display (mr_sender, p_sender, conv) which are each 1:1 per message.
+	// is not needed. The sender is resolved via a correlated scalar subquery
+	// (LIMIT 1) so messages with multiple 'from' rows produce exactly one result row.
 	var orderBy string
 	switch filter.Sorting.Field {
 	case MessageSortByDate:
@@ -684,8 +684,12 @@ func (e *SQLiteEngine) ListMessages(ctx context.Context, filter MessageFilter) (
 			COALESCE(m.message_type, ''),
 			COALESCE(conv.title, '')
 		FROM messages m
-		LEFT JOIN message_recipients mr_sender ON mr_sender.message_id = m.id AND mr_sender.recipient_type = 'from'
-		LEFT JOIN participants p_sender ON p_sender.id = COALESCE(mr_sender.participant_id, m.sender_id)
+		LEFT JOIN participants p_sender ON p_sender.id = COALESCE(
+			(SELECT mr.participant_id FROM message_recipients mr
+			 WHERE mr.message_id = m.id AND mr.recipient_type = 'from'
+			 ORDER BY mr.id LIMIT 1),
+			m.sender_id
+		)
 		LEFT JOIN conversations conv ON conv.id = m.conversation_id
 		%s
 		WHERE %s
@@ -787,8 +791,12 @@ func (e *SQLiteEngine) GetMessageSummariesByIDs(ctx context.Context, ids []int64
 			COALESCE(m.message_type, ''),
 			COALESCE(conv.title, '')
 		FROM messages m
-		LEFT JOIN message_recipients mr_sender ON mr_sender.message_id = m.id AND mr_sender.recipient_type = 'from'
-		LEFT JOIN participants p_sender ON p_sender.id = COALESCE(mr_sender.participant_id, m.sender_id)
+		LEFT JOIN participants p_sender ON p_sender.id = COALESCE(
+			(SELECT mr.participant_id FROM message_recipients mr
+			 WHERE mr.message_id = m.id AND mr.recipient_type = 'from'
+			 ORDER BY mr.id LIMIT 1),
+			m.sender_id
+		)
 		LEFT JOIN conversations conv ON conv.id = m.conversation_id
 		WHERE m.id IN (%s) AND %s
 	`, strings.Join(placeholders, ","), store.LiveMessagesWhere("m", true))
@@ -1449,9 +1457,9 @@ func (e *SQLiteEngine) executeSearchQuery(ctx context.Context, conditions []stri
 	}
 
 	// All filter conditions in buildSearchQueryParts use EXISTS subqueries,
-	// never plain JOINs, so no row multiplication occurs. The display LEFT JOINs
-	// below (mr_sender, p_sender, conv) are each 1:1 per message. SELECT DISTINCT
-	// is therefore not needed and would break PostgreSQL ORDER BY semantics.
+	// never plain JOINs, so no row multiplication occurs from filter conditions.
+	// The sender is hydrated via a correlated scalar subquery (LIMIT 1) so that
+	// messages with multiple 'from' recipients do not produce multiple result rows.
 	query := fmt.Sprintf(`
 		SELECT
 			m.id,
@@ -1471,8 +1479,12 @@ func (e *SQLiteEngine) executeSearchQuery(ctx context.Context, conditions []stri
 			COALESCE(m.message_type, ''),
 			COALESCE(conv.title, '')
 		FROM messages m
-		LEFT JOIN message_recipients mr_sender ON mr_sender.message_id = m.id AND mr_sender.recipient_type = 'from'
-		LEFT JOIN participants p_sender ON p_sender.id = COALESCE(mr_sender.participant_id, m.sender_id)
+		LEFT JOIN participants p_sender ON p_sender.id = COALESCE(
+			(SELECT mr.participant_id FROM message_recipients mr
+			 WHERE mr.message_id = m.id AND mr.recipient_type = 'from'
+			 ORDER BY mr.id LIMIT 1),
+			m.sender_id
+		)
 		LEFT JOIN conversations conv ON conv.id = m.conversation_id
 		%s
 		%s
