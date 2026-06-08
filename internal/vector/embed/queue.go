@@ -22,17 +22,25 @@ import (
 type Queue struct {
 	db     *sql.DB
 	rebind func(string) string
+	// isPG is true when the underlying driver is PostgreSQL. When set,
+	// Claim uses FOR UPDATE SKIP LOCKED in the inner SELECT to prevent
+	// concurrent workers from claiming the same pending rows.
+	isPG bool
 }
 
 // NewQueue returns a Queue bound to db. The caller retains ownership of
 // db; Queue does not close it. rebind translates ?-placeholders to the
 // driver's native form; pass an identity function (or nil) for SQLite
 // and the PostgreSQL dialect's Rebind for pgx.
+//
+// The Queue detects whether the backend is PostgreSQL by probing rebind:
+// if rebind("?") == "$1" the driver is pgx and Claim will use
+// FOR UPDATE SKIP LOCKED to prevent concurrent workers from double-claiming.
 func NewQueue(db *sql.DB, rebind func(string) string) *Queue {
 	if rebind == nil {
 		rebind = func(q string) string { return q }
 	}
-	return &Queue{db: db, rebind: rebind}
+	return &Queue{db: db, rebind: rebind, isPG: rebind("?") == "$1"}
 }
 
 // Claim marks up to batch pending rows for gen as claimed by a fresh
@@ -58,18 +66,32 @@ func (q *Queue) Claim(ctx context.Context, gen vector.GenerationID, batch int) (
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	ids, err := func() ([]int64, error) {
-		rows, err := tx.QueryContext(ctx, q.rebind(`
-        UPDATE pending_embeddings
-           SET claimed_at = ?, claim_token = ?
-         WHERE (generation_id, message_id) IN (
+	// claimSQL selects the candidate rows for the UPDATE. PostgreSQL uses
+	// FOR UPDATE SKIP LOCKED so that concurrent workers each see a disjoint
+	// slice of available rows; without it two workers can select the same
+	// rows in their subquery snapshots and the later UPDATE will simply
+	// overwrite the earlier claim token, causing duplicate work.
+	// SQLite serializes writers at the file level so no advisory locking is
+	// needed there (and it does not support the FOR UPDATE syntax).
+	claimSubquery := `
                SELECT generation_id, message_id
                  FROM pending_embeddings
                 WHERE generation_id = ?
                   AND claimed_at IS NULL
                 ORDER BY message_id
-                LIMIT ?)
-        RETURNING message_id`),
+                LIMIT ?`
+	if q.isPG {
+		claimSubquery += `
+                FOR UPDATE SKIP LOCKED`
+	}
+	claimSQL := `
+        UPDATE pending_embeddings
+           SET claimed_at = ?, claim_token = ?
+         WHERE (generation_id, message_id) IN (` + claimSubquery + `)
+        RETURNING message_id`
+
+	ids, err := func() ([]int64, error) {
+		rows, err := tx.QueryContext(ctx, q.rebind(claimSQL),
 			now, token, int64(gen), batch)
 		if err != nil {
 			return nil, fmt.Errorf("claim query: %w", err)
