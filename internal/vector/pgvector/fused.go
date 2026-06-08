@@ -19,6 +19,11 @@ import (
 // Compile-time check that *Backend satisfies vector.FusingBackend.
 var _ vector.FusingBackend = (*Backend)(nil)
 
+// fusedANNChunksPerMessage bounds how many chunks one message may
+// contribute to the inner ANN scan, sizing the inner LIMIT so the
+// outer GROUP BY still yields enough distinct messages.
+const fusedANNChunksPerMessage = 8
+
 // FusedSearch runs the single-query hybrid CTE against pgvector.
 // Mirrors sqlitevec.FusedSearch (spec §5.3) but built around
 // websearch_to_tsquery + ts_rank_cd on the inline messages.search_fts
@@ -101,15 +106,14 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
 	if useANN {
 		vecArg := bind(vectorLiteral(req.QueryVec))
 		genArg := bind(int64(req.Generation))
-		// maxChunksPerMessage is the upper bound on how many chunks a single
+		// fusedANNChunksPerMessage is the upper bound on how many chunks a single
 		// message may contribute to the inner ANN scan. The inner scan fetches
-		// (KPerSignal+1)*maxChunksPerMessage chunks so that after GROUP BY
+		// (KPerSignal+1)*fusedANNChunksPerMessage chunks so that after GROUP BY
 		// deduplication the outer result still contains at least KPerSignal+1
 		// distinct messages with high probability. Without this headroom,
 		// multi-chunk messages could crowd out distinct candidates before the
 		// GROUP BY runs.
-		const maxChunksPerMessage = 8
-		innerChunks := kPlus1 * maxChunksPerMessage
+		innerChunks := kPlus1 * fusedANNChunksPerMessage
 		innerArg := bind(innerChunks)
 		kp1Arg := bind(kPlus1)
 		kArg := bind(req.KPerSignal)

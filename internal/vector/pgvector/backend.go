@@ -23,6 +23,11 @@ import (
 // Compile-time check that *Backend satisfies vector.Backend.
 var _ vector.Backend = (*Backend)(nil)
 
+// annOverFetchFactor multiplies k for the inner ANN scan so that after
+// GROUP BY dedup across multi-chunk messages, at least k distinct
+// messages survive with high probability.
+const annOverFetchFactor = 4
+
 // Options configures Open. The same *sql.DB handle backs both the
 // embedding schema and the main msgvault schema; pgvector embeddings
 // live in the same Postgres database.
@@ -591,13 +596,18 @@ func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec 
 	if filter.IsEmpty() {
 		// Fast path: let pgvector use the HNSW index by issuing ORDER BY
 		// <=> LIMIT inside a subquery first. The inner SELECT returns at
-		// most k*overFetch rows in ANN order; the HNSW index applies to
-		// that inner ORDER BY. The outer query re-groups by message_id to
-		// collapse multi-chunk messages (best chunk wins via MIN), then
-		// re-sorts and re-limits the deduplicated result. We fetch
-		// k*overFetch chunks in the inner query so that after dedup we
-		// still have at least k distinct messages with high probability.
-		const overFetch = 4
+		// most k*annOverFetchFactor rows in ANN order; the HNSW index
+		// applies to that inner ORDER BY. The outer query re-groups by
+		// message_id to collapse multi-chunk messages (best chunk wins via
+		// MIN), then re-sorts and re-limits the deduplicated result. We
+		// fetch k*annOverFetchFactor chunks in the inner query so that
+		// after dedup we still have at least k distinct messages with high
+		// probability.
+		//
+		// The dimension predicate is embedded as a literal (matching the
+		// partial HNSW index's WHERE dimension = <N> in migrate.go and the
+		// fused.go ANN path) rather than a bind param, so a PG generic plan
+		// can prove the partial-index predicate and use the HNSW index.
 		stmt := fmt.Sprintf(`
 			SELECT ann.message_id,
 			       MIN(ann.distance) AS distance
@@ -606,17 +616,17 @@ func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec 
 			               (e.embedding::vector(%[1]d)) <=> $1::vector AS distance
 			          FROM embeddings e
 			         WHERE e.generation_id = $2
-			           AND e.dimension = $3
+			           AND e.dimension = %[1]d
 			           AND EXISTS (
 			                SELECT 1 FROM messages m
 			                 WHERE m.id = e.message_id AND %[2]s)
 			         ORDER BY e.embedding::vector(%[1]d) <=> $1::vector
-			         LIMIT $4
+			         LIMIT $3
 			       ) ann
 			 GROUP BY ann.message_id
 			 ORDER BY distance
-			 LIMIT $5`, dim, store.LiveMessagesWhere("m", true))
-		return b.scanHits(ctx, stmt, queryVecLit, int64(gen), int64(dim), k*overFetch, k)
+			 LIMIT $4`, dim, store.LiveMessagesWhere("m", true))
+		return b.scanHits(ctx, stmt, queryVecLit, int64(gen), k*annOverFetchFactor, k)
 	}
 
 	ids, err := b.filteredMessageIDs(ctx, filter)
@@ -630,7 +640,6 @@ func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec 
 	// message-ID set, so we use the same inner-subquery shape for
 	// consistency but accept a sequential scan within the filtered set.
 	// The inner ORDER BY <=> LIMIT still short-circuits on chunk count.
-	const overFetch = 4
 	stmt := fmt.Sprintf(`
 		SELECT ann.message_id,
 		       MIN(ann.distance) AS distance
@@ -647,7 +656,7 @@ func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec 
 		 GROUP BY ann.message_id
 		 ORDER BY distance
 		 LIMIT $6`, dim, dim)
-	return b.scanHits(ctx, stmt, queryVecLit, int64(gen), int64(dim), int64Array(ids), k*overFetch, k)
+	return b.scanHits(ctx, stmt, queryVecLit, int64(gen), int64(dim), int64Array(ids), k*annOverFetchFactor, k)
 }
 
 func (b *Backend) scanHits(ctx context.Context, query string, args ...any) ([]vector.Hit, error) {
