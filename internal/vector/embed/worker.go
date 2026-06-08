@@ -202,6 +202,44 @@ func (w *Worker) ReclaimStale(ctx context.Context) (int, error) {
 	return n, nil
 }
 
+// startEmbedRun inserts an embed_runs row and returns the new row's id.
+// A failure is non-fatal — run tracking is observability, not correctness.
+func (w *Worker) startEmbedRun(ctx context.Context, gen vector.GenerationID, now int64) int64 {
+	if w.deps.VectorsDB == nil {
+		return 0
+	}
+	var id int64
+	err := w.deps.VectorsDB.QueryRowContext(ctx,
+		w.rebind(`INSERT INTO embed_runs (generation_id, started_at) VALUES (?, ?) RETURNING id`),
+		int64(gen), now).Scan(&id)
+	if err != nil {
+		w.deps.Log.Warn("embed_runs: start insert failed", "error", err)
+		return 0
+	}
+	return id
+}
+
+// finalizeEmbedRun stamps ended_at plus result counters on the run row
+// opened by startEmbedRun. A zero runID means startEmbedRun failed; skip.
+func (w *Worker) finalizeEmbedRun(ctx context.Context, runID int64, res RunResult, runErr error, now int64) {
+	if runID == 0 || w.deps.VectorsDB == nil {
+		return
+	}
+	var errText *string
+	if runErr != nil {
+		s := runErr.Error()
+		errText = &s
+	}
+	_, err := w.deps.VectorsDB.ExecContext(ctx,
+		w.rebind(`UPDATE embed_runs
+		             SET ended_at = ?, claimed = ?, succeeded = ?, failed = ?, truncated = ?, error = ?
+		           WHERE id = ?`),
+		now, res.Claimed, res.Succeeded, res.Failed, res.Truncated, errText, runID)
+	if err != nil {
+		w.deps.Log.Warn("embed_runs: finalize update failed", "error", err)
+	}
+}
+
 // RunOnce drains the queue for the given generation until empty,
 // releasing claimed rows on embed or upsert error so another worker can
 // retry them. Returns when pending is empty or ctx is cancelled.
@@ -210,12 +248,13 @@ func (w *Worker) ReclaimStale(ctx context.Context) (int, error) {
 // MaxConsecutiveFailures, so a persistently misconfigured embedder
 // (bad credentials, unreachable endpoint) surfaces quickly instead of
 // looping forever. A successful batch resets the failure counter.
-func (w *Worker) RunOnce(ctx context.Context, gen vector.GenerationID) (RunResult, error) {
-	var res RunResult
+func (w *Worker) RunOnce(ctx context.Context, gen vector.GenerationID) (res RunResult, retErr error) {
 	consecutiveFailures := 0
 	var lastErr error
 	completedRows := 0
 	w.runStart = time.Now()
+	runID := w.startEmbedRun(ctx, gen, w.runStart.Unix())
+	defer func() { w.finalizeEmbedRun(ctx, runID, res, retErr, time.Now().Unix()) }()
 	// orphanDrainErr/orphanDrainCount preserve the latest orphan-drain
 	// failure across iterations so we can surface it on the empty-claim
 	// exit. Without this, a Complete() failure on orphan rows would be
