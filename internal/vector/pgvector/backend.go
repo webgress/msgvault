@@ -590,26 +590,33 @@ func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec 
 	// from a slim fast path that elides the join.
 	queryVecLit := vectorLiteral(queryVec)
 	if filter.IsEmpty() {
-		// Fast path: ANN order with an inline live-message check via
-		// EXISTS to skip soft-deleted rows without dragging the whole
-		// recipients/labels machinery in. GROUP BY message_id with
-		// MIN(distance) keeps the best-scoring chunk per message and
-		// discards the rest, so a multi-chunk message yields exactly one
-		// Hit (the Backend contract). Grouping precludes the per-row HNSW
-		// ordering; acceptable for this not-yet-tuned path, and the
-		// filtered path below already scans rather than indexes.
+		// Fast path: let pgvector use the HNSW index by issuing ORDER BY
+		// <=> LIMIT inside a subquery first. The inner SELECT returns at
+		// most k*overFetch rows in ANN order; the HNSW index applies to
+		// that inner ORDER BY. The outer query re-groups by message_id to
+		// collapse multi-chunk messages (best chunk wins via MIN), then
+		// re-sorts and re-limits the deduplicated result. We fetch
+		// k*overFetch chunks in the inner query so that after dedup we
+		// still have at least k distinct messages with high probability.
+		const overFetch = 4
 		stmt := fmt.Sprintf(`
-			SELECT e.message_id,
-			       MIN((e.embedding::vector(%d)) <=> $1::vector) AS distance
-			  FROM embeddings e
-			 WHERE e.generation_id = $2
-			   AND EXISTS (
-			        SELECT 1 FROM messages m
-			         WHERE m.id = e.message_id AND %s)
-			 GROUP BY e.message_id
+			SELECT ann.message_id,
+			       MIN(ann.distance) AS distance
+			  FROM (
+			        SELECT e.message_id,
+			               (e.embedding::vector(%[1]d)) <=> $1::vector AS distance
+			          FROM embeddings e
+			         WHERE e.generation_id = $2
+			           AND EXISTS (
+			                SELECT 1 FROM messages m
+			                 WHERE m.id = e.message_id AND %[2]s)
+			         ORDER BY e.embedding::vector(%[1]d) <=> $1::vector
+			         LIMIT $3
+			       ) ann
+			 GROUP BY ann.message_id
 			 ORDER BY distance
-			 LIMIT $3`, dim, store.LiveMessagesWhere("m", true))
-		return b.scanHits(ctx, stmt, queryVecLit, int64(gen), k)
+			 LIMIT $4`, dim, store.LiveMessagesWhere("m", true))
+		return b.scanHits(ctx, stmt, queryVecLit, int64(gen), k*overFetch, k)
 	}
 
 	ids, err := b.filteredMessageIDs(ctx, filter)
@@ -619,16 +626,27 @@ func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec 
 	if len(ids) == 0 {
 		return nil, nil
 	}
+	// Filtered path: HNSW cannot be applied when filtering by an arbitrary
+	// message-ID set, so we use the same inner-subquery shape for
+	// consistency but accept a sequential scan within the filtered set.
+	// The inner ORDER BY <=> LIMIT still short-circuits on chunk count.
+	const overFetch = 4
 	stmt := fmt.Sprintf(`
-		SELECT e.message_id,
-		       MIN((e.embedding::vector(%d)) <=> $1::vector) AS distance
-		  FROM embeddings e
-		 WHERE e.generation_id = $2
-		   AND e.message_id = ANY($3::bigint[])
-		 GROUP BY e.message_id
+		SELECT ann.message_id,
+		       MIN(ann.distance) AS distance
+		  FROM (
+		        SELECT e.message_id,
+		               (e.embedding::vector(%d)) <=> $1::vector AS distance
+		          FROM embeddings e
+		         WHERE e.generation_id = $2
+		           AND e.message_id = ANY($3::bigint[])
+		         ORDER BY e.embedding::vector(%d) <=> $1::vector
+		         LIMIT $4
+		       ) ann
+		 GROUP BY ann.message_id
 		 ORDER BY distance
-		 LIMIT $4`, dim)
-	return b.scanHits(ctx, stmt, queryVecLit, int64(gen), int64Array(ids), k)
+		 LIMIT $5`, dim, dim)
+	return b.scanHits(ctx, stmt, queryVecLit, int64(gen), int64Array(ids), k*overFetch, k)
 }
 
 func (b *Backend) scanHits(ctx context.Context, query string, args ...any) ([]vector.Hit, error) {
