@@ -52,30 +52,24 @@ func (e *SQLiteEngine) hasFTSTable(ctx context.Context) bool {
 		return e.ftsResult
 	}
 
+	// The dialect's HasFTSTableSQL() probe is authoritative for BOTH backends:
+	// SQLite checks sqlite_master for the messages_fts virtual table;
+	// PostgreSQL checks information_schema for the messages.search_fts column.
+	// We must NOT run a hardcoded SQLite-only `SELECT 1 FROM messages_fts`
+	// secondary probe here — on PostgreSQL there is no messages_fts relation
+	// (PG uses an inline search_fts TSVECTOR column), so that probe errors with
+	// `relation "messages_fts" does not exist` (42P01), causing FTS to be cached
+	// as unavailable and PG Search to silently fall back to subject/snippet LIKE
+	// instead of the tsvector ranking path.
 	var count int
 	err := e.queryRowContext(ctx, e.dialect.HasFTSTableSQL()).Scan(&count)
-
 	if err != nil {
 		// On error (canceled context, temporary DB issue), return false
-		// but don't cache so next call can retry
-		return false
-	}
-	if count == 0 {
-		e.ftsResult = false
-		e.ftsChecked = true
+		// but don't cache so next call can retry.
 		return false
 	}
 
-	var probe int
-	err = e.db.QueryRowContext(ctx, `SELECT 1 FROM messages_fts LIMIT 1`).Scan(&probe)
-	if err != nil && err != sql.ErrNoRows {
-		e.ftsResult = false
-		e.ftsChecked = true
-		return false
-	}
-
-	// Cache successful result
-	e.ftsResult = true
+	e.ftsResult = count > 0
 	e.ftsChecked = true
 	return e.ftsResult
 }

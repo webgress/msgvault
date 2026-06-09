@@ -289,6 +289,71 @@ func TestQueryEngine_MultiFromNoDuplication(t *testing.T) {
 	})
 }
 
+// TestQueryEngine_FTSBodySearch is the regression guard for cf-4: on
+// PostgreSQL, query.Engine.Search must take the tsvector FTS path
+// (search_fts @@ to_tsquery), not the subject/snippet LIKE fallback. The bug
+// was that hasFTSTable ran a hardcoded SQLite-only `SELECT 1 FROM messages_fts`
+// probe even on PG, where that relation does not exist; the probe errored, FTS
+// was cached as unavailable, and PG Search silently degraded to LIKE over
+// subject/snippet only — so body-only terms returned zero rows.
+//
+// The discriminating term ("zorblax") lives ONLY in the body, never in the
+// subject or snippet, so the LIKE fallback cannot match it. A passing result
+// therefore proves the FTS path is engaged. Runs on whichever backend
+// testutil.NewTestStore selects, so it doubles as a SQLite<->PG parity test:
+// both backends must return the body-only hit.
+func TestQueryEngine_FTSBodySearch(t *testing.T) {
+	require := requirepkg.New(t)
+	st := testutil.NewTestStore(t)
+	if !st.FTS5Available() {
+		t.Skip("full-text search index not available on this backend")
+	}
+
+	src, err := st.GetOrCreateSource("gmail", "fts-body@example.com")
+	require.NoError(err, "GetOrCreateSource")
+	convID, err := st.EnsureConversation(src.ID, "fts-thread", "fts thread")
+	require.NoError(err, "EnsureConversation")
+
+	const bodyOnlyTerm = "zorblax"
+	mid, err := st.UpsertMessage(&store.Message{
+		ConversationID:  convID,
+		SourceID:        src.ID,
+		SourceMessageID: "fts-body-msg-1",
+		MessageType:     "email",
+		SentAt:          sql.NullTime{Time: time.Date(2024, 8, 1, 12, 0, 0, 0, time.UTC), Valid: true},
+		// Neither subject nor snippet contains the discriminating term, so a
+		// LIKE-over-subject/snippet fallback cannot match it.
+		Subject:      sql.NullString{String: "Quarterly report", Valid: true},
+		Snippet:      sql.NullString{String: "see attached summary", Valid: true},
+		SizeEstimate: 2048,
+	})
+	require.NoError(err, "UpsertMessage")
+	body := "The hidden keyword " + bodyOnlyTerm + " appears only in the message body."
+	require.NoError(st.UpsertMessageBody(mid,
+		sql.NullString{String: body, Valid: true},
+		sql.NullString{}), "UpsertMessageBody")
+	// Index the message for full-text search (search_fts on PG, messages_fts on SQLite).
+	require.NoError(st.UpsertFTS(mid, "Quarterly report", body, "", "", ""), "UpsertFTS")
+
+	eng := query.NewEngine(st.DB(), st.IsPostgreSQL())
+	ctx := context.Background()
+
+	// (1) Body-only TextTerms search must find the message — only the FTS path
+	// can, since the term is absent from subject/snippet.
+	got, err := eng.Search(ctx, &search.Query{TextTerms: []string{bodyOnlyTerm}}, 50, 0)
+	require.NoError(err, "Search TextTerms=%q", bodyOnlyTerm)
+	assertpkg.Len(t, got, 1,
+		"body-only term %q must be found via FTS (subject/snippet LIKE fallback would return 0)", bodyOnlyTerm)
+	if len(got) == 1 {
+		assertpkg.Equal(t, mid, got[0].ID, "the indexed message")
+	}
+
+	// (2) Control: a subject term is found on both the FTS and LIKE paths.
+	gotSubj, err := eng.Search(ctx, &search.Query{TextTerms: []string{"Quarterly"}}, 50, 0)
+	require.NoError(err, "Search TextTerms=Quarterly")
+	assertpkg.Len(t, gotSubj, 1, "subject term must match")
+}
+
 func gmailSourceID(i int) string {
 	return "gmail-msg-" + string(rune('a'+i))
 }
