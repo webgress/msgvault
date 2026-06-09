@@ -254,7 +254,19 @@ func (w *Worker) RunOnce(ctx context.Context, gen vector.GenerationID) (res RunR
 	completedRows := 0
 	w.runStart = time.Now()
 	runID := w.startEmbedRun(ctx, gen, w.runStart.Unix())
-	defer func() { w.finalizeEmbedRun(ctx, runID, res, retErr, time.Now().Unix()) }()
+	defer func() {
+		// Finalize on a context detached from the caller's cancellation so
+		// the embed_runs row is stamped (ended_at/counters/error) even when
+		// RunOnce exits because ctx was cancelled (Ctrl-C / SIGTERM /
+		// daemon shutdown). Running the close-out UPDATE on the cancelled
+		// ctx would short-circuit in database/sql and leave the row open
+		// forever, corrupting the "find in-flight/crashed runs" signal.
+		// A short timeout keeps shutdown from hanging on a wedged DB.
+		// Mirrors the query/duckdb.go cleanup convention.
+		fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		w.finalizeEmbedRun(fctx, runID, res, retErr, time.Now().Unix())
+	}()
 	// orphanDrainErr/orphanDrainCount preserve the latest orphan-drain
 	// failure across iterations so we can surface it on the empty-claim
 	// exit. Without this, a Complete() failure on orphan rows would be
