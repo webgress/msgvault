@@ -417,11 +417,24 @@ func (w *Worker) RunOnce(ctx context.Context, gen vector.GenerationID) (res RunR
 				// rows (Complete is a token-scoped DELETE, safe against a
 				// concurrent newer claim), do not count this as a failure,
 				// and continue draining so the run finishes cleanly.
+				// Drop the FULL claimed batch, not just the embedded subset:
+				// missing/empty rows were claimed under this token too, and
+				// leaving them claimed would strand them until ReclaimStale
+				// (cr2-5). `ids` is exactly the set of message IDs claimed for
+				// this batch (every one is embedded, missing, or empty).
 				w.deps.Log.Info("embed: generation retired mid-run; dropping batch",
-					"gen", gen, "ids", len(eb.embeddedIDs))
-				if cerr := w.q.Complete(ctx, gen, token, eb.embeddedIDs); cerr != nil {
+					"gen", gen, "ids", len(ids))
+				if cerr := w.q.Complete(ctx, gen, token, ids); cerr != nil {
+					// A Complete failure during a retired-gen drop leaves these
+					// rows claimed; route it through the orphan-drain surfacing
+					// channel so RunOnce cannot report a false-clean drain while
+					// rows remain stuck (cr2-6). Re-embedding a retired
+					// generation is pointless, so surface-and-continue (no
+					// consecutiveFailures escalation), matching the orphan path.
 					w.deps.Log.Error("complete drop after retired generation", "error", cerr,
-						"gen", gen, "ids", len(eb.embeddedIDs))
+						"gen", gen, "ids", len(ids))
+					orphanDrainErr = cerr
+					orphanDrainCount += len(ids)
 				}
 				continue
 			}
@@ -796,6 +809,16 @@ func (w *Worker) downshiftDrain(
 ) (embedded int, dropped int, err error) {
 	var deferredDrops []int64
 	var lastDeferredErr error
+	// retiredObserved records that at least one singleton's Upsert reported
+	// the generation as retired. It is load-bearing for the end-of-drain
+	// decision (cr2-7): once a generation is retired, no future run will ever
+	// re-claim these rows (pickTarget never targets retired gens), so the
+	// endpoint-misconfig protection that Releases on embedded==0 is moot and
+	// would only orphan the deferred rows and trigger the re-embed/hard-abort
+	// loop. retiredDrainErr captures a Complete failure during a retired drop
+	// so RunOnce can surface it rather than report a false-clean run (cr2-6).
+	var retiredObserved bool
+	var retiredDrainErr error
 
 	for i, id := range ids {
 		select {
@@ -839,12 +862,19 @@ func (w *Worker) downshiftDrain(
 				// wrapping into a non-4xx error (which RunOnce would treat
 				// as a hard abort). The remaining claimed rows will also
 				// observe the retired state and drop the same way, so the
-				// drain finishes cleanly and RunOnce returns nil.
+				// drain finishes cleanly and RunOnce returns nil. Record the
+				// retirement so the end-of-drain decision drops any deferred
+				// 4xx rows instead of Releasing them (cr2-7).
+				retiredObserved = true
 				w.deps.Log.Info("embed: generation retired mid-drain; dropping singleton",
 					"gen", gen, "id", id)
-				if cerr := w.q.Complete(ctx, gen, token, eb.embeddedIDs); cerr != nil {
+				if cerr := w.q.Complete(ctx, gen, token, []int64{id}); cerr != nil {
+					// Surface the Complete failure rather than swallowing it
+					// (cr2-6): the row stays claimed and RunOnce must not
+					// report a clean run.
 					w.deps.Log.Error("complete drop after retired generation (drain)", "error", cerr,
 						"gen", gen, "id", id)
+					retiredDrainErr = cerr
 				}
 				continue
 			}
@@ -867,6 +897,39 @@ func (w *Worker) downshiftDrain(
 
 	// Drain finished. Decide deferred-drop fate.
 	if len(deferredDrops) == 0 {
+		// No deferred 4xx rows. Surface a retired-drop Complete failure if one
+		// occurred (cr2-6); otherwise the drain is clean.
+		if retiredDrainErr != nil {
+			return embedded, dropped, fmt.Errorf("complete drop after retired generation: %w", retiredDrainErr)
+		}
+		return embedded, dropped, nil
+	}
+	// A retirement was observed: the generation is gone, so re-claiming is
+	// impossible (pickTarget never targets retired gens). Releasing the
+	// deferred 4xx rows would orphan them forever and trigger the wasteful
+	// re-embed/hard-abort loop. Token-DROP them instead and return nil
+	// (benign) — UNLESS a retired-drop Complete already failed, in which case
+	// we surface that so RunOnce reports the stuck rows (cr2-6/cr2-7). This
+	// check MUST precede the embedded==0 all-drop Release path below; the
+	// retiredObserved flag (not embedded==0 alone) is what distinguishes a
+	// retired generation from a misconfigured endpoint, preserving the
+	// silent-delete-on-misconfig guard.
+	if retiredObserved {
+		for _, id := range deferredDrops {
+			w.deps.Log.Warn("dropping deferred 4xx pending message; generation retired",
+				"gen", gen, "id", id, "error", lastDeferredErr)
+		}
+		dropStart := time.Now()
+		if cerr := w.q.Complete(ctx, gen, token, deferredDrops); cerr != nil {
+			res.Failed += len(deferredDrops)
+			return embedded, dropped, fmt.Errorf("complete drop after retired generation: %w", cerr)
+		}
+		dropped += len(deferredDrops)
+		*completedRows += len(deferredDrops)
+		w.reportProgress(*completedRows, len(deferredDrops), 0, time.Since(dropStart))
+		if retiredDrainErr != nil {
+			return embedded, dropped, fmt.Errorf("complete drop after retired generation: %w", retiredDrainErr)
+		}
 		return embedded, dropped, nil
 	}
 	if embedded > 0 {

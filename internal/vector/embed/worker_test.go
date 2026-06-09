@@ -1356,6 +1356,178 @@ func TestWorker_RetiredGenerationDrainsViaDownshift(t *testing.T) {
 	assertPending(t, f.VectorsDB, int64(f.BuildingGen), 0)
 }
 
+// TestWorker_RetiredGeneration_DrainsFullClaimedBatch pins cr2-5: the
+// main-batch ErrGenerationRetired arm must Complete the FULL claimed batch
+// (embedded + missing + empty), not just the embedded subset. Here a batch of
+// two is claimed; msg 2 was deleted from the main DB so it reaches embedBatch
+// as "missing". msg 1 embeds, but Upsert reports the generation retired, so
+// the whole batch must be benignly dropped. Before the fix only msg 1 was
+// Completed, stranding msg 2 claimed until ReclaimStale and permanently
+// inflating PendingCount.
+//
+// Revert-proof: dropping the full-batch Complete back to eb.embeddedIDs makes
+// assertPending(...,0) fail with one stranded row for the missing message.
+func TestWorker_RetiredGeneration_DrainsFullClaimedBatch(t *testing.T) {
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	ctx := context.Background()
+	f := newWorkerFixture(t, 2)
+
+	const missingID = 2
+	_, err := f.MainDB.ExecContext(ctx, `DELETE FROM messages WHERE id = ?`, missingID)
+	require.NoError(err, "delete missing from main")
+	_, err = f.MainDB.ExecContext(ctx, `DELETE FROM message_bodies WHERE message_id = ?`, missingID)
+	require.NoError(err, "delete missing body")
+
+	w := NewWorker(WorkerDeps{
+		Backend:                retiredUpsertBackend{Backend: f.Backend},
+		VectorsDB:              f.VectorsDB,
+		MainDB:                 f.MainDB,
+		Client:                 f.FakeClient,
+		BatchSize:              2, // both rows claimed in one batch
+		MaxConsecutiveFailures: 5,
+	})
+
+	res, err := w.RunOnce(ctx, f.BuildingGen)
+	require.NoError(err, "RunOnce must return nil for a retired generation (benign drop)")
+	assert.Equal(0, res.Failed, "retired drop must not count as a failure")
+	// The full claimed batch (embedded msg 1 + missing msg 2) must be drained.
+	assertPending(t, f.VectorsDB, int64(f.BuildingGen), 0)
+	assert.Equal(0, countAvailable(t, f.VectorsDB, int64(f.BuildingGen)), "no rows left claimed or available")
+}
+
+// TestWorker_RetiredDownshift_MixedWith4xxDropsCleanly pins cr2-7. A batch of
+// three trips ErrPermanent4xx (forcing the singleton downshift). In the
+// drain, msg 1 keeps returning 4xx (deferred), while msg 2 and msg 3 embed
+// fine but their Upsert reports the generation retired. The drain therefore
+// ends with embedded==0 and a non-empty deferredDrops set. The retiredObserved
+// flag must make the worker token-DROP the deferred 4xx row and return nil —
+// NOT take the embedded==0 all-drop Release path (which would orphan the row
+// for a generation no future run re-claims, then re-embed/hard-abort).
+//
+// Revert-proof: removing the retiredObserved branch makes downshiftDrain take
+// the embedded==0 Release+ErrPermanent4xx path; RunOnce then re-claims and
+// re-embeds the released row each loop until MaxConsecutiveFailures, returning
+// a non-nil "consecutive failures" abort and leaving the row in
+// pending_embeddings — failing the nil-error, res.Failed==0, and
+// assertPending(...,0) assertions below.
+func TestWorker_RetiredDownshift_MixedWith4xxDropsCleanly(t *testing.T) {
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	ctx := context.Background()
+	f := newWorkerFixture(t, 3)
+
+	f.FakeClient.OnEmbed = func(inputs []string) ([][]float32, error) {
+		if len(inputs) > 1 {
+			// Force the downshift to BatchSize=1.
+			return nil, fmt.Errorf("embed: HTTP 400: batch: %w", ErrPermanent4xx)
+		}
+		// Singleton for msg 1 keeps returning 4xx → deferred drop candidate.
+		if strings.Contains(inputs[0], "msg 1") {
+			return nil, fmt.Errorf("embed: HTTP 400: msg-specific: %w", ErrPermanent4xx)
+		}
+		// msg 2 / msg 3 embed fine; their Upsert will report retired.
+		v := make([]float32, 4)
+		v[0] = 1
+		return [][]float32{v}, nil
+	}
+
+	w := NewWorker(WorkerDeps{
+		Backend:                retiredUpsertBackend{Backend: f.Backend},
+		VectorsDB:              f.VectorsDB,
+		MainDB:                 f.MainDB,
+		Client:                 f.FakeClient,
+		BatchSize:              3, // multi-message batch → 4xx → downshift
+		MaxConsecutiveFailures: 5,
+	})
+
+	res, err := w.RunOnce(ctx, f.BuildingGen)
+	require.NoError(err, "RunOnce must return nil: retirement is benign, deferred 4xx row is dropped not released")
+	assert.Equal(0, res.Failed, "retired-generation drain must not count failures")
+	assert.Equal(0, res.Succeeded, "nothing durably embedded (all rows dropped)")
+	// No orphaned rows: the deferred 4xx singleton was token-DROPPED, not
+	// released back to the queue for a generation no future run re-claims.
+	assertPending(t, f.VectorsDB, int64(f.BuildingGen), 0)
+}
+
+// TestWorker_RetiredDrainCompleteFailure_Surfaces pins cr2-6 for the main-loop
+// retired arm: when the retired-gen drop's Complete DELETE fails at the DB
+// level and those are the last queue rows, RunOnce must NOT report a clean
+// (nil) run. The failure is routed through the same orphan-drain surfacing
+// channel so the empty-claim exit returns a non-nil error referencing
+// ReclaimStale, rather than swallowing it with a log line.
+func TestWorker_RetiredDrainCompleteFailure_Surfaces(t *testing.T) {
+	require := requirepkg.New(t)
+	ctx := context.Background()
+	f := newWorkerFixture(t, 1)
+
+	_, err := f.VectorsDB.ExecContext(ctx, `
+        CREATE TRIGGER block_pending_delete_retired
+        BEFORE DELETE ON pending_embeddings
+        BEGIN
+            SELECT RAISE(FAIL, 'simulated complete failure during retired drop');
+        END`)
+	require.NoError(err, "install trigger")
+
+	w := NewWorker(WorkerDeps{
+		Backend:                retiredUpsertBackend{Backend: f.Backend},
+		VectorsDB:              f.VectorsDB,
+		MainDB:                 f.MainDB,
+		Client:                 f.FakeClient,
+		BatchSize:              1,
+		MaxConsecutiveFailures: 5,
+	})
+
+	_, err = w.RunOnce(ctx, f.BuildingGen)
+	require.Error(err, "Complete failure during retired drop must be surfaced, not swallowed")
+	require.ErrorContains(err, "ReclaimStale", "caller must learn recovery is automatic")
+	// The row stays claimed (the trigger blocked the DELETE).
+	var claimed int
+	require.NoError(f.VectorsDB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pending_embeddings WHERE generation_id = ? AND claim_token IS NOT NULL`,
+		int64(f.BuildingGen)).Scan(&claimed), "count claimed")
+	require.Equal(1, claimed, "retired-drop Complete failure leaves the row claimed")
+}
+
+// TestWorker_RetiredDownshiftCompleteFailure_Surfaces pins cr2-6 for the
+// downshift retired arm: a Complete failure while dropping a retired-gen
+// singleton in downshiftDrain must surface from RunOnce (non-nil error)
+// rather than being logged and lost.
+func TestWorker_RetiredDownshiftCompleteFailure_Surfaces(t *testing.T) {
+	require := requirepkg.New(t)
+	ctx := context.Background()
+	f := newWorkerFixture(t, 2)
+
+	f.FakeClient.OnEmbed = func(inputs []string) ([][]float32, error) {
+		if len(inputs) > 1 {
+			return nil, fmt.Errorf("embed: HTTP 400: batch: %w", ErrPermanent4xx)
+		}
+		v := make([]float32, 4)
+		v[0] = 1
+		return [][]float32{v}, nil
+	}
+
+	_, err := f.VectorsDB.ExecContext(ctx, `
+        CREATE TRIGGER block_pending_delete_downshift
+        BEFORE DELETE ON pending_embeddings
+        BEGIN
+            SELECT RAISE(FAIL, 'simulated complete failure during downshift retired drop');
+        END`)
+	require.NoError(err, "install trigger")
+
+	w := NewWorker(WorkerDeps{
+		Backend:                retiredUpsertBackend{Backend: f.Backend},
+		VectorsDB:              f.VectorsDB,
+		MainDB:                 f.MainDB,
+		Client:                 f.FakeClient,
+		BatchSize:              2, // multi-message → 4xx → downshift, then retired Upsert
+		MaxConsecutiveFailures: 5,
+	})
+
+	_, err = w.RunOnce(ctx, f.BuildingGen)
+	require.Error(err, "downshift retired-drop Complete failure must surface from RunOnce")
+}
+
 func TestWorker_DownshiftDrain_TransientErrorReleasesRemainingAndErrors(t *testing.T) {
 	require := requirepkg.New(t)
 	f := newWorkerFixture(t, 3)
