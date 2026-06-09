@@ -359,8 +359,10 @@ CREATE INDEX IF NOT EXISTS idx_messages_type ON messages(message_type);
 CREATE INDEX IF NOT EXISTS idx_messages_deleted ON messages(source_id, deleted_from_source_at);
 CREATE INDEX IF NOT EXISTS idx_messages_source_message_id ON messages(source_message_id);
 
--- Full-text search GIN index on tsvector column
-CREATE INDEX IF NOT EXISTS messages_search_fts_idx ON messages USING GIN (search_fts);
+-- Full-text search GIN index on messages.search_fts is created by
+-- PostgreSQLDialect.EnsureFTSIndex AFTER LegacyColumnMigrations add the
+-- column, not here: a legacy DB missing search_fts would fail this index
+-- during the schema-file Exec and roll back the whole apply. [cr2-10]
 
 CREATE INDEX IF NOT EXISTS idx_message_recipients_message ON message_recipients(message_id);
 CREATE INDEX IF NOT EXISTS idx_message_recipients_participant ON message_recipients(participant_id, recipient_type);

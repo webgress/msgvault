@@ -652,6 +652,13 @@ func (s *Store) InitSchema() error {
 		}
 	}
 
+	// Create FTS indexes that depend on columns just added by the legacy
+	// migrations (PostgreSQL's GIN index on messages.search_fts). No-op on
+	// SQLite. Must run after the migration loop above. [cr2-10]
+	if err := s.dialect.EnsureFTSIndex(s.db.DB); err != nil {
+		return fmt.Errorf("ensure FTS index: %w", err)
+	}
+
 	// Load the optional FTS schema, if the dialect keeps one separate.
 	// PostgreSQL returns "" here because its tsvector lives in the main schema.
 	if ftsFile := s.dialect.SchemaFTS(); ftsFile != "" {

@@ -2,7 +2,11 @@ package query_test
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -352,6 +356,131 @@ func TestQueryEngine_FTSBodySearch(t *testing.T) {
 	gotSubj, err := eng.Search(ctx, &search.Query{TextTerms: []string{"Quarterly"}}, 50, 0)
 	require.NoError(err, "Search TextTerms=Quarterly")
 	assertpkg.Len(t, gotSubj, 1, "subject term must match")
+}
+
+// TestQueryDialect_HasFTSTableSQL_SchemaScoped pins cr2-8: the PG query
+// dialect's FTS existence probe must be scoped to the connection's
+// current_schema(), matching the store dialect. Without the scope, a
+// schema-scoped connection whose own messages table lacks search_fts would
+// falsely report FTS available because a SIBLING schema (or public) has a
+// messages.search_fts column — then the actual search errors with
+// "column m.search_fts does not exist".
+//
+// Two schemas are created: one WITH messages.search_fts, one WITHOUT. The
+// connection's search_path is scoped to the one WITHOUT it; the probe must
+// return 0 (FTS not available here) even though a sibling has the column.
+func TestQueryDialect_HasFTSTableSQL_SchemaScoped(t *testing.T) {
+	dbURL := os.Getenv("MSGVAULT_TEST_DB")
+	if !strings.HasPrefix(dbURL, "postgres://") && !strings.HasPrefix(dbURL, "postgresql://") {
+		t.Skip("cr2-8 schema-scoping test requires MSGVAULT_TEST_DB pointing at PostgreSQL")
+	}
+
+	buf := make([]byte, 8)
+	_, err := rand.Read(buf)
+	requirepkg.NoError(t, err, "random suffix")
+	suffix := hex.EncodeToString(buf)
+	hasSchema := "cr2_8_has_" + suffix
+	noSchema := "cr2_8_no_" + suffix
+
+	setupDB, err := sql.Open("pgx", dbURL)
+	requirepkg.NoError(t, err, "open setup connection")
+	defer func() { _ = setupDB.Close() }()
+	for _, s := range []struct {
+		name    string
+		withFTS bool
+	}{{hasSchema, true}, {noSchema, false}} {
+		_, err := setupDB.Exec("CREATE SCHEMA " + s.name)
+		requirepkg.NoErrorf(t, err, "create schema %s", s.name)
+		cols := "id BIGINT"
+		if s.withFTS {
+			cols += ", search_fts TSVECTOR"
+		}
+		_, err = setupDB.Exec("CREATE TABLE " + s.name + ".messages (" + cols + ")")
+		requirepkg.NoErrorf(t, err, "create messages in %s", s.name)
+	}
+	t.Cleanup(func() {
+		_, _ = setupDB.Exec("DROP SCHEMA " + hasSchema + " CASCADE")
+		_, _ = setupDB.Exec("DROP SCHEMA " + noSchema + " CASCADE")
+	})
+
+	// Connection scoped to the schema WITHOUT search_fts.
+	sep := "?"
+	if strings.Contains(dbURL, "?") {
+		sep = "&"
+	}
+	scopedDB, err := sql.Open("pgx", dbURL+sep+"search_path="+noSchema)
+	requirepkg.NoError(t, err, "open scoped connection")
+	defer func() { _ = scopedDB.Close() }()
+
+	var count int
+	requirepkg.NoError(t,
+		scopedDB.QueryRow(query.PostgreSQLQueryDialect{}.HasFTSTableSQL()).Scan(&count),
+		"run HasFTSTableSQL probe")
+	assertpkg.Equal(t, 0, count,
+		"schema-scoped FTS probe must not count a sibling schema's messages.search_fts")
+}
+
+// TestQueryEngine_SearchDateRange_TimezoneStable pins cr2-9: the search
+// date-range filter must bind time.Time directly rather than a naive,
+// offset-less "2006-01-02 15:04:05" string. A formatted string compared to a
+// PG TIMESTAMPTZ column is cast using the session TimeZone, so under a
+// non-UTC session the UTC-midnight boundary shifts and excludes rows it
+// should include. Binding time.Time lets pgx encode an explicit offset, which
+// is timezone-stable.
+//
+// The message sits at 2024-03-15 02:00 UTC; the after-bound is 2024-03-15
+// 00:00 UTC. Under America/Los_Angeles a naive '2024-03-15 00:00:00' would be
+// read as 07:00 UTC and exclude the message. With time.Time binding it is
+// included regardless of session TimeZone.
+func TestQueryEngine_SearchDateRange_TimezoneStable(t *testing.T) {
+	require := requirepkg.New(t)
+	st := testutil.NewTestStore(t)
+	if !st.IsPostgreSQL() {
+		t.Skip("cr2-9 timezone-stability is PostgreSQL-specific (SQLite has no session TimeZone for TIMESTAMPTZ casts)")
+	}
+
+	src, err := st.GetOrCreateSource("gmail", "tz-search@example.com")
+	require.NoError(err, "GetOrCreateSource")
+	convID, err := st.EnsureConversation(src.ID, "tz-thread", "tz thread")
+	require.NoError(err, "EnsureConversation")
+
+	mid, err := st.UpsertMessage(&store.Message{
+		ConversationID:  convID,
+		SourceID:        src.ID,
+		SourceMessageID: "tz-msg-1",
+		MessageType:     "email",
+		SentAt:          sql.NullTime{Time: time.Date(2024, 3, 15, 2, 0, 0, 0, time.UTC), Valid: true},
+		Subject:         sql.NullString{String: "tz boundary", Valid: true},
+		Snippet:         sql.NullString{String: "snippet", Valid: true},
+		SizeEstimate:    1024,
+	})
+	require.NoError(err, "UpsertMessage")
+
+	// Pin to a single connection so SET TIME ZONE (and the test schema's
+	// search_path, applied per-connection by pgx) both stick for the search.
+	db := st.DB()
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() {
+		_, _ = db.Exec("SET TIME ZONE 'UTC'")
+		db.SetMaxOpenConns(0)
+	})
+
+	after := time.Date(2024, 3, 15, 0, 0, 0, 0, time.UTC)
+	before := time.Date(2024, 3, 16, 0, 0, 0, 0, time.UTC)
+	q := &search.Query{AfterDate: &after, BeforeDate: &before}
+
+	eng := query.NewEngine(db, true)
+	ctx := context.Background()
+
+	for _, tz := range []string{"UTC", "America/Los_Angeles"} {
+		_, err := db.ExecContext(ctx, "SET TIME ZONE '"+tz+"'")
+		require.NoErrorf(err, "SET TIME ZONE %q", tz)
+		got, err := eng.Search(ctx, q, 50, 0)
+		require.NoErrorf(err, "Search under TZ=%q", tz)
+		require.Lenf(got, 1,
+			"date-range search must include the 02:00 UTC message under TZ=%q (timezone-stable bind)", tz)
+		assertpkg.Equalf(t, mid, got[0].ID, "the in-range message under TZ=%q", tz)
+	}
 }
 
 func gmailSourceID(i int) string {

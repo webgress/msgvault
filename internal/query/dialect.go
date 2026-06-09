@@ -188,8 +188,14 @@ func (PostgreSQLQueryDialect) FTSSearchExpression() string {
 }
 
 func (PostgreSQLQueryDialect) HasFTSTableSQL() string {
+	// Scope to the connection's current schema (matching the store dialect's
+	// postgresColumnExistsSQL). Without this, a schema-scoped connection would
+	// falsely report FTS available because a sibling schema happens to have a
+	// messages.search_fts column, then fail the actual search with
+	// "column m.search_fts does not exist". [cr2-8]
 	return `SELECT COUNT(*) FROM information_schema.columns
-		WHERE table_name = 'messages' AND column_name = 'search_fts'`
+		WHERE table_schema = current_schema()
+		  AND table_name = 'messages' AND column_name = 'search_fts'`
 }
 
 // FTSLivenessSQL is empty for PostgreSQL: the information_schema column
