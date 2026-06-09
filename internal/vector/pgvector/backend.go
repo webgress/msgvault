@@ -930,21 +930,33 @@ func (b *Backend) Delete(ctx context.Context, gen vector.GenerationID, messageID
 	if len(messageIDs) == 0 {
 		return nil
 	}
-	var dim int
-	err := b.db.QueryRowContext(ctx,
-		`SELECT dimension FROM index_generations WHERE id = $1`, int64(gen)).Scan(&dim)
-	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("%w: %d", vector.ErrUnknownGeneration, gen)
-	}
-	if err != nil {
-		return fmt.Errorf("lookup generation %d: %w", gen, err)
-	}
 
 	tx, err := b.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin delete tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// Take the index_generations row lock FIRST, mirroring Upsert's
+	// `SELECT ... FOR UPDATE` (backend.go ~437). Every other write path
+	// (Upsert, ActivateGeneration, RetireGeneration) acquires this row
+	// before touching the embeddings rows; if Delete instead locked
+	// embeddings first (as it did before — the dimension lookup was outside
+	// the tx and the message_count UPDATE locked index_generations only at
+	// the end) it would create an ABBA deadlock asymmetry with those
+	// writers on the same generation. Locking here also closes the TOCTOU
+	// where the generation could be retired/deleted out from under this
+	// Delete. The dimension value is unused by the deletion itself but the
+	// locked read also yields ErrUnknownGeneration semantics.
+	var dim int
+	err = tx.QueryRowContext(ctx,
+		`SELECT dimension FROM index_generations WHERE id = $1 FOR UPDATE`, int64(gen)).Scan(&dim)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: %d", vector.ErrUnknownGeneration, gen)
+	}
+	if err != nil {
+		return fmt.Errorf("lookup generation %d: %w", gen, err)
+	}
 
 	willDelete, err := countExistingMessagesTx(ctx, tx, gen, messageIDs)
 	if err != nil {
