@@ -160,7 +160,9 @@ func (j *EmbedJob) Run(ctx context.Context) {
 			"gen", target, "remaining", remaining)
 		return
 	}
-	if err := j.Backend.ActivateGeneration(ctx, target); err != nil {
+	// force=false: the pendingCount==0 check above is the scheduler's gate,
+	// and the backend re-asserts it atomically inside the activation tx.
+	if err := j.Backend.ActivateGeneration(ctx, target, false); err != nil {
 		log.Warn("embed: activation failed", "gen", target, "error", err)
 		return
 	}

@@ -45,7 +45,7 @@ func TestBackend_CreateActivateRetire(t *testing.T) {
 	_, err = b.ActiveGeneration(ctx)
 	require.Error(err, "ActiveGeneration should error before activation")
 
-	require.NoError(b.ActivateGeneration(ctx, gid), "ActivateGeneration")
+	require.NoError(b.ActivateGeneration(ctx, gid, true), "ActivateGeneration")
 	g, err := b.ActiveGeneration(ctx)
 	require.NoError(err, "ActiveGeneration after activate")
 	assert.Equal(vector.GenerationActive, g.State)
@@ -1286,7 +1286,7 @@ func TestBackend_Stats_AggregateCountsPerGenerationDuplicates(t *testing.T) {
 	// CreateGeneration produces a building gen alongside it instead of
 	// reusing the same row.
 	genA := seedAndEmbed(t, b, map[int64][]float32{1: unitVec(768, 0)})
-	require.NoError(b.ActivateGeneration(ctx, genA), "ActivateGeneration(genA)")
+	require.NoError(b.ActivateGeneration(ctx, genA, true), "ActivateGeneration(genA)")
 
 	// Second generation: re-embed the same message 1, mirroring the
 	// "rebuild in progress" state where every message is dual-embedded
@@ -1377,7 +1377,7 @@ func TestBackend_LoadVector(t *testing.T) {
 	}
 	chunks := []vector.Chunk{{MessageID: 1, Vector: vec, SourceCharLen: 42}}
 	require.NoError(b.Upsert(ctx, gid, chunks), "Upsert")
-	require.NoError(b.ActivateGeneration(ctx, gid), "ActivateGeneration")
+	require.NoError(b.ActivateGeneration(ctx, gid, true), "ActivateGeneration")
 
 	got, err := b.LoadVector(ctx, 1)
 	require.NoError(err, "LoadVector")
@@ -1402,7 +1402,7 @@ func TestBackend_LoadVector_NotEmbedded(t *testing.T) {
 	}
 	chunks := []vector.Chunk{{MessageID: 1, Vector: vec, SourceCharLen: 42}}
 	require.NoError(b.Upsert(ctx, gid, chunks), "Upsert")
-	require.NoError(b.ActivateGeneration(ctx, gid), "ActivateGeneration")
+	require.NoError(b.ActivateGeneration(ctx, gid, true), "ActivateGeneration")
 
 	_, err = b.LoadVector(ctx, 999)
 	require.Error(err, "LoadVector for missing message should error")

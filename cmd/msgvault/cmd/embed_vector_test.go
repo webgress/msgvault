@@ -151,7 +151,7 @@ func TestPickEmbedGeneration_PrefersBuildingOverActive_MatchingFingerprint(t *te
 	// "I want to refresh my index" pattern).
 	activeGen, err := b.CreateGeneration(ctx, "fake", 4, "")
 	require.NoError(err, "CreateGeneration (active)")
-	require.NoError(b.ActivateGeneration(ctx, activeGen), "ActivateGeneration")
+	require.NoError(b.ActivateGeneration(ctx, activeGen, true), "ActivateGeneration")
 	buildingGen, err := b.CreateGeneration(ctx, "fake", 4, "")
 	require.NoError(err, "CreateGeneration (building)")
 
@@ -209,7 +209,7 @@ func TestPickEmbedGeneration_StaleActivePlusMatchingBuilding(t *testing.T) {
 
 	staleActive, err := b.CreateGeneration(ctx, "old-model", 4, "")
 	require.NoError(err, "CreateGeneration (stale active)")
-	require.NoError(b.ActivateGeneration(ctx, staleActive), "ActivateGeneration")
+	require.NoError(b.ActivateGeneration(ctx, staleActive, true), "ActivateGeneration")
 	matchingBuilding, err := b.CreateGeneration(ctx, "new-model", 4, "")
 	require.NoError(err, "CreateGeneration (matching building)")
 
@@ -240,7 +240,7 @@ func TestPickEmbedGeneration_ActivePlusMismatchedBuildingRejected(t *testing.T) 
 
 	matchingActive, err := b.CreateGeneration(ctx, "fake", 4, "")
 	require.NoError(err, "CreateGeneration (active)")
-	require.NoError(b.ActivateGeneration(ctx, matchingActive), "ActivateGeneration")
+	require.NoError(b.ActivateGeneration(ctx, matchingActive, true), "ActivateGeneration")
 	_, err = b.CreateGeneration(ctx, "old-model", 4, "")
 	require.NoError(err, "CreateGeneration (stale building)")
 
@@ -360,7 +360,7 @@ func TestPickEmbedGeneration_ResumeRacesActivation(t *testing.T) {
 	// `msgvault embeddings build` run that finished first) activated the
 	// generation. From this actor's perspective BuildingGeneration
 	// returned non-nil a moment ago, but the state has since flipped.
-	require.NoError(b.ActivateGeneration(ctx, gen), "ActivateGeneration")
+	require.NoError(b.ActivateGeneration(ctx, gen, true), "ActivateGeneration")
 
 	// Intercepting the race is hard to do in a single-threaded test,
 	// but we can drive the same code path by calling

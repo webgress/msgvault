@@ -111,7 +111,7 @@ CREATE TABLE message_recipients (
 		chunks = append(chunks, vector.Chunk{MessageID: d.id, Vector: unitVec(parityDim, d.axis)})
 	}
 	require.NoError(t, b.Upsert(ctx, gid, chunks), "Upsert")
-	require.NoError(t, b.ActivateGeneration(ctx, gid), "Activate")
+	require.NoError(t, b.ActivateGeneration(ctx, gid, true), "Activate")
 	return b, ctx, gid
 }
 

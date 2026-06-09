@@ -72,7 +72,7 @@ func newVectorSearchTestEnv(t *testing.T, embedSrvURL string) (*store.Store, fun
 		_ = b.Close()
 		requirepkg.NoError(t, err, "CreateGeneration")
 	}
-	if err := b.ActivateGeneration(ctx, gid); err != nil {
+	if err := b.ActivateGeneration(ctx, gid, true); err != nil {
 		_ = b.Close()
 		requirepkg.NoError(t, err, "ActivateGeneration")
 	}

@@ -278,7 +278,7 @@ func (b *Backend) seedPending(ctx context.Context, gen vector.GenerationID, now 
 // active generation's recall. Deleting them keeps the graph
 // generation-clean. This intentionally differs from sqlitevec, whose
 // vec0 PARTITION KEY isolates retired rows so it can retain them.
-func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationID) error {
+func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationID, force bool) error {
 	now := time.Now().Unix()
 	tx, err := b.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -308,21 +308,59 @@ func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationI
 			return fmt.Errorf("delete retired generation %d embeddings: %w", demoted.Int64, err)
 		}
 	}
+	// The promote enforces the seeded/no-pending gate IN the same tx as the
+	// flip (unless force) so a concurrent enqueue.go dual-enqueue cannot slip
+	// a pending row into gen between a caller's pre-check and this UPDATE.
 	res, err := tx.ExecContext(ctx,
 		`UPDATE index_generations
 		    SET state = 'active', activated_at = $1, completed_at = COALESCE(completed_at, $2)
-		  WHERE id = $3 AND state = 'building'`, now, now, int64(gen))
+		  WHERE id = $3 AND state = 'building'
+		    AND ($4 OR seeded_at IS NOT NULL)
+		    AND ($4 OR NOT EXISTS (
+		        SELECT 1 FROM pending_embeddings WHERE generation_id = $3
+		    ))`, now, now, int64(gen), force)
 	if err != nil {
 		return fmt.Errorf("activate: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("generation %d not in 'building' state", gen)
+		return activateGateError(ctx, tx, gen, force)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit activate generation %d: %w", gen, err)
 	}
 	return nil
+}
+
+// activateGateError re-reads gen inside the activation tx to return a
+// precise reason the gated promote affected zero rows: pending rows present,
+// not finished seeding, unknown generation, or not in 'building' state.
+// Mirrors the prior CLI raw helper so callers get the same actionable
+// messages now that the gate lives in the backend.
+func activateGateError(ctx context.Context, tx *sql.Tx, gen vector.GenerationID, force bool) error {
+	var pending int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pending_embeddings WHERE generation_id = $1`, int64(gen)).Scan(&pending); err != nil {
+		return fmt.Errorf("count pending rows for generation %d: %w", gen, err)
+	}
+	if pending > 0 && !force {
+		return fmt.Errorf("generation %d still has %d pending embedding rows; run `msgvault embeddings resume` or pass --force",
+			gen, pending)
+	}
+	var state vector.GenerationState
+	var seededAt sql.NullInt64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT state, seeded_at FROM index_generations WHERE id = $1`, int64(gen)).Scan(&state, &seededAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: %d", vector.ErrUnknownGeneration, gen)
+		}
+		return fmt.Errorf("lookup generation %d: %w", gen, err)
+	}
+	if state == vector.GenerationBuilding && !seededAt.Valid && !force {
+		return fmt.Errorf("generation %d has not finished seeding; run `msgvault embeddings resume` or pass --force",
+			gen)
+	}
+	return fmt.Errorf("generation %d not in 'building' state", gen)
 }
 
 // RetireGeneration marks the given generation as retired and DELETEs its

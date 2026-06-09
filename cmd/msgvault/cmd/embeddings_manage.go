@@ -148,6 +148,13 @@ func runEmbeddingsActivate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("generation %d fingerprint=%q does not match config=%q; pass --force to activate anyway",
 			gen, row.Fingerprint, expected)
 	}
+	// The pending/seeded gate is enforced atomically inside
+	// backend.ActivateGeneration (see below) so a concurrent sync that
+	// dual-enqueues a pending row cannot slip it in between this read and
+	// the state flip. We still surface a friendly pre-flight error here
+	// (against the committed metadata read) so the common case fails fast
+	// before opening a backend connection and before prompting — but the
+	// backend's transactional gate is the authoritative guarantee.
 	if row.PendingCount > 0 && !embeddingsActivateForce {
 		return fmt.Errorf("generation %d still has %d pending embedding rows; run `msgvault embeddings resume` or pass --force",
 			gen, row.PendingCount)
@@ -174,16 +181,18 @@ func runEmbeddingsActivate(cmd *cobra.Command, args []string) error {
 
 	// Route through the vector backend so the auto-retire of the previously
 	// active generation deletes its embeddings on PG (the same delete-on-retire
-	// invariant as the retire path). The fingerprint/pending/seeded gating
-	// above already enforces the CLI UX before we mutate state; the backend's
-	// ActivateGeneration requires the target to be in 'building' state and
-	// auto-retires the prior active generation in one transaction.
+	// invariant as the retire path). The backend's ActivateGeneration requires
+	// the target to be in 'building' state, enforces the seeded/no-pending gate
+	// ATOMICALLY with the state flip (unless force), and auto-retires the prior
+	// active generation in one transaction. The fingerprint check above is the
+	// only gate the backend cannot make (it does not know the config
+	// fingerprint); the pending/seeded gate is owned by the backend.
 	backend, closeBackend, err := openEmbeddingsBackend(cmd.Context())
 	if err != nil {
 		return err
 	}
 	defer closeBackend()
-	if err := backend.ActivateGeneration(cmd.Context(), gen); err != nil {
+	if err := backend.ActivateGeneration(cmd.Context(), gen, embeddingsActivateForce); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Generation %d activated.\n", gen)
@@ -390,93 +399,6 @@ func activeEmbeddingGeneration(ctx context.Context, db *sql.DB, rebind func(stri
 		return embeddingGenerationRow{}, false, fmt.Errorf("lookup active generation: %w", err)
 	}
 	return g, true, nil
-}
-
-func retireEmbeddingGeneration(ctx context.Context, db *sql.DB, rebind func(string) string, gen vector.GenerationID, forceActive bool) error {
-	stateFilter := `state = ?`
-	args := []any{string(vector.GenerationBuilding), int64(gen)}
-	if forceActive {
-		stateFilter = `state IN (?, ?)`
-		args = []any{string(vector.GenerationBuilding), string(vector.GenerationActive), int64(gen)}
-	}
-	res, err := db.ExecContext(ctx,
-		rebind(`UPDATE index_generations SET state = 'retired' WHERE `+stateFilter+` AND id = ?`), args...)
-	if err != nil {
-		return fmt.Errorf("retire generation %d: %w", gen, err)
-	}
-	n, _ := res.RowsAffected()
-	if n > 0 {
-		return nil
-	}
-
-	row, err := getEmbeddingGeneration(ctx, db, rebind, gen)
-	if err != nil {
-		return err
-	}
-	if row.State == vector.GenerationRetired {
-		return nil
-	}
-	if row.State == vector.GenerationActive && !forceActive {
-		return fmt.Errorf("generation %d is active; pass --force-active to retire the serving generation", gen)
-	}
-	return fmt.Errorf("generation %d could not be retired from %q state", gen, row.State)
-}
-
-func activateEmbeddingGeneration(ctx context.Context, db *sql.DB, rebind func(string) string, gen vector.GenerationID, force bool) error {
-	now := time.Now().Unix()
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin activate transaction: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	if _, err := tx.ExecContext(ctx,
-		rebind(`UPDATE index_generations
-		 SET state = 'retired', completed_at = COALESCE(completed_at, ?)
-		 WHERE state = 'active'`), now); err != nil {
-		return fmt.Errorf("retire previous active: %w", err)
-	}
-	res, err := tx.ExecContext(ctx,
-		rebind(`UPDATE index_generations
-		 SET state = 'active', activated_at = ?, completed_at = COALESCE(completed_at, ?)
-		 WHERE id = ? AND state = 'building'
-		   AND (? OR seeded_at IS NOT NULL)
-		   AND (? OR NOT EXISTS (
-		       SELECT 1 FROM pending_embeddings WHERE generation_id = ?
-		   ))`), now, now, int64(gen), force, force, int64(gen))
-	if err != nil {
-		return fmt.Errorf("activate generation %d: %w", gen, err)
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		var pending int64
-		if err := tx.QueryRowContext(ctx,
-			rebind(`SELECT COUNT(*) FROM pending_embeddings WHERE generation_id = ?`), int64(gen)).Scan(&pending); err != nil {
-			return fmt.Errorf("count pending rows for generation %d: %w", gen, err)
-		}
-		if pending > 0 && !force {
-			return fmt.Errorf("generation %d still has %d pending embedding rows; run `msgvault embeddings resume` or pass --force",
-				gen, pending)
-		}
-		var state vector.GenerationState
-		var seededAt sql.NullInt64
-		if err := tx.QueryRowContext(ctx,
-			rebind(`SELECT state, seeded_at FROM index_generations WHERE id = ?`), int64(gen)).Scan(&state, &seededAt); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("%w: %d", vector.ErrUnknownGeneration, gen)
-			}
-			return fmt.Errorf("lookup generation %d: %w", gen, err)
-		}
-		if state == vector.GenerationBuilding && !seededAt.Valid && !force {
-			return fmt.Errorf("generation %d has not finished seeding; run `msgvault embeddings resume` or pass --force",
-				gen)
-		}
-		return fmt.Errorf("generation %d not in %q state", gen, vector.GenerationBuilding)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit activate transaction: %w", err)
-	}
-	return nil
 }
 
 type generationScanner interface {

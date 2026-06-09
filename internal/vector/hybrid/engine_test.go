@@ -121,7 +121,7 @@ CREATE TABLE message_recipients (
 		{MessageID: 3, Vector: unitVec(2), SourceCharLen: 40},
 	}
 	requirepkg.NoError(t, b.Upsert(ctx, gid, chunks), "Upsert")
-	requirepkg.NoError(t, b.ActivateGeneration(ctx, gid), "Activate")
+	requirepkg.NoError(t, b.ActivateGeneration(ctx, gid, true), "Activate")
 
 	fp := "fake-model:4"
 	eng := NewEngine(b, mainDB, &fakeEmbedder{dim: 4}, Config{

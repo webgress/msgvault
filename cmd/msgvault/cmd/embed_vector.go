@@ -147,7 +147,9 @@ func runEmbed(cmd *cobra.Command) error {
 			return fmt.Errorf("count pending: %w", err)
 		}
 		if remaining == 0 {
-			if err := backend.ActivateGeneration(ctx, gen); err != nil {
+			// force=false: we already gated on remaining==0 above, and the
+			// backend re-asserts the seeded/no-pending gate atomically.
+			if err := backend.ActivateGeneration(ctx, gen, false); err != nil {
 				return fmt.Errorf("activate generation: %w", err)
 			}
 			_, _ = fmt.Fprintf(out, "Generation %d activated.\n", gen)

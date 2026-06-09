@@ -29,7 +29,7 @@ func TestFusedSearch_BothSignalsContribute(t *testing.T) {
 		2: unitVec(768, 1),
 		3: unitVec(768, 2),
 	})
-	require.NoError(b.ActivateGeneration(ctx, gid), "ActivateGeneration")
+	require.NoError(b.ActivateGeneration(ctx, gid, true), "ActivateGeneration")
 
 	req := vector.FusedRequest{
 		FTSQuery:   "meeting",
@@ -56,7 +56,7 @@ func TestFusedSearch_FTSOnly_VectorScoreIsNaN(t *testing.T) {
 		2: unitVec(768, 1),
 		3: unitVec(768, 2),
 	})
-	require.NoError(b.ActivateGeneration(ctx, gid), "ActivateGeneration")
+	require.NoError(b.ActivateGeneration(ctx, gid, true), "ActivateGeneration")
 
 	req := vector.FusedRequest{
 		FTSQuery:   "meeting",
@@ -83,7 +83,7 @@ func TestFusedSearch_VectorOnly_BM25ScoreIsNaN(t *testing.T) {
 		2: unitVec(768, 1),
 		3: unitVec(768, 2),
 	})
-	require.NoError(b.ActivateGeneration(ctx, gid), "ActivateGeneration")
+	require.NoError(b.ActivateGeneration(ctx, gid, true), "ActivateGeneration")
 
 	req := vector.FusedRequest{
 		FTSQuery:   "",
@@ -116,7 +116,7 @@ func TestFusedSearch_AnnSaturation_VectorOnly(t *testing.T) {
 		vecs[i] = unitVec(768, 0)
 	}
 	gid := seedAndEmbed(t, b, vecs)
-	requirepkg.NoError(t, b.ActivateGeneration(ctx, gid), "ActivateGeneration")
+	requirepkg.NoError(t, b.ActivateGeneration(ctx, gid, true), "ActivateGeneration")
 
 	req := vector.FusedRequest{
 		QueryVec:   unitVec(768, 0),
@@ -139,7 +139,7 @@ func TestFusedSearch_AnnSaturation_BelowCap(t *testing.T) {
 		1: unitVec(768, 0),
 		2: unitVec(768, 0),
 	})
-	requirepkg.NoError(t, b.ActivateGeneration(ctx, gid), "ActivateGeneration")
+	requirepkg.NoError(t, b.ActivateGeneration(ctx, gid, true), "ActivateGeneration")
 
 	req := vector.FusedRequest{
 		QueryVec:   unitVec(768, 0),
@@ -222,7 +222,7 @@ func TestFusedSearch_BM25TopKRespectsRank(t *testing.T) {
 
 	gid, err := b.CreateGeneration(ctx, "m", 768, "")
 	require.NoError(err, "CreateGeneration")
-	require.NoError(b.ActivateGeneration(ctx, gid), "ActivateGeneration")
+	require.NoError(b.ActivateGeneration(ctx, gid, true), "ActivateGeneration")
 
 	// Confirm the ground-truth BM25 ordering in the attached DB so
 	// the assertion below reflects what FTS5 would produce without
@@ -334,7 +334,7 @@ func TestFusedSearch_PinnedPoolKeepsAttach(t *testing.T) {
 	assert := assertpkg.New(t)
 	b, ctx := newFusedBackendForTest(t)
 	gid := seedAndEmbed(t, b, map[int64][]float32{1: unitVec(768, 0)})
-	require.NoError(b.ActivateGeneration(ctx, gid), "ActivateGeneration")
+	require.NoError(b.ActivateGeneration(ctx, gid, true), "ActivateGeneration")
 
 	conn, err := b.openFusedConn(ctx)
 	require.NoError(err, "openFusedConn")
@@ -436,7 +436,7 @@ func TestFusedSearch_AfterBeforeBoundaries_TextDate(t *testing.T) {
 
 	gid, err := b.CreateGeneration(ctx, "m", 768, "")
 	require.NoError(err, "CreateGeneration")
-	require.NoError(b.ActivateGeneration(ctx, gid), "Activate")
+	require.NoError(b.ActivateGeneration(ctx, gid, true), "Activate")
 
 	mid := time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC)
 	end := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
@@ -539,7 +539,7 @@ func TestFusedSearch_SenderMatchesFromRecipientOnly(t *testing.T) {
 
 	gid, err := b.CreateGeneration(ctx, "m", 768, "")
 	require.NoError(err, "CreateGeneration")
-	require.NoError(b.ActivateGeneration(ctx, gid), "Activate")
+	require.NoError(b.ActivateGeneration(ctx, gid, true), "Activate")
 
 	req := vector.FusedRequest{
 		FTSQuery:   "topic",
@@ -574,7 +574,7 @@ func TestFusedSearch_RecipientFiltersMatchNoneSentinel(t *testing.T) {
 		2: unitVec(768, 1),
 		3: unitVec(768, 2),
 	})
-	requirepkg.NoError(t, b.ActivateGeneration(ctx, gid), "Activate")
+	requirepkg.NoError(t, b.ActivateGeneration(ctx, gid, true), "Activate")
 
 	const sentinel int64 = -1 // mirrors hybrid.noMatchSentinel
 	cases := []struct {
@@ -654,7 +654,7 @@ func TestFusedSearch_SubjectBoost(t *testing.T) {
 		1: unitVec(768, 0),   // identical to query → distance ~0
 		2: unitVec(768, 137), // distant
 	})
-	require.NoError(b.ActivateGeneration(ctx, gid), "ActivateGeneration")
+	require.NoError(b.ActivateGeneration(ctx, gid, true), "ActivateGeneration")
 
 	t.Run("boost_lifts_subject_match_above_higher_ann", func(t *testing.T) {
 		require := requirepkg.New(t)
@@ -763,7 +763,7 @@ func TestFusedSearch_EmptyFilteredSetReportsNotSaturated(t *testing.T) {
 		1: unitVec(768, 0),
 		2: unitVec(768, 1),
 	})
-	require.NoError(b.ActivateGeneration(ctx, gid), "ActivateGeneration")
+	require.NoError(b.ActivateGeneration(ctx, gid, true), "ActivateGeneration")
 
 	yes := true
 	hits, saturated, err := b.FusedSearch(ctx, vector.FusedRequest{
@@ -824,7 +824,7 @@ func TestFusedSearch_SubjectBoostOverFetchesBeyondLimit(t *testing.T) {
 		vecs[int64(i+1)] = v
 	}
 	gid := seedAndEmbed(t, b, vecs)
-	require.NoError(b.ActivateGeneration(ctx, gid), "ActivateGeneration")
+	require.NoError(b.ActivateGeneration(ctx, gid, true), "ActivateGeneration")
 
 	req := vector.FusedRequest{
 		QueryVec:     queryVec,
@@ -895,7 +895,7 @@ func TestFusedSearch_SubjectBoostPromotesDeepRankHit(t *testing.T) {
 		vecs[i] = v
 	}
 	gid := seedAndEmbed(t, b, vecs)
-	require.NoError(b.ActivateGeneration(ctx, gid), "ActivateGeneration")
+	require.NoError(b.ActivateGeneration(ctx, gid, true), "ActivateGeneration")
 
 	hits, _, err := b.FusedSearch(ctx, vector.FusedRequest{
 		QueryVec:     queryVec,
@@ -952,7 +952,7 @@ func TestFusedSearch_NullSubjectExcludedBySubjectFilter(t *testing.T) {
 		1: unitVec(768, 0),
 		2: unitVec(768, 1),
 	})
-	require.NoError(b.ActivateGeneration(ctx, gid), "ActivateGeneration")
+	require.NoError(b.ActivateGeneration(ctx, gid, true), "ActivateGeneration")
 
 	hits, _, err := b.FusedSearch(ctx, vector.FusedRequest{
 		QueryVec:   unitVec(768, 0),

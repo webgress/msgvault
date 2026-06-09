@@ -21,7 +21,7 @@ type fakeBackend struct {
 func (f *fakeBackend) CreateGeneration(context.Context, string, int, string) (GenerationID, error) {
 	return 0, errors.New("not implemented")
 }
-func (f *fakeBackend) ActivateGeneration(context.Context, GenerationID) error {
+func (f *fakeBackend) ActivateGeneration(context.Context, GenerationID, bool) error {
 	return errors.New("not implemented")
 }
 func (f *fakeBackend) RetireGeneration(context.Context, GenerationID) error {

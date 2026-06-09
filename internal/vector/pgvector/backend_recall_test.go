@@ -185,7 +185,7 @@ func TestBackend_FusedSearch_MultiChunkCorpus_ReturnsKDistinct(t *testing.T) {
 	const multiChunks = 200
 	const singles = k - 1 // total chunks = 1*multiChunks + singles = 204 > 48
 	gen, query := seedRecallCorpus(t, b, db, multiChunks, singles)
-	require.NoError(t, b.ActivateGeneration(ctx, gen), "ActivateGeneration")
+	require.NoError(t, b.ActivateGeneration(ctx, gen, true), "ActivateGeneration")
 
 	hits, _, err := b.FusedSearch(ctx, vector.FusedRequest{
 		QueryVec:   query,
