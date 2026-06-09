@@ -56,6 +56,58 @@ func TestBackend_CreateActivateRetire(t *testing.T) {
 	require.Error(err, "ActiveGeneration should error after retire")
 }
 
+// pendingCount returns the number of pending_embeddings rows for a generation.
+func pendingCount(t *testing.T, b *Backend, gen vector.GenerationID) int {
+	t.Helper()
+	var n int
+	requirepkg.NoError(t, b.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM pending_embeddings WHERE generation_id = ?`, int64(gen)).Scan(&n),
+		"count pending rows")
+	return n
+}
+
+// TestBackend_RetireGeneration_CleansPending pins the cr2-2/cr2-4 fix for the
+// explicit-retire path: RetireGeneration must DELETE the generation's
+// pending_embeddings rows in the same tx as the state flip. A retired
+// generation is never re-targeted by pickTarget, so leftover queue rows would
+// be orphaned forever and would violate the documented "retired generations
+// have zero pending items" stats invariant.
+func TestBackend_RetireGeneration_CleansPending(t *testing.T) {
+	b, ctx := newBackendForTest(t)
+
+	// CreateGeneration seeds one pending row (for msg id=1 in the test main DB).
+	gen, err := b.CreateGeneration(ctx, "m", 768, "")
+	requirepkg.NoError(t, err, "CreateGeneration")
+	requirepkg.Equal(t, 1, pendingCount(t, b, gen), "precondition: pending row present")
+
+	requirepkg.NoError(t, b.RetireGeneration(ctx, gen), "RetireGeneration")
+
+	assertpkg.Equal(t, 0, pendingCount(t, b, gen),
+		"retire must delete the generation's pending_embeddings rows")
+}
+
+// TestBackend_ActivateGeneration_AutoRetireCleansPending pins the
+// cr2-3/cr2-4 fix for the auto-retire path: activating a new generation must
+// reap the demoted (now-retired) generation's pending_embeddings rows in the
+// same tx as the state flip.
+func TestBackend_ActivateGeneration_AutoRetireCleansPending(t *testing.T) {
+	b, ctx := newBackendForTest(t)
+
+	genA, err := b.CreateGeneration(ctx, "model-a", 768, "")
+	requirepkg.NoError(t, err, "CreateGeneration A")
+	// Force-activate A while it still has its seeded pending row (mimicking an
+	// undrained incremental queue row left on the active gen at re-embed time).
+	requirepkg.NoError(t, b.ActivateGeneration(ctx, genA, true), "activate A (force)")
+	requirepkg.Equal(t, 1, pendingCount(t, b, genA), "precondition: pending row on active gen")
+
+	genB, err := b.CreateGeneration(ctx, "model-b", 768, "")
+	requirepkg.NoError(t, err, "CreateGeneration B")
+	requirepkg.NoError(t, b.ActivateGeneration(ctx, genB, true), "activate B (auto-retires A)")
+
+	assertpkg.Equal(t, 0, pendingCount(t, b, genA),
+		"auto-retire must delete the demoted generation's pending_embeddings rows")
+}
+
 func TestBackend_CreateGeneration_SeedsPending(t *testing.T) {
 	b, ctx := newBackendForTest(t)
 	gid, err := b.CreateGeneration(ctx, "m", 768, "")

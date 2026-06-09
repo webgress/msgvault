@@ -307,6 +307,16 @@ func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationI
 			`DELETE FROM embeddings WHERE generation_id = $1`, demoted.Int64); err != nil {
 			return fmt.Errorf("delete retired generation %d embeddings: %w", demoted.Int64, err)
 		}
+		// Reap the demoted generation's queue rows in the same tx. Retired
+		// generations are never re-targeted by pickTarget, so any leftover
+		// pending_embeddings rows would be orphaned forever (the
+		// index_generations row is preserved, so the ON DELETE CASCADE never
+		// fires). Deleting them keeps the documented stats invariant
+		// ("retired generations have zero pending items") true. [cr2-3, cr2-4]
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM pending_embeddings WHERE generation_id = $1`, demoted.Int64); err != nil {
+			return fmt.Errorf("delete retired generation %d pending: %w", demoted.Int64, err)
+		}
 	}
 	// The promote enforces the seeded/no-pending gate IN the same tx as the
 	// flip (unless force) so a concurrent enqueue.go dual-enqueue cannot slip
@@ -388,6 +398,15 @@ func (b *Backend) RetireGeneration(ctx context.Context, gen vector.GenerationID)
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM embeddings WHERE generation_id = $1`, int64(gen)); err != nil {
 		return fmt.Errorf("delete retired generation %d embeddings: %w", gen, err)
+	}
+	// Reap the retired generation's queue rows in the same tx so they cannot
+	// be orphaned (no future run re-targets a retired generation, and the
+	// preserved index_generations row means the ON DELETE CASCADE never
+	// fires). Keeps the "retired generations have zero pending items"
+	// stats invariant true. [cr2-2, cr2-3]
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM pending_embeddings WHERE generation_id = $1`, int64(gen)); err != nil {
+		return fmt.Errorf("delete retired generation %d pending: %w", gen, err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit retire generation %d: %w", gen, err)

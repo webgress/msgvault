@@ -23,6 +23,32 @@ func countEmbeddingRows(t *testing.T, b *Backend, gen vector.GenerationID) int {
 	return n
 }
 
+// countPendingRows returns the number of pending_embeddings rows belonging to
+// a generation. Used by the retire-cleans-pending tests (cr2-2/cr2-3/cr2-4).
+func countPendingRows(t *testing.T, b *Backend, gen vector.GenerationID) int {
+	t.Helper()
+	var n int
+	require.NoError(t, b.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM pending_embeddings WHERE generation_id = $1`, int64(gen)).Scan(&n),
+		"count pending rows for generation %d", gen)
+	return n
+}
+
+// seedPending inserts a pending_embeddings row for (gen, msgID) directly,
+// without going through the worker. The message row is created first to
+// satisfy the FK. Used to simulate queue rows left behind on a retired gen.
+func seedPending(t *testing.T, b *Backend, gen vector.GenerationID, msgID int64) {
+	t.Helper()
+	ctx := context.Background()
+	_, err := b.db.ExecContext(ctx,
+		`INSERT INTO messages (id) VALUES ($1) ON CONFLICT DO NOTHING`, msgID)
+	require.NoErrorf(t, err, "seed message %d", msgID)
+	_, err = b.db.ExecContext(ctx,
+		`INSERT INTO pending_embeddings (generation_id, message_id, enqueued_at)
+		 VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, int64(gen), msgID, 0)
+	require.NoErrorf(t, err, "seed pending (%d, %d)", gen, msgID)
+}
+
 // genMessageCount returns index_generations.message_count for a generation.
 func genMessageCount(t *testing.T, b *Backend, gen vector.GenerationID) int {
 	t.Helper()
@@ -217,6 +243,59 @@ func TestBackend_ActivateGeneration_PreservesBuildingGenerations(t *testing.T) {
 	require.NoError(t, b.ActivateGeneration(ctx, genC, true), "activate C (retires B)")
 	assert.Equal(t, 0, countEmbeddingRows(t, b, genB), "B deleted on C's activation")
 	assert.Equal(t, 1, countEmbeddingRows(t, b, genC), "C's own rows preserved")
+}
+
+// TestBackend_RetireGeneration_CleansPending pins the cr2-2/cr2-3 fix for the
+// explicit-retire path: RetireGeneration must DELETE the generation's
+// pending_embeddings rows in the same tx as the state flip. Retired
+// generations are never re-targeted by pickTarget, so any leftover queue rows
+// would be orphaned forever and would violate the documented "retired
+// generations have zero pending items" stats invariant.
+func TestBackend_RetireGeneration_CleansPending(t *testing.T) {
+	b, ctx, _ := newBackendForTest(t)
+
+	gen := buildGenWithVectors(t, b, "model-a", 4, map[int64][]float32{
+		1: unitVec(4, 0),
+	})
+	// Simulate queue rows left behind on the generation (e.g. an incremental
+	// enqueue that was never drained before retire).
+	seedPending(t, b, gen, 10)
+	seedPending(t, b, gen, 11)
+	require.Equal(t, 2, countPendingRows(t, b, gen), "precondition: pending rows present")
+
+	require.NoError(t, b.RetireGeneration(ctx, gen), "RetireGeneration")
+
+	assert.Equal(t, 0, countPendingRows(t, b, gen),
+		"retire must delete the generation's pending_embeddings rows")
+	assert.Equal(t, string(vector.GenerationRetired), genState(t, b, gen),
+		"index_generations row must remain, flipped to retired")
+}
+
+// TestBackend_ActivateGeneration_AutoRetireCleansPending pins the
+// cr2-3/cr2-4 fix for the auto-retire path: activating a new generation must
+// reap the demoted (now-retired) generation's pending_embeddings rows in the
+// same tx as the state flip.
+func TestBackend_ActivateGeneration_AutoRetireCleansPending(t *testing.T) {
+	b, ctx, _ := newBackendForTest(t)
+
+	genA := buildGenWithVectors(t, b, "model-a", 4, map[int64][]float32{
+		1: unitVec(4, 0),
+	})
+	require.NoError(t, b.ActivateGeneration(ctx, genA, true), "activate A")
+	// Stage incremental queue rows on the active gen that haven't drained yet.
+	seedPending(t, b, genA, 20)
+	seedPending(t, b, genA, 21)
+	require.Equal(t, 2, countPendingRows(t, b, genA), "precondition: pending rows on active gen")
+
+	genB := buildGenWithVectors(t, b, "model-b", 4, map[int64][]float32{
+		1: unitVec(4, 1),
+	})
+	require.NoError(t, b.ActivateGeneration(ctx, genB, true), "activate B (auto-retires A)")
+
+	assert.Equal(t, string(vector.GenerationRetired), genState(t, b, genA),
+		"A must be retired by B's activation")
+	assert.Equal(t, 0, countPendingRows(t, b, genA),
+		"auto-retire must delete the demoted generation's pending_embeddings rows")
 }
 
 // TestBackend_DeleteOnRetire_KeepsActiveRecallClean is the recall proof for
