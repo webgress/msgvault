@@ -386,10 +386,15 @@ func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationI
 			return fmt.Errorf("delete retired generation %d pending: %w", demoted.Int64, err)
 		}
 	}
-	// Enforce the seeded/no-pending gate IN the activation tx (unless force)
-	// so a concurrent enqueue cannot slip a pending row into gen between a
-	// caller's pre-check and this flip. SQLite serializes writers, so the
-	// gate and flip are inherently atomic once inside the tx.
+	// Re-check the seeded/no-pending gate IN the activation tx (unless force).
+	// SQLite serializes writers, so the gate and flip are atomic once inside
+	// the tx: this closes the window between a CALLER's pre-flight pending read
+	// and this flip — no pending row committed before this statement can sneak
+	// gen past the gate. It does NOT prevent an enqueue that commits just AFTER
+	// this flip from leaving one pending row on the now-active gen; that
+	// post-flip row is acceptable and is drained by the embed worker's
+	// active-generation top-up on the next run (see embed_job.go pickTarget /
+	// enqueue.go). [cr2-1]
 	res, err := tx.ExecContext(ctx,
 		`UPDATE index_generations
 		 SET state = 'active', activated_at = ?, completed_at = COALESCE(completed_at, ?)

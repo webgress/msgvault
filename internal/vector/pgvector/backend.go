@@ -318,9 +318,16 @@ func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationI
 			return fmt.Errorf("delete retired generation %d pending: %w", demoted.Int64, err)
 		}
 	}
-	// The promote enforces the seeded/no-pending gate IN the same tx as the
-	// flip (unless force) so a concurrent enqueue.go dual-enqueue cannot slip
-	// a pending row into gen between a caller's pre-check and this UPDATE.
+	// The promote re-checks the seeded/no-pending gate IN the same tx as the
+	// flip (unless force). This closes the window between a CALLER's pre-flight
+	// pending read and this UPDATE: no pending row committed before this
+	// statement can sneak gen past the gate. It does NOT serialize against a
+	// concurrent enqueue.go dual-enqueue under READ COMMITTED — the FK key-share
+	// lock enqueue takes does not conflict with this non-key UPDATE, so an
+	// enqueue that commits just AFTER this gated UPDATE can still leave one
+	// pending row on the now-active gen. That post-flip row is acceptable: the
+	// embed worker's active-generation top-up (see embed_job.go pickTarget /
+	// enqueue.go) simply processes it on the next run. [cr2-1]
 	res, err := tx.ExecContext(ctx,
 		`UPDATE index_generations
 		    SET state = 'active', activated_at = $1, completed_at = COALESCE(completed_at, $2)
