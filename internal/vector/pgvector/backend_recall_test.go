@@ -273,14 +273,18 @@ func seedDistinctNearQueryCorpus(t *testing.T, b *Backend, db *sql.DB, count int
 	return gen, query
 }
 
-// emptyFilterANNSQL is the exact empty-filter ANN statement from
-// backend.go's Search fast path (dimension literal, EXISTS-against-messages
-// liveness, inner ORDER BY <=> LIMIT, outer GROUP BY + ORDER BY MIN(distance)
-// + LIMIT). Both the EXPLAIN assertion and the distinct-count run THIS
-// identical SQL so the planner makes the same HNSW-index choice for the row
-// the test counts as for the plan it inspects — a COUNT(*) wrapper would let
-// the planner rewrite the inner LIMIT and pick a different (non-HNSW) plan,
-// breaking plan parity between the EXPLAIN and the count.
+// emptyFilterANNSQL mirrors backend.go's empty-filter ANN statement
+// (dimension literal, EXISTS-against-messages liveness, inner ORDER BY <=>
+// LIMIT, outer GROUP BY + ORDER BY MIN(distance) + LIMIT). The inner ANN
+// subquery (ORDER BY embedding <=> $1 LIMIT $3) is identical to backend.go's
+// Search fast path — that inner ORDER BY/LIMIT is what selects the HNSW index.
+// The outer LIMIT here is widened to innerLimit (vs production's k) so
+// COUNT(DISTINCT message_id) can observe the full ef_search candidate ceiling.
+// Both the EXPLAIN assertion and the distinct-count run THIS same SQL so the
+// planner makes the same HNSW-index choice for the row the test counts as for
+// the plan it inspects — a COUNT(*) wrapper would let the planner rewrite the
+// inner LIMIT and pick a different (non-HNSW) plan, breaking plan parity
+// between the EXPLAIN and the count.
 func emptyFilterANNSQL() string {
 	return fmt.Sprintf(`
 		SELECT ann.message_id, MIN(ann.distance) AS distance
