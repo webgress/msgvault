@@ -127,6 +127,35 @@ The per-dimension HNSW cosine index is created lazily by
 guard so generations of different dimensions can coexist in the same
 `embeddings` table.
 
+### Retiring a generation deletes its embedding rows (pgvector only)
+
+Because the HNSW index is partial by **dimension only**, a single graph
+indexes *every* generation of that dimension, and `Search`/`FusedSearch`
+apply `generation_id` as a **post-filter**. If a retired generation's
+vectors stayed in the table they would remain in the shared graph and
+consume the `ef_search` candidate budget, eroding the active generation's
+recall (the inner ANN scan can fill its budget with retired-generation
+rows that the post-filter then discards, short-returning the active set).
+
+To keep the shared graph generation-clean, retiring a pgvector generation
+**deletes its embedding rows** — in both paths that retire a generation:
+`RetireGeneration` (explicit) and `ActivateGeneration` (which auto-retires
+the previously-active generation during the normal re-embed flow). The
+`index_generations` row is preserved (`state = 'retired'`) so lifecycle and
+history queries still see it; only the `embeddings` rows are removed, inside
+the same transaction as the state flip.
+
+This intentionally **differs from sqlitevec**, which retains a retired
+generation's rows because its `vec0` virtual table uses a `PARTITION KEY`
+on `generation_id`, isolating each generation in its own ANN partition so
+retired rows never contaminate the active generation's search. pgvector has
+no equivalent per-partition ANN index, so deletion is the mechanism that
+achieves the same isolation. Covered by
+`internal/vector/pgvector/backend_retire_test.go`
+(`TestBackend_RetireGeneration_DeletesEmbeddings`,
+`TestBackend_ActivateGeneration_AutoRetireDeletesPrevious`,
+`TestBackend_DeleteOnRetire_KeepsActiveRecallClean`).
+
 ## Remaining for PR4
 
 Nothing outstanding for the vector pipeline: the pgvector backend, the

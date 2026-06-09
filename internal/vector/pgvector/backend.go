@@ -260,24 +260,53 @@ func (b *Backend) seedPending(ctx context.Context, gen vector.GenerationID, now 
 	if _, err := tx.ExecContext(ctx, stmt, int64(gen), now); err != nil {
 		return fmt.Errorf("seed pending: %w", err)
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit seed pending: %w", err)
+	}
+	return nil
 }
 
 // ActivateGeneration atomically retires the current active generation
 // (if any) and promotes gen to active.
+//
+// Retiring the previously-active generation also DELETEs its embedding
+// rows in the same transaction. The pgvector HNSW index is partial by
+// dimension only (see migrate.go: WHERE dimension = N), so a single
+// graph indexes every generation of that dimension; Search/FusedSearch
+// post-filter by generation_id. Leaving a retired generation's vectors
+// in the shared graph would consume the ef_search budget and erode the
+// active generation's recall. Deleting them keeps the graph
+// generation-clean. This intentionally differs from sqlitevec, whose
+// vec0 PARTITION KEY isolates retired rows so it can retain them.
 func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationID) error {
 	now := time.Now().Unix()
 	tx, err := b.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("begin activate tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// Capture the generation being demoted (if any) so we can delete its
+	// embedding rows after flipping its state. Done inside the tx so the
+	// demote+delete is atomic with the activation below.
+	var demoted sql.NullInt64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id FROM index_generations WHERE state = 'active'`).Scan(&demoted); err != nil &&
+		!errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("lookup active generation to demote: %w", err)
+	}
 
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE index_generations
 		    SET state = 'retired', completed_at = COALESCE(completed_at, $1)
 		  WHERE state = 'active'`, now); err != nil {
 		return fmt.Errorf("retire previous active: %w", err)
+	}
+	if demoted.Valid {
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM embeddings WHERE generation_id = $1`, demoted.Int64); err != nil {
+			return fmt.Errorf("delete retired generation %d embeddings: %w", demoted.Int64, err)
+		}
 	}
 	res, err := tx.ExecContext(ctx,
 		`UPDATE index_generations
@@ -290,14 +319,42 @@ func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationI
 	if n == 0 {
 		return fmt.Errorf("generation %d not in 'building' state", gen)
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit activate generation %d: %w", gen, err)
+	}
+	return nil
 }
 
-// RetireGeneration marks the given generation as retired.
+// RetireGeneration marks the given generation as retired and DELETEs its
+// embedding rows in one transaction.
+//
+// The embedding rows are deleted for the same reason as in
+// ActivateGeneration's auto-retire path: pgvector's HNSW index is partial
+// by dimension only, so all generations of a dimension share one graph and
+// Search/FusedSearch post-filter by generation_id. Retaining a retired
+// generation's vectors would consume the ef_search budget and erode the
+// active generation's recall. The index_generations row is preserved
+// (state='retired'); only its embeddings are removed. This intentionally
+// differs from sqlitevec, whose vec0 PARTITION KEY isolates retired rows.
 func (b *Backend) RetireGeneration(ctx context.Context, gen vector.GenerationID) error {
-	_, err := b.db.ExecContext(ctx,
-		`UPDATE index_generations SET state = 'retired' WHERE id = $1`, int64(gen))
-	return err
+	tx, err := b.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin retire tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE index_generations SET state = 'retired' WHERE id = $1`, int64(gen)); err != nil {
+		return fmt.Errorf("retire generation %d: %w", gen, err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM embeddings WHERE generation_id = $1`, int64(gen)); err != nil {
+		return fmt.Errorf("delete retired generation %d embeddings: %w", gen, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit retire generation %d: %w", gen, err)
+	}
+	return nil
 }
 
 // ActiveGeneration returns the current active generation, or
@@ -425,7 +482,10 @@ func (b *Backend) Upsert(ctx context.Context, gen vector.GenerationID, chunks []
 	if err := applyMessageCountDeltaTx(ctx, tx, gen, delta); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit upsert for generation %d: %w", gen, err)
+	}
+	return nil
 }
 
 // distinctMessageIDs returns the unique message_ids referenced by chunks,
