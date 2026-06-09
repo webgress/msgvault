@@ -128,26 +128,33 @@ func (q *Queue) Claim(ctx context.Context, gen vector.GenerationID, batch int) (
 	return ids, token, nil
 }
 
+// completeReleaseChunkRows caps how many message ids go into a single
+// Complete/Release statement's IN clause. Each statement binds one
+// placeholder per id plus two (generation_id, claim_token), so a chunk
+// of 500 ids = 502 bound parameters — comfortably under SQLite's
+// 32,766-variable ceiling and PostgreSQL's 65,535 limit even if a
+// misconfigured Embeddings.BatchSize claims far more rows than the
+// default 32. Mirrors enqueue.go's enqueueChunkRows discipline so a
+// single oversized batch never blows the driver bind ceiling. It is a
+// var (not const) only so tests can lower it to exercise the chunk
+// boundary without driving a multi-thousand-row batch through the DB;
+// production never reassigns it.
+var completeReleaseChunkRows = 500
+
 // Complete deletes the claimed rows from the queue. Only rows whose
 // claim_token matches token are removed; any row that was reclaimed or
 // re-claimed under a different token is left in place. A nil or empty
-// ids slice is a no-op.
+// ids slice is a no-op. The ids are processed in chunks (see
+// completeReleaseChunkRows); each chunk is an independent, token-scoped
+// DELETE over a disjoint id subset, so the chunked statements compose to
+// the same effect as a single statement.
 func (q *Queue) Complete(ctx context.Context, gen vector.GenerationID, token string, ids []int64) error {
-	if len(ids) == 0 {
-		return nil
-	}
-	in := inPlaceholders(len(ids))
-	args := make([]any, 0, 2+len(ids))
-	args = append(args, int64(gen), token)
-	for _, id := range ids {
-		args = append(args, id)
-	}
-	query := q.rebind(`
+	const stmt = `
         DELETE FROM pending_embeddings
          WHERE generation_id = ?
            AND claim_token   = ?
-           AND message_id IN ` + in)
-	if _, err := q.db.ExecContext(ctx, query, args...); err != nil {
+           AND message_id IN `
+	if err := q.execTokenScoped(ctx, stmt, gen, token, ids); err != nil {
 		return fmt.Errorf("delete pending: %w", err)
 	}
 	return nil
@@ -155,25 +162,45 @@ func (q *Queue) Complete(ctx context.Context, gen vector.GenerationID, token str
 
 // Release returns claimed rows to the pool so another worker can pick
 // them up (for embedding failures). Only rows whose claim_token matches
-// token are released. A nil or empty ids slice is a no-op.
+// token are released. A nil or empty ids slice is a no-op. Like
+// Complete, the ids are processed in token-scoped chunks (see
+// completeReleaseChunkRows).
 func (q *Queue) Release(ctx context.Context, gen vector.GenerationID, token string, ids []int64) error {
-	if len(ids) == 0 {
-		return nil
-	}
-	in := inPlaceholders(len(ids))
-	args := make([]any, 0, 2+len(ids))
-	args = append(args, int64(gen), token)
-	for _, id := range ids {
-		args = append(args, id)
-	}
-	query := q.rebind(`
+	const stmt = `
         UPDATE pending_embeddings
            SET claimed_at = NULL, claim_token = NULL
          WHERE generation_id = ?
            AND claim_token   = ?
-           AND message_id IN ` + in)
-	if _, err := q.db.ExecContext(ctx, query, args...); err != nil {
+           AND message_id IN `
+	if err := q.execTokenScoped(ctx, stmt, gen, token, ids); err != nil {
 		return fmt.Errorf("release: %w", err)
+	}
+	return nil
+}
+
+// execTokenScoped runs stmtPrefix (a DELETE or UPDATE ending in
+// "... message_id IN ") once per chunk of ids, appending an
+// inPlaceholders IN clause and binding (gen, token, ids...) for each
+// chunk. Chunking keeps the per-statement bind count under the driver's
+// limit regardless of how many ids a single claim produced. Every chunk
+// is filtered on generation_id = gen AND claim_token = token, so the
+// token-scoped semantics are identical to a single statement; because the
+// chunks operate over disjoint id subsets the additive deletes/updates
+// compose correctly. A nil or empty ids slice is a no-op.
+func (q *Queue) execTokenScoped(ctx context.Context, stmtPrefix string, gen vector.GenerationID, token string, ids []int64) error {
+	for start := 0; start < len(ids); start += completeReleaseChunkRows {
+		end := min(start+completeReleaseChunkRows, len(ids))
+		chunk := ids[start:end]
+
+		args := make([]any, 0, 2+len(chunk))
+		args = append(args, int64(gen), token)
+		for _, id := range chunk {
+			args = append(args, id)
+		}
+		query := q.rebind(stmtPrefix + inPlaceholders(len(chunk)))
+		if _, err := q.db.ExecContext(ctx, query, args...); err != nil {
+			return err
+		}
 	}
 	return nil
 }

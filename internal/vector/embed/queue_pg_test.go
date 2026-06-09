@@ -89,12 +89,14 @@ func openPGQueueDB(t *testing.T, n int) *sql.DB {
 	return db
 }
 
-func pgCountAvailable(t *testing.T, db *sql.DB, gen int64) int {
+// pgCountAvailable returns the number of available (unclaimed) rows for
+// the single building generation (id=1) that newPGQueueSchema seeds —
+// the only generation these queue tests create.
+func pgCountAvailable(t *testing.T, db *sql.DB) int {
 	t.Helper()
 	var n int
 	err := db.QueryRow(
-		`SELECT COUNT(*) FROM pending_embeddings WHERE generation_id = $1 AND claimed_at IS NULL`,
-		gen).Scan(&n)
+		`SELECT COUNT(*) FROM pending_embeddings WHERE generation_id = 1 AND claimed_at IS NULL`).Scan(&n)
 	require.NoError(t, err, "countAvailable")
 	return n
 }
@@ -119,7 +121,7 @@ func TestQueuePG_ClaimReleaseComplete(t *testing.T) {
 	assert.NotEqual(t, token, token2, "second claim must use a fresh token")
 
 	require.NoError(t, q.Release(ctx, 1, token, ids), "Release")
-	assert.Equal(t, 3, pgCountAvailable(t, db, 1), "available after release")
+	assert.Equal(t, 3, pgCountAvailable(t, db), "available after release")
 
 	require.NoError(t, q.Complete(ctx, 1, token2, more), "Complete")
 	var total int
@@ -166,7 +168,7 @@ func TestQueuePG_Release_WrongTokenNoop(t *testing.T) {
 	ids, _, err := q.Claim(ctx, 1, 2)
 	require.NoError(t, err)
 	require.NoError(t, q.Release(ctx, 1, "deadbeef", ids), "Release with wrong token")
-	assert.Equal(t, 0, pgCountAvailable(t, db, 1), "available after wrong-token release (still claimed)")
+	assert.Equal(t, 0, pgCountAvailable(t, db), "available after wrong-token release (still claimed)")
 }
 
 func TestQueuePG_ReclaimStale(t *testing.T) {
@@ -182,7 +184,7 @@ func TestQueuePG_ReclaimStale(t *testing.T) {
 	n, err := q.ReclaimStale(ctx, 10*time.Minute)
 	require.NoError(t, err)
 	assert.Equal(t, 2, n, "reclaimed")
-	assert.Equal(t, 2, pgCountAvailable(t, db, 1), "available after reclaim")
+	assert.Equal(t, 2, pgCountAvailable(t, db), "available after reclaim")
 }
 
 func TestQueuePG_Complete_EmptyIDsIsNoop(t *testing.T) {
@@ -202,6 +204,63 @@ func TestQueuePG_Claim_ReturnsIDsAscending(t *testing.T) {
 	require.Len(t, ids, 10)
 	assert.True(t, sort.SliceIsSorted(ids, func(i, j int) bool { return ids[i] < ids[j] }),
 		"ids not ascending: %v", ids)
+}
+
+// TestQueuePG_CompleteRelease_ChunksLargeIDSets is the PG counterpart of
+// TestQueue_CompleteRelease_ChunksLargeIDSets: it lowers the chunk size
+// so Complete/Release span multiple token-scoped statements on pgx, then
+// asserts every intended row is released/deleted.
+func TestQueuePG_CompleteRelease_ChunksLargeIDSets(t *testing.T) {
+	ctx := context.Background()
+
+	orig := completeReleaseChunkRows
+	completeReleaseChunkRows = 2
+	t.Cleanup(func() { completeReleaseChunkRows = orig })
+
+	const n = 5
+	db := openPGQueueDB(t, n)
+	q := NewQueue(db, pgRebind())
+
+	ids, token, err := q.Claim(ctx, 1, n)
+	require.NoError(t, err, "Claim")
+	require.Len(t, ids, n)
+
+	require.NoError(t, q.Release(ctx, 1, token, ids), "Release (chunked)")
+	assert.Equal(t, n, pgCountAvailable(t, db), "all rows available after chunked Release")
+
+	ids2, token2, err := q.Claim(ctx, 1, n)
+	require.NoError(t, err, "re-Claim")
+	require.Len(t, ids2, n)
+	require.NoError(t, q.Complete(ctx, 1, token2, ids2), "Complete (chunked)")
+	var total int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM pending_embeddings`).Scan(&total))
+	assert.Equal(t, 0, total, "all rows deleted after chunked Complete")
+}
+
+// TestQueuePG_CompleteRelease_ChunkedTokenScoped verifies the chunked
+// pgx path preserves the token filter across chunk boundaries.
+func TestQueuePG_CompleteRelease_ChunkedTokenScoped(t *testing.T) {
+	ctx := context.Background()
+
+	orig := completeReleaseChunkRows
+	completeReleaseChunkRows = 2
+	t.Cleanup(func() { completeReleaseChunkRows = orig })
+
+	const n = 5
+	db := openPGQueueDB(t, n)
+	q := NewQueue(db, pgRebind())
+
+	ids, _, err := q.Claim(ctx, 1, n)
+	require.NoError(t, err, "Claim")
+	require.Len(t, ids, n)
+
+	require.NoError(t, q.Complete(ctx, 1, "deadbeef", ids), "Complete wrong token (chunked)")
+	var total int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM pending_embeddings`).Scan(&total))
+	assert.Equal(t, n, total, "wrong-token chunked Complete must not delete")
+
+	require.NoError(t, q.Release(ctx, 1, "deadbeef", ids), "Release wrong token (chunked)")
+	assert.Equal(t, 0, pgCountAvailable(t, db), "wrong-token chunked Release must leave rows claimed")
 }
 
 func TestQueuePG_Complete_AfterReclaim_PreservesNewClaim(t *testing.T) {
