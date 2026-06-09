@@ -187,8 +187,26 @@ func openEmbeddingsMetadataDB() (*sql.DB, func(string) string, func(), error) {
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("open postgres for embeddings metadata: %w", err)
 		}
+		closeDB := func() { _ = db.Close(); cleanup() }
+		// Pre-check that the embedding metadata tables exist. They are created
+		// only by pgvector.Migrate (on an embed/serve run), not by the core PG
+		// store init, so on a PG deployment where no embed run has happened yet
+		// the bare query path would surface a raw
+		// `relation "index_generations" does not exist (SQLSTATE 42P01)`.
+		// Return a friendly message mirroring the SQLite "vectors.db not found"
+		// UX and pointing at `msgvault embeddings build`.
+		var reg sql.NullString
+		if err := db.QueryRow(`SELECT to_regclass('index_generations')`).Scan(&reg); err != nil {
+			closeDB()
+			return nil, nil, nil, fmt.Errorf("check embeddings metadata: %w", err)
+		}
+		if !reg.Valid {
+			closeDB()
+			return nil, nil, nil, errors.New(
+				"no embedding metadata found in PostgreSQL; run \"msgvault embeddings build\" first")
+		}
 		rebind := (&store.PostgreSQLDialect{}).Rebind
-		return db, rebind, func() { _ = db.Close(); cleanup() }, nil
+		return db, rebind, closeDB, nil
 	}
 
 	vecPath := cfg.Vector.DBPath
