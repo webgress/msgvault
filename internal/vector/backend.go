@@ -136,7 +136,18 @@ type Backend interface {
 	// ResolveActiveForFingerprint and forces a --full-rebuild instead
 	// of silently mixing inconsistently-prepared vectors.
 	CreateGeneration(ctx context.Context, model string, dimension int, fingerprint string) (GenerationID, error)
-	ActivateGeneration(ctx context.Context, gen GenerationID) error
+
+	// ActivateGeneration atomically retires the current active generation
+	// (if any, deleting its embeddings on backends that share an index
+	// graph) and promotes gen to active. The promotion enforces, inside the
+	// same transaction as the state flip, that gen is in state='building'
+	// and — unless force is true — that gen has finished seeding
+	// (seeded_at IS NOT NULL) and has zero pending embedding rows. force
+	// bypasses the seeded/pending gate (operator `--force`); the gate stays
+	// atomic so a concurrent enqueue cannot slip a pending row in between a
+	// caller's pre-check and the flip. On a gate failure the backend returns
+	// a precise error distinguishing pending vs unseeded vs not-building.
+	ActivateGeneration(ctx context.Context, gen GenerationID, force bool) error
 	RetireGeneration(ctx context.Context, gen GenerationID) error
 
 	// ActiveGeneration returns the current active generation, or

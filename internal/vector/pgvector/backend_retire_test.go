@@ -167,7 +167,7 @@ func TestBackend_ActivateGeneration_AutoRetireDeletesPrevious(t *testing.T) {
 		1: unitVec(4, 0),
 		2: unitVec(4, 1),
 	})
-	require.NoError(t, b.ActivateGeneration(ctx, genA), "activate A")
+	require.NoError(t, b.ActivateGeneration(ctx, genA, true), "activate A")
 	require.Equal(t, 2, countEmbeddingRows(t, b, genA), "A populated before re-embed")
 
 	// Generation B: a new building generation at the same dimension (the
@@ -176,7 +176,7 @@ func TestBackend_ActivateGeneration_AutoRetireDeletesPrevious(t *testing.T) {
 		1: unitVec(4, 2),
 		2: unitVec(4, 3),
 	})
-	require.NoError(t, b.ActivateGeneration(ctx, genB), "activate B (auto-retires A)")
+	require.NoError(t, b.ActivateGeneration(ctx, genB, true), "activate B (auto-retires A)")
 
 	assert.Equal(t, string(vector.GenerationRetired), genState(t, b, genA),
 		"A must be retired by B's activation")
@@ -199,7 +199,7 @@ func TestBackend_ActivateGeneration_PreservesBuildingGenerations(t *testing.T) {
 	genA := buildGenWithVectors(t, b, "model-a", 4, map[int64][]float32{
 		1: unitVec(4, 0),
 	})
-	require.NoError(t, b.ActivateGeneration(ctx, genA), "activate A")
+	require.NoError(t, b.ActivateGeneration(ctx, genA, true), "activate A")
 
 	// A second generation B that we activate (auto-retiring A) — but first
 	// stage it as building. Only one building generation may exist at a time,
@@ -207,14 +207,14 @@ func TestBackend_ActivateGeneration_PreservesBuildingGenerations(t *testing.T) {
 	genB := buildGenWithVectors(t, b, "model-b", 4, map[int64][]float32{
 		1: unitVec(4, 1),
 	})
-	require.NoError(t, b.ActivateGeneration(ctx, genB), "activate B (retires A)")
+	require.NoError(t, b.ActivateGeneration(ctx, genB, true), "activate B (retires A)")
 	require.Equal(t, 0, countEmbeddingRows(t, b, genA), "A deleted")
 
 	genC := buildGenWithVectors(t, b, "model-c", 4, map[int64][]float32{
 		1: unitVec(4, 2),
 	})
 	// C is still building; activating it retires B but must leave C's own rows.
-	require.NoError(t, b.ActivateGeneration(ctx, genC), "activate C (retires B)")
+	require.NoError(t, b.ActivateGeneration(ctx, genC, true), "activate C (retires B)")
 	assert.Equal(t, 0, countEmbeddingRows(t, b, genB), "B deleted on C's activation")
 	assert.Equal(t, 1, countEmbeddingRows(t, b, genC), "C's own rows preserved")
 }
@@ -262,7 +262,7 @@ func TestBackend_DeleteOnRetire_KeepsActiveRecallClean(t *testing.T) {
 		aVecs[id] = nearQueryVec(int(id), 0.005)
 	}
 	genA := buildGenWithVectors(t, b, "model-a", recallDim, aVecs)
-	require.NoError(t, b.ActivateGeneration(ctx, genA), "activate A")
+	require.NoError(t, b.ActivateGeneration(ctx, genA, true), "activate A")
 	require.Equal(t, aCount, countEmbeddingRows(t, b, genA), "A populated")
 
 	// Generation B: exactly k messages at a moderate distance from the query.
@@ -275,7 +275,7 @@ func TestBackend_DeleteOnRetire_KeepsActiveRecallClean(t *testing.T) {
 	genB := buildGenWithVectors(t, b, "model-b", recallDim, bVecs)
 
 	// Activate B: auto-retires A AND (with the fix) deletes A's vectors.
-	require.NoError(t, b.ActivateGeneration(ctx, genB), "activate B")
+	require.NoError(t, b.ActivateGeneration(ctx, genB, true), "activate B")
 
 	// (i) Retired generation A's rows are deleted.
 	require.Equal(t, 0, countEmbeddingRows(t, b, genA),

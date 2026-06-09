@@ -85,7 +85,7 @@ func (f *fusedFixture) embedAll(t *testing.T, vecs map[int64][]float32) {
 		chunks = append(chunks, vector.Chunk{MessageID: id, Vector: v})
 	}
 	require.NoError(t, f.b.Upsert(f.ctx, gen, chunks), "Upsert")
-	require.NoError(t, f.b.ActivateGeneration(f.ctx, gen), "Activate")
+	require.NoError(t, f.b.ActivateGeneration(f.ctx, gen, true), "Activate")
 }
 
 // embedChunks creates a generation sized to the first chunk's vector
@@ -100,7 +100,7 @@ func (f *fusedFixture) embedChunks(t *testing.T, chunks []vector.Chunk) {
 	require.NoError(t, err, "CreateGeneration")
 	f.gen = gen
 	require.NoError(t, f.b.Upsert(f.ctx, gen, chunks), "Upsert")
-	require.NoError(t, f.b.ActivateGeneration(f.ctx, gen), "Activate")
+	require.NoError(t, f.b.ActivateGeneration(f.ctx, gen, true), "Activate")
 }
 
 // seedThree wires up a 3-message corpus with distinct vectors and

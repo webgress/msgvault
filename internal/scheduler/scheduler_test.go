@@ -437,7 +437,7 @@ func (f *fakeBackend) BuildingGeneration(ctx context.Context) (*vector.Generatio
 func (f *fakeBackend) CreateGeneration(ctx context.Context, model string, dim int, fp string) (vector.GenerationID, error) {
 	panic("unexpected: CreateGeneration")
 }
-func (f *fakeBackend) ActivateGeneration(ctx context.Context, gen vector.GenerationID) error {
+func (f *fakeBackend) ActivateGeneration(ctx context.Context, gen vector.GenerationID, _ bool) error {
 	f.mu.Lock()
 	f.activateCallIDs = append(f.activateCallIDs, gen)
 	f.mu.Unlock()

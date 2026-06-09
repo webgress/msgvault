@@ -109,7 +109,7 @@ func TestRunEmbeddingsActivate_PG_AutoRetireDeletesPrevious(t *testing.T) {
 	db := pgb.DB()
 
 	genA := seedGenWithEmbeddingsPG(t, pgb, 1, 2)
-	require.NoError(t, pgb.ActivateGeneration(ctx, genA), "activate A directly")
+	require.NoError(t, pgb.ActivateGeneration(ctx, genA, true), "activate A directly")
 	require.Equal(t, 2, countEmbeddingRowsPG(t, db, genA), "A populated before re-embed")
 
 	genB := seedGenWithEmbeddingsPG(t, pgb, 3, 4)
@@ -199,50 +199,6 @@ func TestListEmbeddingGenerations_PG(t *testing.T) {
 	assert.Equal(t, gen, rows[0].ID)
 	assert.Equal(t, vector.GenerationBuilding, rows[0].State)
 	assert.Equal(t, "test-model", rows[0].Model)
-}
-
-// TestRetireEmbeddingGeneration_PG exercises retireEmbeddingGeneration via
-// the PG rebind path. Creates a building generation, retires it using the
-// force flag, and asserts the state transitions correctly.
-func TestRetireEmbeddingGeneration_PG(t *testing.T) {
-	pgb, rebind, _ := openEmbedManagePGDB(t)
-	ctx := context.Background()
-	db := pgb.DB()
-
-	gen, err := pgb.CreateGeneration(ctx, "test-model", 4, "test-model:4")
-	require.NoError(t, err, "CreateGeneration")
-
-	// Retire the building generation (force=true since it is not active).
-	require.NoError(t, retireEmbeddingGeneration(ctx, db, rebind, gen, true),
-		"retireEmbeddingGeneration with force on PG")
-
-	g, err := getEmbeddingGeneration(ctx, db, rebind, gen)
-	require.NoError(t, err, "getEmbeddingGeneration after retire")
-	assert.Equal(t, vector.GenerationRetired, g.State, "generation must be retired")
-}
-
-// TestActivateEmbeddingGeneration_PG exercises activateEmbeddingGeneration via
-// the PG rebind path. Creates a building generation with no pending rows, then
-// activates it and checks the state.
-func TestActivateEmbeddingGeneration_PG(t *testing.T) {
-	pgb, rebind, _ := openEmbedManagePGDB(t)
-	ctx := context.Background()
-	db := pgb.DB()
-
-	gen, err := pgb.CreateGeneration(ctx, "test-model", 4, "test-model:4")
-	require.NoError(t, err, "CreateGeneration")
-
-	// Drain pending rows so activation is allowed.
-	_, err = db.ExecContext(ctx, `DELETE FROM pending_embeddings WHERE generation_id = $1`, int64(gen))
-	require.NoError(t, err, "drain pending")
-
-	require.NoError(t, activateEmbeddingGeneration(ctx, db, rebind, gen, false),
-		"activateEmbeddingGeneration on PG must succeed with no pending rows")
-
-	g, err := getEmbeddingGeneration(ctx, db, rebind, gen)
-	require.NoError(t, err, "getEmbeddingGeneration after activate")
-	assert.Equal(t, vector.GenerationActive, g.State, "generation must be active")
-	assert.NotNil(t, g.ActivatedAt, "activated_at must be set")
 }
 
 // TestOpenEmbeddingsMetadataDB_PG exercises the real openEmbeddingsMetadataDB

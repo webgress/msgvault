@@ -351,7 +351,7 @@ func (b *Backend) seedPending(ctx context.Context, gen vector.GenerationID, now 
 
 // ActivateGeneration atomically retires the current active generation
 // (if any) and promotes `gen` to active.
-func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationID) error {
+func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationID, force bool) error {
 	now := time.Now().Unix()
 	tx, err := b.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -365,18 +365,55 @@ func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationI
 		 WHERE state = 'active'`, now); err != nil {
 		return fmt.Errorf("retire previous active: %w", err)
 	}
+	// Enforce the seeded/no-pending gate IN the activation tx (unless force)
+	// so a concurrent enqueue cannot slip a pending row into gen between a
+	// caller's pre-check and this flip. SQLite serializes writers, so the
+	// gate and flip are inherently atomic once inside the tx.
 	res, err := tx.ExecContext(ctx,
 		`UPDATE index_generations
 		 SET state = 'active', activated_at = ?, completed_at = COALESCE(completed_at, ?)
-		 WHERE id = ? AND state = 'building'`, now, now, int64(gen))
+		 WHERE id = ? AND state = 'building'
+		   AND (? OR seeded_at IS NOT NULL)
+		   AND (? OR NOT EXISTS (
+		       SELECT 1 FROM pending_embeddings WHERE generation_id = ?
+		   ))`, now, now, int64(gen), force, force, int64(gen))
 	if err != nil {
 		return fmt.Errorf("activate: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("generation %d not in 'building' state", gen)
+		return activateGateError(ctx, tx, gen, force)
 	}
 	return tx.Commit()
+}
+
+// activateGateError re-reads gen inside the activation tx to return a
+// precise reason the gated promote affected zero rows: pending rows present,
+// not finished seeding, unknown generation, or not in 'building' state.
+func activateGateError(ctx context.Context, tx *sql.Tx, gen vector.GenerationID, force bool) error {
+	var pending int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pending_embeddings WHERE generation_id = ?`, int64(gen)).Scan(&pending); err != nil {
+		return fmt.Errorf("count pending rows for generation %d: %w", gen, err)
+	}
+	if pending > 0 && !force {
+		return fmt.Errorf("generation %d still has %d pending embedding rows; run `msgvault embeddings resume` or pass --force",
+			gen, pending)
+	}
+	var state vector.GenerationState
+	var seededAt sql.NullInt64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT state, seeded_at FROM index_generations WHERE id = ?`, int64(gen)).Scan(&state, &seededAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: %d", vector.ErrUnknownGeneration, gen)
+		}
+		return fmt.Errorf("lookup generation %d: %w", gen, err)
+	}
+	if state == vector.GenerationBuilding && !seededAt.Valid && !force {
+		return fmt.Errorf("generation %d has not finished seeding; run `msgvault embeddings resume` or pass --force",
+			gen)
+	}
+	return fmt.Errorf("generation %d not in 'building' state", gen)
 }
 
 // RetireGeneration marks the given generation as retired.

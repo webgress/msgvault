@@ -67,7 +67,7 @@ func (b *Backend) CreateGeneration(_ context.Context, _ string, _ int, _ string)
 }
 
 // ActivateGeneration is a stub that always returns ErrNotBuilt.
-func (b *Backend) ActivateGeneration(_ context.Context, _ vector.GenerationID) error {
+func (b *Backend) ActivateGeneration(_ context.Context, _ vector.GenerationID, _ bool) error {
 	return ErrNotBuilt
 }
 

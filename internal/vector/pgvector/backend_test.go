@@ -30,7 +30,7 @@ func TestBackend_CreateActivateRetire(t *testing.T) {
 	_, err = b.ActiveGeneration(ctx)
 	assert.Error(t, err, "ActiveGeneration should error before activation")
 
-	require.NoError(t, b.ActivateGeneration(ctx, gid), "ActivateGeneration")
+	require.NoError(t, b.ActivateGeneration(ctx, gid, true), "ActivateGeneration")
 
 	g, err := b.ActiveGeneration(ctx)
 	require.NoError(t, err, "ActiveGeneration after activate")
@@ -161,7 +161,7 @@ func TestBackend_EnsureSeeded_RejectsActiveGeneration(t *testing.T) {
 	b, ctx, _ := newBackendForTest(t)
 	gen, err := b.CreateGeneration(ctx, "m", 768, "")
 	require.NoError(t, err, "Create")
-	require.NoError(t, b.ActivateGeneration(ctx, gen), "Activate")
+	require.NoError(t, b.ActivateGeneration(ctx, gen, true), "Activate")
 
 	err = b.EnsureSeeded(ctx, gen)
 	assert.True(t, errors.Is(err, vector.ErrGenerationNotBuilding),
@@ -285,7 +285,7 @@ func TestBackend_LoadVector_RoundTrip(t *testing.T) {
 	b, ctx, db := newBackendForTest(t)
 	original := []float32{0.25, -0.5, 0.75, 1.0}
 	gen := seedAndEmbed(t, b, db, map[int64][]float32{1: original})
-	require.NoError(t, b.ActivateGeneration(ctx, gen), "Activate")
+	require.NoError(t, b.ActivateGeneration(ctx, gen, true), "Activate")
 
 	got, err := b.LoadVector(ctx, 1)
 	require.NoError(t, err, "LoadVector")
