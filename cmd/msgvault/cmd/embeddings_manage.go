@@ -17,6 +17,8 @@ import (
 	"github.com/spf13/cobra"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
+	"go.kenn.io/msgvault/internal/vector/pgvector"
+	"go.kenn.io/msgvault/internal/vector/sqlitevec"
 )
 
 type embeddingGenerationRow struct {
@@ -104,7 +106,18 @@ func runEmbeddingsRetire(cmd *cobra.Command, args []string) error {
 			return errors.New("aborted")
 		}
 	}
-	if err := retireEmbeddingGeneration(cmd.Context(), db, rebind, gen, embeddingsRetireForceActive); err != nil {
+
+	// Route the state transition through the vector backend so the
+	// delete-on-retire invariant lives in one place (pgvector deletes the
+	// retired generation's embeddings; sqlitevec retains them). The
+	// active/building/retired gating above mirrors what the backend needs;
+	// backend.RetireGeneration itself retires unconditionally.
+	backend, closeBackend, err := openEmbeddingsBackend(cmd.Context())
+	if err != nil {
+		return err
+	}
+	defer closeBackend()
+	if err := backend.RetireGeneration(cmd.Context(), gen); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Generation %d retired.\n", gen)
@@ -159,7 +172,18 @@ func runEmbeddingsActivate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	if err := activateEmbeddingGeneration(cmd.Context(), db, rebind, gen, embeddingsActivateForce); err != nil {
+	// Route through the vector backend so the auto-retire of the previously
+	// active generation deletes its embeddings on PG (the same delete-on-retire
+	// invariant as the retire path). The fingerprint/pending/seeded gating
+	// above already enforces the CLI UX before we mutate state; the backend's
+	// ActivateGeneration requires the target to be in 'building' state and
+	// auto-retires the prior active generation in one transaction.
+	backend, closeBackend, err := openEmbeddingsBackend(cmd.Context())
+	if err != nil {
+		return err
+	}
+	defer closeBackend()
+	if err := backend.ActivateGeneration(cmd.Context(), gen); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Generation %d activated.\n", gen)
@@ -225,6 +249,63 @@ func openEmbeddingsMetadataDB(ctx context.Context) (*sql.DB, func(string) string
 	}
 	rebind := (&store.SQLiteDialect{}).Rebind
 	return db, rebind, func() { _ = db.Close() }, nil
+}
+
+// openEmbeddingsBackend constructs the vector backend for the active dialect,
+// mirroring how embed_vector.go builds it. The CLI retire/activate commands
+// route their state transitions through the backend so a SINGLE implementation
+// owns the delete-on-retire invariant (pgvector deletes a retired generation's
+// embeddings so the shared HNSW graph stays generation-clean; sqlitevec retains
+// them because its vec0 PARTITION KEY isolates retired rows). Raw-SQL helpers
+// that only flip index_generations.state would bypass that invariant on PG.
+//
+// Returns the backend and a close callback. On a build without the relevant
+// vector tag the package stubs' Open returns ErrNotBuilt.
+func openEmbeddingsBackend(ctx context.Context) (vector.Backend, func(), error) {
+	dsn := cfg.DatabaseDSN()
+	if store.IsPostgresURL(dsn) {
+		db, cleanup, err := store.OpenPostgresDB(dsn)
+		if err != nil {
+			return nil, nil, fmt.Errorf("open postgres for embeddings backend: %w", err)
+		}
+		// SkipMigrate: the metadata tables already exist (the caller's
+		// openEmbeddingsMetadataDB pre-checks index_generations), and a
+		// management command must not run migrations as a side effect.
+		b, err := pgvector.Open(ctx, pgvector.Options{
+			DB:          db,
+			Dimension:   cfg.Vector.Embeddings.Dimension,
+			SkipMigrate: true,
+		})
+		if err != nil {
+			_ = db.Close()
+			cleanup()
+			return nil, nil, fmt.Errorf("open pgvector backend: %w", err)
+		}
+		return b, func() { _ = b.Close(); _ = db.Close(); cleanup() }, nil
+	}
+
+	if err := sqlitevec.RegisterExtension(); err != nil {
+		return nil, nil, fmt.Errorf("register sqlite-vec: %w", err)
+	}
+	vecPath := cfg.Vector.DBPath
+	if vecPath == "" {
+		vecPath = filepath.Join(cfg.Data.DataDir, "vectors.db")
+	}
+	if _, err := os.Stat(vecPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil, fmt.Errorf("vectors.db not found at %s", vecPath)
+		}
+		return nil, nil, fmt.Errorf("stat vectors.db: %w", err)
+	}
+	b, err := sqlitevec.Open(ctx, sqlitevec.Options{
+		Path:      vecPath,
+		MainPath:  dsn,
+		Dimension: cfg.Vector.Embeddings.Dimension,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("open vectors.db backend: %w", err)
+	}
+	return b, func() { _ = b.Close() }, nil
 }
 
 func sqliteDSNWithBusyTimeout(path string) string {
