@@ -3,6 +3,7 @@ package query
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -52,15 +53,16 @@ func (e *SQLiteEngine) hasFTSTable(ctx context.Context) bool {
 		return e.ftsResult
 	}
 
-	// The dialect's HasFTSTableSQL() probe is authoritative for BOTH backends:
-	// SQLite checks sqlite_master for the messages_fts virtual table;
-	// PostgreSQL checks information_schema for the messages.search_fts column.
-	// We must NOT run a hardcoded SQLite-only `SELECT 1 FROM messages_fts`
-	// secondary probe here — on PostgreSQL there is no messages_fts relation
-	// (PG uses an inline search_fts TSVECTOR column), so that probe errors with
-	// `relation "messages_fts" does not exist` (42P01), causing FTS to be cached
-	// as unavailable and PG Search to silently fall back to subject/snippet LIKE
-	// instead of the tsvector ranking path.
+	// The dialect's HasFTSTableSQL() probe is the existence check for BOTH
+	// backends: SQLite checks sqlite_master for the messages_fts virtual
+	// table; PostgreSQL checks information_schema for the messages.search_fts
+	// column. We must NOT run a hardcoded SQLite-only `SELECT 1 FROM
+	// messages_fts` secondary probe unconditionally — on PostgreSQL there is
+	// no messages_fts relation (PG uses an inline search_fts TSVECTOR column),
+	// so that probe errors with `relation "messages_fts" does not exist`
+	// (42P01), causing FTS to be cached as unavailable and PG Search to
+	// silently fall back to subject/snippet LIKE instead of the tsvector
+	// ranking path.
 	var count int
 	err := e.queryRowContext(ctx, e.dialect.HasFTSTableSQL()).Scan(&count)
 	if err != nil {
@@ -68,8 +70,33 @@ func (e *SQLiteEngine) hasFTSTable(ctx context.Context) bool {
 		// but don't cache so next call can retry.
 		return false
 	}
+	if count == 0 {
+		e.ftsResult = false
+		e.ftsChecked = true
+		return false
+	}
 
-	e.ftsResult = count > 0
+	// Dialect-aware liveness probe. SQLite's existence check (sqlite_master)
+	// does NOT prove the fts5 module is loadable: a DB built by an
+	// fts5-enabled binary still lists messages_fts in sqlite_master when
+	// opened by a no-fts5 binary, but querying it fails with
+	// `no such module: fts5`. Run the dialect's liveness SQL to confirm the
+	// table is actually queryable, mirroring store.SQLiteDialect.FTSAvailable.
+	// PostgreSQL returns "" here (its column probe is authoritative).
+	if liveness := e.dialect.FTSLivenessSQL(); liveness != "" {
+		var probe int
+		lerr := e.queryRowContext(ctx, liveness).Scan(&probe)
+		// sql.ErrNoRows means the table is queryable but empty — still
+		// available. Any other error (e.g. no such module) means FTS is
+		// not usable: cache false so search uses the LIKE fallback.
+		if lerr != nil && !errors.Is(lerr, sql.ErrNoRows) {
+			e.ftsResult = false
+			e.ftsChecked = true
+			return false
+		}
+	}
+
+	e.ftsResult = true
 	e.ftsChecked = true
 	return e.ftsResult
 }

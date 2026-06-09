@@ -40,6 +40,25 @@ type Dialect interface {
 	// Returns a single-row, single-column integer: 1 if present, 0 if absent.
 	HasFTSTableSQL() string
 
+	// FTSLivenessSQL returns a runtime liveness probe to run AFTER
+	// HasFTSTableSQL confirms the FTS relation exists, or "" when the
+	// existence probe is already authoritative.
+	//
+	// SQLite needs this: HasFTSTableSQL only checks sqlite_master for the
+	// messages_fts virtual table, which does NOT prove the fts5 module is
+	// loadable. A DB created by an fts5-enabled binary but opened by a
+	// binary built without fts5 still has the row in sqlite_master, yet any
+	// query against it fails with "no such module: fts5". The liveness probe
+	// (`SELECT 1 FROM messages_fts LIMIT 1`) surfaces that so search falls
+	// back to LIKE instead of erroring. This mirrors the store dialect's
+	// FTSAvailable contract (internal/store/dialect_sqlite.go).
+	//
+	// PostgreSQL returns "" — its HasFTSTableSQL information_schema column
+	// probe is an authoritative metadata check (the tsvector column either
+	// exists and is queryable or it does not), so no extra liveness query
+	// is needed.
+	FTSLivenessSQL() string
+
 	// FTSJoin returns a JOIN clause that must be added to the FROM clause
 	// when using FTSSearchExpression. Empty string if no join is needed
 	// (PostgreSQL has the tsvector column on messages directly).
@@ -88,6 +107,12 @@ func (SQLiteQueryDialect) FTSSearchExpression() string {
 
 func (SQLiteQueryDialect) HasFTSTableSQL() string {
 	return `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='messages_fts'`
+}
+
+// FTSLivenessSQL probes that the fts5 module is actually loadable, not just
+// that the messages_fts row exists in sqlite_master. See the interface doc.
+func (SQLiteQueryDialect) FTSLivenessSQL() string {
+	return `SELECT 1 FROM messages_fts LIMIT 1`
 }
 
 func (SQLiteQueryDialect) FTSJoin() string {
@@ -166,6 +191,12 @@ func (PostgreSQLQueryDialect) HasFTSTableSQL() string {
 	return `SELECT COUNT(*) FROM information_schema.columns
 		WHERE table_name = 'messages' AND column_name = 'search_fts'`
 }
+
+// FTSLivenessSQL is empty for PostgreSQL: the information_schema column
+// probe in HasFTSTableSQL is already authoritative, and there is no
+// messages_fts relation to probe (PG uses an inline search_fts tsvector
+// column). Returning "" keeps the SQLite-only liveness query off the PG path.
+func (PostgreSQLQueryDialect) FTSLivenessSQL() string { return "" }
 
 // FTSJoin: PostgreSQL's tsvector column lives on messages — no join needed.
 func (PostgreSQLQueryDialect) FTSJoin() string { return "" }
