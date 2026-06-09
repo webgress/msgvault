@@ -124,6 +124,41 @@ func TestBackend_Search_MultiChunkCorpus_ReturnsKDistinct(t *testing.T) {
 	assert.Equal(t, int64(1), hits[0].MessageID, "top hit is the multi-chunk message (its chunks are closest)")
 }
 
+// TestBackend_Search_Filtered_MultiChunkCorpus_ReturnsKDistinct asserts
+// the same recall guard on the FILTERED Search path (a structured filter
+// that matches every seeded row, so it exercises the filtered branch
+// rather than the empty-filter fast path). All seeded messages have
+// has_attachments = false (the column default), so HasAttachment=false
+// matches the entire corpus. Without a chunk-count loop ceiling the
+// filtered widening loop caps the inner LIMIT at the filtered MESSAGE
+// count (5), saturating before the multi-chunk message's 40 chunks are
+// deduplicated, and Search short-returns a single distinct message.
+func TestBackend_Search_Filtered_MultiChunkCorpus_ReturnsKDistinct(t *testing.T) {
+	b, ctx, db := newBackendForTest(t)
+
+	const k = 5
+	const multiChunks = 40 // far exceeds annOverFetchFactor (4)
+	const singles = k - 1
+	gen, query := seedRecallCorpus(t, b, db, multiChunks, singles)
+
+	// Filter matches all rows (has_attachments defaults to false) yet is
+	// non-empty, so Search takes the filtered branch.
+	no := false
+	hits, err := b.Search(ctx, gen, query, k, vector.Filter{HasAttachment: &no})
+	require.NoError(t, err, "Search")
+	require.Len(t, hits, k, "filtered Search must return k distinct messages despite the multi-chunk message")
+
+	seen := map[int64]int{}
+	for _, h := range hits {
+		seen[h.MessageID]++
+	}
+	require.Len(t, seen, k, "filtered hits must be k distinct messages")
+	for id, n := range seen {
+		assert.Equalf(t, 1, n, "message %d returned %d times, want exactly 1", id, n)
+	}
+	assert.Equal(t, int64(1), hits[0].MessageID, "top hit is the multi-chunk message (its chunks are closest)")
+}
+
 // TestBackend_FusedSearch_MultiChunkCorpus_ReturnsKDistinct mirrors the
 // recall guard on the fused (hybrid) ANN path: the ann_pool widening loop
 // must reach KPerSignal+1 distinct messages even when a single message's

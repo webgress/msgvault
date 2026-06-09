@@ -108,7 +108,17 @@ func TestBackendSearchStructuredFilters(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			hits, err := b.Search(ctx, gen, unitVec(4, 0), 10, tc.filter)
 			require.NoError(t, err, "Search")
-			assert.Equal(t, tc.want, hitMessageIDs(hits))
+			got := hitMessageIDs(hits)
+			// Search returns (nil, nil) for an empty result, but the
+			// hitMessageIDs helper materializes a non-nil empty slice.
+			// Treat nil and empty as equivalent (matching the sqlitevec
+			// sentinel precedent, fused_test.go's assert.Empty) instead
+			// of asserting strict nil-vs-empty equality.
+			if len(tc.want) == 0 {
+				assert.Empty(t, got)
+			} else {
+				assert.Equal(t, tc.want, got)
+			}
 		})
 	}
 }
