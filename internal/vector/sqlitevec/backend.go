@@ -359,11 +359,32 @@ func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationI
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// Capture the generation being demoted (if any) so we can reap its queue
+	// rows after flipping its state, in the same tx as the activation below.
+	var demoted sql.NullInt64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id FROM index_generations WHERE state = 'active'`).Scan(&demoted); err != nil &&
+		!errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("lookup active generation to demote: %w", err)
+	}
+
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE index_generations
 		 SET state = 'retired', completed_at = COALESCE(completed_at, ?)
 		 WHERE state = 'active'`, now); err != nil {
 		return fmt.Errorf("retire previous active: %w", err)
+	}
+	if demoted.Valid {
+		// Reap the demoted generation's queue rows in the same tx. Retired
+		// generations are never re-targeted by pickTarget, so leftover
+		// pending_embeddings rows would be orphaned forever (the
+		// index_generations row is preserved, so the ON DELETE CASCADE never
+		// fires). Keeps the "retired generations have zero pending items"
+		// stats invariant true. [cr2-3, cr2-4]
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM pending_embeddings WHERE generation_id = ?`, demoted.Int64); err != nil {
+			return fmt.Errorf("delete retired generation %d pending: %w", demoted.Int64, err)
+		}
 	}
 	// Enforce the seeded/no-pending gate IN the activation tx (unless force)
 	// so a concurrent enqueue cannot slip a pending row into gen between a
@@ -416,11 +437,32 @@ func activateGateError(ctx context.Context, tx *sql.Tx, gen vector.GenerationID,
 	return fmt.Errorf("generation %d not in 'building' state", gen)
 }
 
-// RetireGeneration marks the given generation as retired.
+// RetireGeneration marks the given generation as retired and reaps its
+// queue rows in one transaction.
 func (b *Backend) RetireGeneration(ctx context.Context, gen vector.GenerationID) error {
-	_, err := b.db.ExecContext(ctx,
-		`UPDATE index_generations SET state = 'retired' WHERE id = ?`, int64(gen))
-	return err
+	tx, err := b.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin retire tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE index_generations SET state = 'retired' WHERE id = ?`, int64(gen)); err != nil {
+		return fmt.Errorf("retire generation %d: %w", gen, err)
+	}
+	// Reap the retired generation's queue rows in the same tx so they cannot
+	// be orphaned (no future run re-targets a retired generation, and the
+	// preserved index_generations row means the ON DELETE CASCADE never
+	// fires). Keeps the "retired generations have zero pending items"
+	// stats invariant true. [cr2-2, cr2-4]
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM pending_embeddings WHERE generation_id = ?`, int64(gen)); err != nil {
+		return fmt.Errorf("delete retired generation %d pending: %w", gen, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit retire generation %d: %w", gen, err)
+	}
+	return nil
 }
 
 // ActiveGeneration returns the current active generation, or
