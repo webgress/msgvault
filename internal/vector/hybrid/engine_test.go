@@ -280,7 +280,7 @@ func TestEngine_PoolSaturated_WhenLimitBelowK(t *testing.T) {
 func TestEngine_NoGenerations_ReturnsNotEnabled(t *testing.T) {
 	ctx := context.Background()
 	f := newEngineFixture(t)
-	requirepkg.NoError(t, f.Backend.RetireGeneration(ctx, f.GenID), "Retire")
+	requirepkg.NoError(t, f.Backend.RetireGeneration(ctx, f.GenID, true), "Retire")
 	_, _, err := f.Engine.Search(ctx, SearchRequest{
 		Mode: ModeHybrid, FreeText: "meeting", Limit: 5,
 	})
@@ -325,7 +325,7 @@ func (timeoutEmbedder) Embed(_ context.Context, _ []string) ([][]float32, error)
 func TestEngine_BuildingOnly_ReturnsBuilding(t *testing.T) {
 	ctx := context.Background()
 	f := newEngineFixture(t)
-	requirepkg.NoError(t, f.Backend.RetireGeneration(ctx, f.GenID), "Retire")
+	requirepkg.NoError(t, f.Backend.RetireGeneration(ctx, f.GenID, true), "Retire")
 	// A new building generation must be present; CreateGeneration
 	// writes one directly.
 	_, err := f.Backend.CreateGeneration(ctx, "fake-model", 4, "")

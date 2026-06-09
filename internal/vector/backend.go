@@ -148,7 +148,17 @@ type Backend interface {
 	// caller's pre-check and the flip. On a gate failure the backend returns
 	// a precise error distinguishing pending vs unseeded vs not-building.
 	ActivateGeneration(ctx context.Context, gen GenerationID, force bool) error
-	RetireGeneration(ctx context.Context, gen GenerationID) error
+
+	// RetireGeneration marks gen as retired, deleting its embeddings on
+	// backends that share an index graph (pgvector) and reaping its pending
+	// queue rows. Unless force is true, the state-flip UPDATE refuses to
+	// retire a generation in state='active', returning ErrRefuseRetireActive
+	// WITHOUT deleting anything; the guard is enforced atomically inside the
+	// retire transaction so a concurrent activation between a caller's
+	// pre-flight read and the flip cannot retire (and on pgvector delete the
+	// embeddings of) the now-serving generation. force bypasses the guard
+	// (operator `--force-active`) and retires unconditionally.
+	RetireGeneration(ctx context.Context, gen GenerationID, force bool) error
 
 	// ActiveGeneration returns the current active generation, or
 	// ErrNoActiveGeneration if none exists.

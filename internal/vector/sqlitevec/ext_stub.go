@@ -72,7 +72,7 @@ func (b *Backend) ActivateGeneration(_ context.Context, _ vector.GenerationID, _
 }
 
 // RetireGeneration is a stub that always returns ErrNotBuilt.
-func (b *Backend) RetireGeneration(_ context.Context, _ vector.GenerationID) error {
+func (b *Backend) RetireGeneration(_ context.Context, _ vector.GenerationID, _ bool) error {
 	return ErrNotBuilt
 }
 

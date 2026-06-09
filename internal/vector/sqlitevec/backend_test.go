@@ -51,7 +51,7 @@ func TestBackend_CreateActivateRetire(t *testing.T) {
 	assert.Equal(vector.GenerationActive, g.State)
 	assert.Equal("nomic-embed-text-v1.5:768", g.Fingerprint)
 
-	require.NoError(b.RetireGeneration(ctx, gid), "RetireGeneration")
+	require.NoError(b.RetireGeneration(ctx, gid, true), "RetireGeneration")
 	_, err = b.ActiveGeneration(ctx)
 	require.Error(err, "ActiveGeneration should error after retire")
 }
@@ -80,10 +80,65 @@ func TestBackend_RetireGeneration_CleansPending(t *testing.T) {
 	requirepkg.NoError(t, err, "CreateGeneration")
 	requirepkg.Equal(t, 1, pendingCount(t, b, gen), "precondition: pending row present")
 
-	requirepkg.NoError(t, b.RetireGeneration(ctx, gen), "RetireGeneration")
+	requirepkg.NoError(t, b.RetireGeneration(ctx, gen, false), "RetireGeneration")
 
 	assertpkg.Equal(t, 0, pendingCount(t, b, gen),
 		"retire must delete the generation's pending_embeddings rows")
+}
+
+// genStateSV reads index_generations.state for a generation.
+func genStateSV(t *testing.T, b *Backend, gen vector.GenerationID) vector.GenerationState {
+	t.Helper()
+	var s vector.GenerationState
+	requirepkg.NoError(t, b.db.QueryRowContext(context.Background(),
+		`SELECT state FROM index_generations WHERE id = ?`, int64(gen)).Scan(&s),
+		"read state for generation %d", gen)
+	return s
+}
+
+// TestBackend_RetireGeneration_ActiveGuard pins the retire-TOCTOU class-closing
+// fix: the active-gen guard lives ATOMICALLY inside RetireGeneration's tx.
+//   - force=false against the ACTIVE generation is refused with
+//     ErrRefuseRetireActive, leaving state='active' and its pending rows intact
+//     (no destructive reap of the now-serving generation).
+//   - force=true retires the active generation and reaps its pending rows.
+//   - force=false against a NON-active (building) generation retires fine.
+func TestBackend_RetireGeneration_ActiveGuard(t *testing.T) {
+	b, ctx := newBackendForTest(t)
+
+	// Build + force-activate genA, leaving an undrained pending row on it.
+	genA, err := b.CreateGeneration(ctx, "model-a", 768, "")
+	requirepkg.NoError(t, err, "CreateGeneration A")
+	requirepkg.NoError(t, b.ActivateGeneration(ctx, genA, true), "activate A (force)")
+	requirepkg.Equal(t, 1, pendingCount(t, b, genA), "precondition: pending row on active gen")
+	requirepkg.Equal(t, vector.GenerationActive, genStateSV(t, b, genA), "precondition: A active")
+
+	// (1) Non-forced retire of the ACTIVE gen is refused atomically: sentinel
+	// error, state unchanged, pending rows NOT reaped.
+	err = b.RetireGeneration(ctx, genA, false)
+	requirepkg.ErrorIs(t, err, vector.ErrRefuseRetireActive,
+		"non-forced retire of active gen must return ErrRefuseRetireActive")
+	assertpkg.Equal(t, vector.GenerationActive, genStateSV(t, b, genA),
+		"refused retire must leave the active gen's state unchanged")
+	assertpkg.Equal(t, 1, pendingCount(t, b, genA),
+		"refused retire must NOT reap the active gen's pending rows")
+
+	// (2) Forced retire succeeds: state flips to retired and pending is reaped.
+	requirepkg.NoError(t, b.RetireGeneration(ctx, genA, true),
+		"forced retire of active gen must succeed")
+	assertpkg.Equal(t, vector.GenerationRetired, genStateSV(t, b, genA),
+		"forced retire flips state to retired")
+	assertpkg.Equal(t, 0, pendingCount(t, b, genA),
+		"forced retire reaps the gen's pending rows")
+
+	// (3) A NON-active (building) generation retires fine without force.
+	genB, err := b.CreateGeneration(ctx, "model-b", 768, "")
+	requirepkg.NoError(t, err, "CreateGeneration B")
+	requirepkg.Equal(t, vector.GenerationBuilding, genStateSV(t, b, genB), "precondition: B building")
+	requirepkg.NoError(t, b.RetireGeneration(ctx, genB, false),
+		"non-forced retire of a non-active gen must succeed")
+	assertpkg.Equal(t, vector.GenerationRetired, genStateSV(t, b, genB),
+		"non-active gen retires to retired without force")
 }
 
 // TestBackend_ActivateGeneration_AutoRetireCleansPending pins the

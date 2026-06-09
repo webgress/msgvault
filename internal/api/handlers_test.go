@@ -1776,7 +1776,7 @@ func (f *fakeVectorBackend) CreateGeneration(_ context.Context, _ string, _ int,
 func (f *fakeVectorBackend) ActivateGeneration(_ context.Context, _ vector.GenerationID, _ bool) error {
 	return errors.New("not implemented")
 }
-func (f *fakeVectorBackend) RetireGeneration(_ context.Context, _ vector.GenerationID) error {
+func (f *fakeVectorBackend) RetireGeneration(_ context.Context, _ vector.GenerationID, _ bool) error {
 	return errors.New("not implemented")
 }
 func (f *fakeVectorBackend) ActiveGeneration(_ context.Context) (vector.Generation, error) {
