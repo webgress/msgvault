@@ -587,6 +587,18 @@ func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec 
 			vector.ErrDimensionMismatch, len(queryVec), dim)
 	}
 
+	// chunkCeiling is the actual number of embedding rows in the
+	// generation — the upper bound for the candidate-widening loops below.
+	// When the inner ANN LIMIT already reaches this value, no wider fetch
+	// can surface more distinct messages, so the loop terminates.
+	chunkCeiling, err := b.chunkCount(ctx, gen)
+	if err != nil {
+		return nil, err
+	}
+	if chunkCeiling == 0 {
+		return nil, nil
+	}
+
 	// Filter resolution. Unlike sqlitevec, embeddings live in the same
 	// database as messages — we can express the live-message and
 	// structured filters as a single SQL query against both tables
@@ -596,13 +608,16 @@ func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec 
 	if filter.IsEmpty() {
 		// Fast path: let pgvector use the HNSW index by issuing ORDER BY
 		// <=> LIMIT inside a subquery first. The inner SELECT returns at
-		// most k*annOverFetchFactor rows in ANN order; the HNSW index
-		// applies to that inner ORDER BY. The outer query re-groups by
-		// message_id to collapse multi-chunk messages (best chunk wins via
-		// MIN), then re-sorts and re-limits the deduplicated result. We
-		// fetch k*annOverFetchFactor chunks in the inner query so that
-		// after dedup we still have at least k distinct messages with high
-		// probability.
+		// most innerLimit rows in ANN order; the HNSW index applies to that
+		// inner ORDER BY (ef_search is raised at connect time — see
+		// store.HNSWEfSearch — so the index is not capped at the pgvector
+		// default of 40). The outer query re-groups by message_id to
+		// collapse multi-chunk messages (best chunk wins via MIN), then
+		// re-sorts and re-limits the deduplicated result. We start at
+		// k*annOverFetchFactor chunks so the common single-chunk case is a
+		// single query; on multi-chunk corpora the dedup can collapse the
+		// candidate set below k, so the loop doubles the inner LIMIT
+		// (bounded by chunkCeiling) until k distinct messages survive.
 		//
 		// The dimension predicate is embedded as a literal (matching the
 		// partial HNSW index's WHERE dimension = <N> in migrate.go and the
@@ -626,7 +641,9 @@ func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec 
 			 GROUP BY ann.message_id
 			 ORDER BY distance
 			 LIMIT $4`, dim, store.LiveMessagesWhere("m", true))
-		return b.scanHits(ctx, stmt, queryVecLit, int64(gen), k*annOverFetchFactor, k)
+		return searchWiden(k, chunkCeiling, func(innerLimit int) ([]vector.Hit, error) {
+			return b.scanHits(ctx, stmt, queryVecLit, int64(gen), innerLimit, k)
+		})
 	}
 
 	ids, err := b.filteredMessageIDs(ctx, filter)
@@ -640,6 +657,11 @@ func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec 
 	// message-ID set, so we use the same inner-subquery shape for
 	// consistency but accept a sequential scan within the filtered set.
 	// The inner ORDER BY <=> LIMIT still short-circuits on chunk count.
+	// The widening loop mirrors the empty-filter path so a multi-chunk
+	// filtered universe still reaches k distinct messages; the candidate
+	// ceiling is the filtered set size (capped at chunkCeiling) so a
+	// selective filter does not drive the loop to the full generation.
+	filteredCeiling := min(len(ids), chunkCeiling)
 	stmt := fmt.Sprintf(`
 		SELECT ann.message_id,
 		       MIN(ann.distance) AS distance
@@ -656,7 +678,53 @@ func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec 
 		 GROUP BY ann.message_id
 		 ORDER BY distance
 		 LIMIT $6`, dim, dim)
-	return b.scanHits(ctx, stmt, queryVecLit, int64(gen), int64(dim), int64Array(ids), k*annOverFetchFactor, k)
+	idArr := int64Array(ids)
+	return searchWiden(k, filteredCeiling, func(innerLimit int) ([]vector.Hit, error) {
+		return b.scanHits(ctx, stmt, queryVecLit, int64(gen), int64(dim), idArr, innerLimit, k)
+	})
+}
+
+// chunkCount returns the number of embedding rows in the generation.
+// It is the upper bound for the candidate-widening loop: once the inner
+// ANN LIMIT reaches it, no wider fetch can surface more distinct messages.
+func (b *Backend) chunkCount(ctx context.Context, gen vector.GenerationID) (int, error) {
+	var n int
+	if err := b.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM embeddings WHERE generation_id = $1`,
+		int64(gen)).Scan(&n); err != nil {
+		return 0, fmt.Errorf("lookup chunk count: %w", err)
+	}
+	return n, nil
+}
+
+// searchWiden runs the inner ANN scan with a doubling inner LIMIT until
+// at least k distinct messages survive the outer GROUP BY dedup, the
+// candidate ceiling is reached, or no further widening is possible.
+// Mirrors sqlitevec.Search's widening loop. The common single-chunk case
+// is satisfied by the first fetch (k*annOverFetchFactor) so it stays a
+// single query; only multi-chunk corpora trigger additional passes.
+func searchWiden(k, ceiling int, run func(innerLimit int) ([]vector.Hit, error)) ([]vector.Hit, error) {
+	innerLimit := max(k*annOverFetchFactor, k)
+	for {
+		if innerLimit > ceiling {
+			innerLimit = ceiling
+		}
+		hits, err := run(innerLimit)
+		if err != nil {
+			return nil, err
+		}
+		if len(hits) >= k || innerLimit >= ceiling {
+			if len(hits) > k {
+				hits = hits[:k]
+			}
+			// Re-rank so callers see contiguous 1,2,3… ranks.
+			for i := range hits {
+				hits[i].Rank = i + 1
+			}
+			return hits, nil
+		}
+		innerLimit *= 2
+	}
 }
 
 func (b *Backend) scanHits(ctx context.Context, query string, args ...any) ([]vector.Hit, error) {

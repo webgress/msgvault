@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +21,17 @@ import (
 
 //go:embed schema.sql schema_sqlite.sql schema_pg.sql
 var schemaFS embed.FS
+
+// HNSWEfSearch is the per-connection value applied to pgvector's
+// hnsw.ef_search GUC (via RuntimeParams in postgresConnConfig). It must
+// be >= the largest inner ANN LIMIT the vector backend issues so the
+// HNSW index does not throttle the over-fetch below k. The fused ANN
+// path's inner LIMIT is (KPerSignal+1)*fusedANNChunksPerMessage ≈ 808 at
+// the default KPerSignal=100; 1000 covers that worst case with headroom
+// while keeping per-query latency bounded. The candidate-widening loop in
+// the pgvector backend can grow the inner LIMIT beyond this for
+// pathological multi-chunk corpora; in that regime recall is best-effort.
+const HNSWEfSearch = 1000
 
 // Store provides database operations for msgvault.
 //
@@ -285,6 +297,18 @@ func postgresConnConfig(dbURL string, readOnly bool) (*pgx.ConnConfig, error) {
 		connConfig.RuntimeParams = map[string]string{}
 	}
 	connConfig.RuntimeParams["statement_timeout"] = "30s"
+	// Raise pgvector's HNSW ef_search so the vector backend's over-fetch
+	// (inner ORDER BY <=> LIMIT) is not silently capped at the pgvector
+	// default of 40. The fused ANN path issues the largest inner LIMIT —
+	// (KPerSignal+1)*fusedANNChunksPerMessage, ≈808 at the default
+	// KPerSignal=100 — and Search over-fetches k*annOverFetchFactor; with
+	// ef_search=40 the HNSW index would return at most ~40 candidates and
+	// short-return below k on multi-chunk corpora. Sizing ef_search to
+	// HNSWEfSearch keeps the over-fetch design intact. Setting a GUC is not
+	// a data write, so this is safe even under default_transaction_read_only.
+	// Larger values raise per-query latency, so it is sized to the worst-case
+	// inner LIMIT for the default config rather than unboundedly.
+	connConfig.RuntimeParams["hnsw.ef_search"] = strconv.Itoa(HNSWEfSearch)
 	if readOnly {
 		connConfig.RuntimeParams["default_transaction_read_only"] = "on"
 	}
