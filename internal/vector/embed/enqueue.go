@@ -3,6 +3,7 @@ package embed
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -10,6 +11,17 @@ import (
 	"go.kenn.io/msgvault/internal/sync"
 	"go.kenn.io/msgvault/internal/vector"
 )
+
+// afterGenSnapshotHook is a test-only synchronization seam. When non-nil
+// it is invoked once inside EnqueueMessages' transaction AFTER the
+// non-retired generation snapshot is read but BEFORE any per-generation
+// re-validation or pending insert runs. It lets the concurrency
+// regression test commit a RetireGeneration at exactly the window the
+// orphan-pending race opens (snapshot read → retire commits → enqueue
+// inserts), proving the locked re-validation excludes the now-retired
+// generation. It is always nil in production. Mirrors the afterChunkHook
+// seam in queue.go.
+var afterGenSnapshotHook func()
 
 // enqueueChunkRows caps how many (gen, message) tuples go into a single
 // INSERT statement. Each row binds 3 placeholders (generation_id,
@@ -52,6 +64,16 @@ type Enqueuer struct {
 	// ?-placeholder SQLite form), then rebind.
 	rebind         func(string) string
 	insertOrIgnore func(string) string
+	// isPG is true when the underlying driver is PostgreSQL. When set,
+	// EnqueueMessages re-validates each generation under a row lock
+	// (SELECT ... FOR NO KEY UPDATE) that conflicts with the implicit
+	// no-key tuple lock RetireGeneration/ActivateGeneration's
+	// state-flip UPDATE takes, so a generation retired concurrently with
+	// an enqueue cannot end up with an orphan pending row. SQLite does not
+	// support the FOR NO KEY UPDATE syntax (and does not need it — its
+	// file-level write serialization plus busy_timeout already serialize
+	// the enqueue against the retire), so the clause is omitted there.
+	isPG bool
 }
 
 // NewEnqueuer returns an Enqueuer backed by the embeddings database
@@ -60,6 +82,10 @@ type Enqueuer struct {
 // internal/store, mirroring NewQueue's decoupled func style: pass nil
 // for both on SQLite (identity), or the dialect's Rebind and
 // InsertOrIgnore for pgx.
+//
+// Like NewQueue, the Enqueuer detects PostgreSQL by probing rebind: if
+// rebind("?") == "$1" the driver is pgx and the per-generation
+// re-validation SELECT acquires a FOR NO KEY UPDATE row lock.
 func NewEnqueuer(db *sql.DB, rebind, insertOrIgnore func(string) string) *Enqueuer {
 	if rebind == nil {
 		rebind = func(q string) string { return q }
@@ -67,7 +93,12 @@ func NewEnqueuer(db *sql.DB, rebind, insertOrIgnore func(string) string) *Enqueu
 	if insertOrIgnore == nil {
 		insertOrIgnore = func(q string) string { return q }
 	}
-	return &Enqueuer{db: db, rebind: rebind, insertOrIgnore: insertOrIgnore}
+	return &Enqueuer{
+		db:             db,
+		rebind:         rebind,
+		insertOrIgnore: insertOrIgnore,
+		isPG:           rebind("?") == "$1",
+	}
 }
 
 // EnqueueMessages adds the given IDs to pending_embeddings for every
@@ -112,18 +143,66 @@ func (e *Enqueuer) EnqueueMessages(ctx context.Context, messageIDs []int64) erro
 		return tx.Commit()
 	}
 
-	// Bulk-insert one row per (gen, message) pair via chunked multi-row
-	// VALUES statements. Each (gen, message) tuple binds 3 parameters, so
-	// we cap each statement at enqueueChunkRows rows to stay under
-	// SQLite's parameter limit and avoid an oversized prepared statement
-	// on either backend. For a 5,000-message batch with two non-retired
-	// generations this is ~20 writes against the embeddings DB lock
-	// instead of 10,000 single-row inserts — keeps the embed worker's
-	// Claim from starving while sync flushes. The previous json_each
-	// path issued one statement per generation but is SQLite-only;
-	// chunked VALUES is portable to pgx.
+	// Test-only synchronization seam (nil in production): fires after the
+	// non-retired snapshot is read but before the locked re-validation +
+	// inserts below, so the concurrency regression test can commit a
+	// RetireGeneration inside the exact window the orphan-pending race opens.
+	if afterGenSnapshotHook != nil {
+		afterGenSnapshotHook()
+	}
+
+	// revalidate re-reads a generation's state under a row lock that
+	// conflicts with the no-key tuple lock RetireGeneration /
+	// ActivateGeneration's state-flip UPDATE takes, then reports whether
+	// the locked re-read still sees the generation as non-retired. The
+	// initial non-retired snapshot above is read at the start of this tx
+	// under READ COMMITTED, so without this guard a concurrent retire could
+	// commit between that snapshot and the INSERT below — the FK insert
+	// takes only FOR KEY SHARE on index_generations, which does NOT conflict
+	// with retire's FOR NO KEY UPDATE, so the orphan pending row would commit
+	// and never be reaped (pickTarget skips retired gens; the retired
+	// index_generations row is preserved so its ON DELETE CASCADE never
+	// fires). Re-validating under FOR NO KEY UPDATE serializes the two
+	// interleavings:
+	//   - enqueue-first: retire's state-flip UPDATE blocks on this lock,
+	//     then its DELETE removes the rows we just inserted -> no orphan.
+	//   - retire-first: this locking SELECT blocks until retire commits, then
+	//     re-reads state='retired' and returns false -> we insert nothing.
+	// On SQLite the FOR NO KEY UPDATE clause is omitted (unsupported syntax);
+	// its file-level write serialization + busy_timeout force a retry on the
+	// losing writer, so the same invariant holds without an explicit lock.
+	revalidate := `SELECT id FROM index_generations WHERE id = ? AND state != ?`
+	if e.isPG {
+		revalidate += ` FOR NO KEY UPDATE`
+	}
+	revalidate = e.rebind(revalidate)
+
 	now := time.Now().Unix()
 	for _, g := range gens {
+		// Re-read the generation's state under a row lock; skip it if it has
+		// been retired since the non-retired snapshot above. Reuses the same
+		// tx so the lock is held through the INSERTs below.
+		var lockedID int64
+		err := tx.QueryRowContext(ctx, revalidate, g, string(vector.GenerationRetired)).Scan(&lockedID)
+		if errors.Is(err, sql.ErrNoRows) {
+			// Retired concurrently (PG: by a now-committed retire we just
+			// blocked on; SQLite: by a retire that won the write race) — do
+			// not enqueue, leaving no orphan pending row for this gen.
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("re-validate generation %d: %w", g, err)
+		}
+		// Bulk-insert one row per (gen, message) pair via chunked multi-row
+		// VALUES statements. Each (gen, message) tuple binds 3 parameters, so
+		// we cap each statement at enqueueChunkRows rows to stay under
+		// SQLite's parameter limit and avoid an oversized prepared statement
+		// on either backend. For a 5,000-message batch with two non-retired
+		// generations this is ~20 writes against the embeddings DB lock
+		// instead of 10,000 single-row inserts — keeps the embed worker's
+		// Claim from starving while sync flushes. The previous json_each
+		// path issued one statement per generation but is SQLite-only;
+		// chunked VALUES is portable to pgx.
 		for start := 0; start < len(messageIDs); start += enqueueChunkRows {
 			end := min(start+enqueueChunkRows, len(messageIDs))
 			chunk := messageIDs[start:end]

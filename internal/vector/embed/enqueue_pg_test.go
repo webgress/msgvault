@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/pgvector"
 )
 
@@ -107,6 +108,67 @@ func TestEnqueuerPG_DualEnqueueAndRetiredExclusion(t *testing.T) {
 	assert.Equal(t, 3, pgPendingCount(t, db, 1), "active generation pending count")
 	assert.Equal(t, 3, pgPendingCount(t, db, 2), "building generation pending count")
 	assert.Equal(t, 0, pgPendingCount(t, db, 3), "retired generation must be excluded")
+}
+
+// TestEnqueuerPG_RetireDuringEnqueue_NoOrphan drives the concurrent
+// retire-during-enqueue interleaving that the locked per-generation
+// re-validation closes. It forces the exact window the orphan-pending race
+// opens — the enqueue tx reads the non-retired snapshot, THEN a concurrent
+// RetireGeneration commits (UPDATE state='retired' + DELETE pending), THEN
+// the enqueue attempts its inserts — and asserts no pending row is left
+// behind for the now-retired generation.
+//
+// Without the fix the enqueue inserts pending rows for the snapshotted
+// (now-retired) generation after retire's DELETE has run, so an orphan row
+// commits and is never reaped. With the fix the locked re-read sees
+// state='retired' and skips the generation, so the post-state has zero
+// pending rows for it.
+//
+// The interleave is made deterministic via afterGenSnapshotHook: the hook
+// fires inside the enqueue tx after the snapshot read and runs the retire
+// to completion before returning, so the enqueue's re-validation always
+// observes the committed retire.
+func TestEnqueuerPG_RetireDuringEnqueue_NoOrphan(t *testing.T) {
+	ctx := context.Background()
+	db := openPGEnqueueDB(t)
+
+	// Gen 1 stays active (so a non-force retire of gen 2 is permitted) and
+	// is the control that must keep its rows. Gen 2 is the building gen that
+	// gets retired mid-enqueue and must end with zero pending rows.
+	insertPGGeneration(t, db, 1, "active")
+	insertPGGeneration(t, db, 2, "building")
+
+	backend, err := pgvector.Open(ctx, pgvector.Options{DB: db, SkipMigrate: true})
+	require.NoError(t, err, "open pgvector backend")
+
+	// The hook fires once, inside the enqueue tx, after the non-retired
+	// snapshot (which still includes gen 2) is read. We retire gen 2 to
+	// completion here so the enqueue's subsequent locked re-validation
+	// observes the committed state='retired'. Reset the seam so it cannot
+	// leak into sibling tests sharing this package's globals.
+	var retireErr error
+	afterGenSnapshotHook = func() {
+		retireErr = backend.RetireGeneration(ctx, 2, false)
+	}
+	t.Cleanup(func() { afterGenSnapshotHook = nil })
+
+	e := pgEnqueuer(db)
+	require.NoError(t, e.EnqueueMessages(ctx, []int64{10, 11, 12}), "EnqueueMessages")
+	require.NoError(t, retireErr, "RetireGeneration during enqueue")
+
+	// Gen 2 was retired before the enqueue inserted its rows: the locked
+	// re-validation must have excluded it, leaving zero orphan pending rows.
+	assert.Equal(t, 0, pgPendingCount(t, db, 2),
+		"retired-mid-enqueue generation must have no orphan pending rows")
+	// Gen 1 stayed active throughout, so it still receives every id.
+	assert.Equal(t, 3, pgPendingCount(t, db, 1),
+		"active generation still enqueued despite concurrent retire")
+
+	// Sanity: gen 2 really is retired.
+	var state string
+	require.NoError(t, db.QueryRow(
+		`SELECT state FROM index_generations WHERE id = $1`, int64(2)).Scan(&state))
+	assert.Equal(t, string(vector.GenerationRetired), state, "gen 2 retired")
 }
 
 // TestEnqueuerPG_Idempotent asserts re-enqueueing the same IDs is a no-op
