@@ -127,6 +127,75 @@ func TestQueue_Claim_ReturnsIDsAscending(t *testing.T) {
 		"ids not ascending: %v", ids)
 }
 
+// TestQueue_CompleteRelease_ChunksLargeIDSets verifies that Complete
+// and Release split an id set larger than completeReleaseChunkRows into
+// multiple token-scoped statements and still affect exactly the intended
+// rows. The chunk size is temporarily lowered so the test exercises the
+// chunk boundary (3 chunks) with a modest row count rather than driving
+// thousands of rows through the driver.
+func TestQueue_CompleteRelease_ChunksLargeIDSets(t *testing.T) {
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	ctx := context.Background()
+
+	orig := completeReleaseChunkRows
+	completeReleaseChunkRows = 2
+	t.Cleanup(func() { completeReleaseChunkRows = orig })
+
+	// 5 ids over a chunk size of 2 → 3 chunks (2, 2, 1).
+	const n = 5
+	db := openVectorsDBWithPending(t, n)
+	q := NewQueue(db, nil)
+
+	ids, token, err := q.Claim(ctx, 1, n)
+	require.NoError(err, "Claim")
+	require.Len(ids, n)
+
+	// Release across chunks: every row returns to the pool.
+	require.NoError(q.Release(ctx, 1, token, ids), "Release (chunked)")
+	assert.Equal(n, countAvailable(t, db, 1), "all rows available after chunked Release")
+
+	// Re-claim and Complete across chunks: every row is deleted.
+	ids2, token2, err := q.Claim(ctx, 1, n)
+	require.NoError(err, "re-Claim")
+	require.Len(ids2, n)
+	require.NoError(q.Complete(ctx, 1, token2, ids2), "Complete (chunked)")
+	var total int
+	require.NoError(db.QueryRow(`SELECT COUNT(*) FROM pending_embeddings`).Scan(&total))
+	assert.Equal(0, total, "all rows deleted after chunked Complete")
+}
+
+// TestQueue_CompleteRelease_ChunkedTokenScoped verifies that the chunked
+// path keeps its token filter: a Complete/Release spanning multiple
+// chunks with a wrong token must not touch any row, even the rows in
+// chunks that would otherwise match by id+generation.
+func TestQueue_CompleteRelease_ChunkedTokenScoped(t *testing.T) {
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	ctx := context.Background()
+
+	orig := completeReleaseChunkRows
+	completeReleaseChunkRows = 2
+	t.Cleanup(func() { completeReleaseChunkRows = orig })
+
+	const n = 5
+	db := openVectorsDBWithPending(t, n)
+	q := NewQueue(db, nil)
+
+	ids, _, err := q.Claim(ctx, 1, n)
+	require.NoError(err, "Claim")
+	require.Len(ids, n)
+
+	// Wrong token across all chunks: nothing deleted, nothing released.
+	require.NoError(q.Complete(ctx, 1, "deadbeef", ids), "Complete wrong token (chunked)")
+	var total int
+	require.NoError(db.QueryRow(`SELECT COUNT(*) FROM pending_embeddings`).Scan(&total))
+	assert.Equal(n, total, "wrong-token chunked Complete must not delete")
+
+	require.NoError(q.Release(ctx, 1, "deadbeef", ids), "Release wrong token (chunked)")
+	assert.Equal(0, countAvailable(t, db, 1), "wrong-token chunked Release must leave rows claimed")
+}
+
 // TestQueue_Complete_AfterReclaim_PreservesNewClaim simulates the
 // stale-worker-completing-late race: worker A claims rows, stalls
 // long enough for ReclaimStale to clear the claim, worker B
