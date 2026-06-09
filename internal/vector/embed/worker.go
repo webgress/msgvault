@@ -336,6 +336,14 @@ func (w *Worker) RunOnce(ctx context.Context, gen vector.GenerationID) (res RunR
 					// upsert/complete failure, ctx cancel — a fresh
 					// failure that should fail this run immediately.
 					lastErr = drainErr
+					// A retired generation is a benign drop, never a hard
+					// abort. downshiftDrain handles ErrGenerationRetired
+					// inline today (so it does not surface here), but guard
+					// defensively so a future drain path that propagates the
+					// sentinel cannot trip the generic non-4xx abort below.
+					if errors.Is(drainErr, vector.ErrGenerationRetired) {
+						continue
+					}
 					if !errors.Is(drainErr, ErrPermanent4xx) {
 						return res, fmt.Errorf("downshift drain: %w", drainErr)
 					}
@@ -398,6 +406,25 @@ func (w *Worker) RunOnce(ctx context.Context, gen vector.GenerationID) (res RunR
 		}
 
 		if err := w.deps.Backend.Upsert(ctx, gen, eb.chunks); err != nil {
+			if errors.Is(err, vector.ErrGenerationRetired) {
+				// The generation was retired out from under this worker
+				// (its claims were reclaimed and a newer generation took
+				// over, or an operator retired it). Per the documented
+				// contract on vector.ErrGenerationRetired this is a benign
+				// "drop the batch" signal, NOT a hard failure: re-embedding
+				// would just re-fail identically and burn embedding-API cost
+				// up to MaxConsecutiveFailures. Token-aware DROP the claimed
+				// rows (Complete is a token-scoped DELETE, safe against a
+				// concurrent newer claim), do not count this as a failure,
+				// and continue draining so the run finishes cleanly.
+				w.deps.Log.Info("embed: generation retired mid-run; dropping batch",
+					"gen", gen, "ids", len(eb.embeddedIDs))
+				if cerr := w.q.Complete(ctx, gen, token, eb.embeddedIDs); cerr != nil {
+					w.deps.Log.Error("complete drop after retired generation", "error", cerr,
+						"gen", gen, "ids", len(eb.embeddedIDs))
+				}
+				continue
+			}
 			res.Failed += len(eb.embeddedIDs)
 			if rerr := w.q.Release(ctx, gen, token, eb.embeddedIDs); rerr != nil {
 				w.deps.Log.Error("release after upsert failure", "error", rerr)
@@ -805,6 +832,22 @@ func (w *Worker) downshiftDrain(
 			continue
 		}
 		if uerr := w.deps.Backend.Upsert(ctx, gen, eb.chunks); uerr != nil {
+			if errors.Is(uerr, vector.ErrGenerationRetired) {
+				// Benign per the ErrGenerationRetired contract: the
+				// generation was retired mid-drain. Token-aware DROP this
+				// singleton's row and continue the drain rather than
+				// wrapping into a non-4xx error (which RunOnce would treat
+				// as a hard abort). The remaining claimed rows will also
+				// observe the retired state and drop the same way, so the
+				// drain finishes cleanly and RunOnce returns nil.
+				w.deps.Log.Info("embed: generation retired mid-drain; dropping singleton",
+					"gen", gen, "id", id)
+				if cerr := w.q.Complete(ctx, gen, token, eb.embeddedIDs); cerr != nil {
+					w.deps.Log.Error("complete drop after retired generation (drain)", "error", cerr,
+						"gen", gen, "id", id)
+				}
+				continue
+			}
 			w.releaseDownshiftRemainder(ctx, gen, token, append(append([]int64(nil), deferredDrops...), ids[i:]...))
 			return embedded, dropped, fmt.Errorf("upsert: %w", uerr)
 		}
