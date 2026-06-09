@@ -66,26 +66,51 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
 		sqlLimit = max(2*req.KPerSignal, req.Limit)
 	}
 
-	var args []any
-	bind := func(v any) string {
-		args = append(args, v)
-		return fmt.Sprintf("$%d", len(args))
-	}
-
-	filterSQL := applyFilterClauses(req.Filter, bind)
-	liveSQL := store.LiveMessagesWhere("m", true)
-
-	ctes := []string{fmt.Sprintf(
-		"filtered AS (SELECT m.id FROM messages m WHERE %s%s)", liveSQL, filterSQL)}
-
 	kPlus1 := req.KPerSignal + 1
 
-	if useFTS {
-		ftsArg := bind(req.FTSQuery)
-		kp1Arg := bind(kPlus1)
-		kArg := bind(req.KPerSignal)
-		ctes = append(ctes,
-			fmt.Sprintf(`fts_pool AS (
+	// Candidate-widening bounds for the ANN pool. The inner ANN scan over-
+	// fetches chunks so the outer GROUP BY can still surface KPerSignal+1
+	// distinct messages; on multi-chunk corpora a few long messages can
+	// pack the inner LIMIT and collapse the deduplicated pool below that.
+	// chunkCeiling (generation-wide chunk count) is the hard upper bound so
+	// the widening loop always terminates; filteredCeiling (distinct
+	// filtered messages with at least one chunk) is an early exit so a
+	// selective filter does not drive the loop to the full generation.
+	// Both are only needed on the ANN side.
+	var chunkCeiling, filteredCeiling int
+	if useANN {
+		if chunkCeiling, err = b.chunkCount(ctx, req.Generation); err != nil {
+			return nil, false, err
+		}
+		if filteredCeiling, err = b.filteredChunkMessageCount(ctx, req.Generation, req.Filter); err != nil {
+			return nil, false, err
+		}
+	}
+
+	// runFused builds and executes the fused CTE for a given inner ANN
+	// LIMIT (innerChunks) and returns the hits plus the per-signal pool
+	// sizes. Args, binds and CTEs are rebuilt per call because the inner
+	// LIMIT participates in positional binding; the widening loop re-issues
+	// it with a growing innerChunks until the ANN pool is large enough.
+	runFused := func(innerChunks int) ([]vector.FusedHit, int, int, error) {
+		var args []any
+		bind := func(v any) string {
+			args = append(args, v)
+			return fmt.Sprintf("$%d", len(args))
+		}
+
+		filterSQL := applyFilterClauses(req.Filter, bind)
+		liveSQL := store.LiveMessagesWhere("m", true)
+
+		ctes := []string{fmt.Sprintf(
+			"filtered AS (SELECT m.id FROM messages m WHERE %s%s)", liveSQL, filterSQL)}
+
+		if useFTS {
+			ftsArg := bind(req.FTSQuery)
+			kp1Arg := bind(kPlus1)
+			kArg := bind(req.KPerSignal)
+			ctes = append(ctes,
+				fmt.Sprintf(`fts_pool AS (
     SELECT m.id AS message_id,
            ts_rank_cd(m.search_fts, websearch_to_tsquery('simple', %s), 32) AS bm25
       FROM messages m
@@ -94,40 +119,37 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
      ORDER BY bm25 DESC
      LIMIT %s
 )`, ftsArg, ftsArg, kp1Arg),
-			fmt.Sprintf(`fts_ranked AS (
+				fmt.Sprintf(`fts_ranked AS (
     SELECT message_id, bm25,
            ROW_NUMBER() OVER (ORDER BY bm25 DESC, message_id ASC) AS rnk
       FROM fts_pool
      ORDER BY bm25 DESC, message_id ASC
      LIMIT %s
 )`, kArg))
-	}
+		}
 
-	if useANN {
-		vecArg := bind(vectorLiteral(req.QueryVec))
-		genArg := bind(int64(req.Generation))
-		// fusedANNChunksPerMessage is the upper bound on how many chunks a single
-		// message may contribute to the inner ANN scan. The inner scan fetches
-		// (KPerSignal+1)*fusedANNChunksPerMessage chunks so that after GROUP BY
-		// deduplication the outer result still contains at least KPerSignal+1
-		// distinct messages with high probability. Without this headroom,
-		// multi-chunk messages could crowd out distinct candidates before the
-		// GROUP BY runs.
-		innerChunks := kPlus1 * fusedANNChunksPerMessage
-		innerArg := bind(innerChunks)
-		kp1Arg := bind(kPlus1)
-		kArg := bind(req.KPerSignal)
-		// Use an inner SELECT with ORDER BY <=> LIMIT so pgvector can
-		// apply the HNSW index before the outer GROUP BY collapses
-		// multi-chunk messages. The filtered CTE already constrains the
-		// candidate set; the inner subquery fetches
-		// (KPerSignal+1)*fusedANNChunksPerMessage chunks in ANN order
-		// (HNSW-eligible), then the outer GROUP BY picks
-		// the best-scoring chunk per message via MIN(distance) and limits to
-		// KPerSignal+1 distinct messages. This ensures the outer LIMIT is
-		// applied after dedup, not before.
-		ctes = append(ctes,
-			fmt.Sprintf(`ann_pool AS (
+		if useANN {
+			vecArg := bind(vectorLiteral(req.QueryVec))
+			genArg := bind(int64(req.Generation))
+			innerArg := bind(innerChunks)
+			kp1Arg := bind(kPlus1)
+			kArg := bind(req.KPerSignal)
+			// Use an inner SELECT with ORDER BY <=> LIMIT so pgvector can
+			// apply the HNSW index before the outer GROUP BY collapses
+			// multi-chunk messages. The filtered CTE constrains the
+			// candidate set; the inner subquery fetches innerChunks rows in
+			// ANN order (intended to be HNSW-eligible — but note the JOIN to
+			// the materialized `filtered` CTE may, depending on PG/pgvector
+			// version and planner costing, force a sequential ANN scan
+			// within the filtered set; same tradeoff as backend.go's
+			// filtered path, and not yet verified with EXPLAIN ANALYZE).
+			// The outer GROUP BY then picks the best-scoring chunk per
+			// message via MIN(distance) and limits to KPerSignal+1 distinct
+			// messages, so the outer LIMIT is applied after dedup. The
+			// widening loop in FusedSearch grows innerChunks when this dedup
+			// collapses the pool below KPerSignal+1.
+			ctes = append(ctes,
+				fmt.Sprintf(`ann_pool AS (
     SELECT ann.message_id,
            MIN(ann.distance) AS distance
       FROM (
@@ -143,28 +165,28 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
      ORDER BY distance
      LIMIT %[5]s
 )`, dim, vecArg, genArg, innerArg, kp1Arg),
-			fmt.Sprintf(`ann_ranked AS (
+				fmt.Sprintf(`ann_ranked AS (
     SELECT message_id, distance,
            ROW_NUMBER() OVER (ORDER BY distance ASC, message_id ASC) AS rnk
       FROM ann_pool
      ORDER BY distance ASC, message_id ASC
      LIMIT %s
 )`, kArg))
-	}
+		}
 
-	// Pool CTEs are now fully bound. Remember how many args belong to
-	// the pool prefix so the empty-result saturation fallback can
-	// re-run the prefix-only SQL without the trailing rrfk/limit args.
-	poolArgsLen := len(args)
-	poolCTEs := append([]string(nil), ctes...)
+		// Pool CTEs are now fully bound. Remember how many args belong to
+		// the pool prefix so the empty-result saturation fallback can
+		// re-run the prefix-only SQL without the trailing rrfk/limit args.
+		poolArgsLen := len(args)
+		poolCTEs := append([]string(nil), ctes...)
 
-	rrfkArg := bind(req.RRFK)
-	limitArg := bind(sqlLimit)
+		rrfkArg := bind(req.RRFK)
+		limitArg := bind(sqlLimit)
 
-	var fusedSQL string
-	switch {
-	case useFTS && useANN:
-		fusedSQL = fmt.Sprintf(`fused AS (
+		var fusedSQL string
+		switch {
+		case useFTS && useANN:
+			fusedSQL = fmt.Sprintf(`fused AS (
     SELECT COALESCE(b.message_id, v.message_id) AS message_id,
            COALESCE(1.0 / (%s + b.rnk), 0.0) +
            COALESCE(1.0 / (%s + v.rnk), 0.0) AS rrf_score,
@@ -173,35 +195,35 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
       FROM fts_ranked b
       FULL OUTER JOIN ann_ranked v USING (message_id)
 )`, rrfkArg, rrfkArg)
-	case useFTS:
-		fusedSQL = fmt.Sprintf(`fused AS (
+		case useFTS:
+			fusedSQL = fmt.Sprintf(`fused AS (
     SELECT b.message_id AS message_id,
            1.0 / (%s + b.rnk) AS rrf_score,
            b.bm25 AS bm25_score,
            CAST(NULL AS DOUBLE PRECISION) AS vector_score
       FROM fts_ranked b
 )`, rrfkArg)
-	case useANN:
-		fusedSQL = fmt.Sprintf(`fused AS (
+		case useANN:
+			fusedSQL = fmt.Sprintf(`fused AS (
     SELECT v.message_id AS message_id,
            1.0 / (%s + v.rnk) AS rrf_score,
            CAST(NULL AS DOUBLE PRECISION) AS bm25_score,
            1.0 - v.distance AS vector_score
       FROM ann_ranked v
 )`, rrfkArg)
-	}
-	ctes = append(ctes, fusedSQL)
+		}
+		ctes = append(ctes, fusedSQL)
 
-	ftsPoolExpr := "0"
-	annPoolExpr := "0"
-	if useFTS {
-		ftsPoolExpr = "(SELECT COUNT(*) FROM fts_pool)"
-	}
-	if useANN {
-		annPoolExpr = "(SELECT COUNT(*) FROM ann_pool)"
-	}
+		ftsPoolExpr := "0"
+		annPoolExpr := "0"
+		if useFTS {
+			ftsPoolExpr = "(SELECT COUNT(*) FROM fts_pool)"
+		}
+		if useANN {
+			annPoolExpr = "(SELECT COUNT(*) FROM ann_pool)"
+		}
 
-	query := "WITH " + strings.Join(ctes, ",\n") + fmt.Sprintf(`
+		query := "WITH " + strings.Join(ctes, ",\n") + fmt.Sprintf(`
 SELECT message_id, rrf_score, bm25_score, vector_score,
        %s AS fts_pool_size,
        %s AS ann_pool_size
@@ -209,61 +231,99 @@ SELECT message_id, rrf_score, bm25_score, vector_score,
  ORDER BY rrf_score DESC, message_id ASC
  LIMIT %s`, ftsPoolExpr, annPoolExpr, limitArg)
 
-	rows, err := b.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, false, fmt.Errorf("fused query: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	var hits []vector.FusedHit
-	var ftsPoolSize, annPoolSize int
-	var poolSizeRead bool
-	for rows.Next() {
-		var h vector.FusedHit
-		var bm, vec sql.NullFloat64
-		var ftsPool, annPool int
-		if err := rows.Scan(&h.MessageID, &h.RRFScore, &bm, &vec, &ftsPool, &annPool); err != nil {
-			return nil, false, fmt.Errorf("scan fused hit: %w", err)
+		rows, err := b.db.QueryContext(ctx, query, args...)
+		if err != nil {
+			return nil, 0, 0, fmt.Errorf("fused query: %w", err)
 		}
+		defer func() { _ = rows.Close() }()
+
+		var hits []vector.FusedHit
+		var ftsPoolSize, annPoolSize int
+		var poolSizeRead bool
+		for rows.Next() {
+			var h vector.FusedHit
+			var bm, vec sql.NullFloat64
+			var ftsPool, annPool int
+			if err := rows.Scan(&h.MessageID, &h.RRFScore, &bm, &vec, &ftsPool, &annPool); err != nil {
+				return nil, 0, 0, fmt.Errorf("scan fused hit: %w", err)
+			}
+			if !poolSizeRead {
+				ftsPoolSize = ftsPool
+				annPoolSize = annPool
+				poolSizeRead = true
+			}
+			h.BM25Score = math.NaN()
+			if bm.Valid {
+				h.BM25Score = bm.Float64
+			}
+			h.VectorScore = math.NaN()
+			if vec.Valid {
+				h.VectorScore = vec.Float64
+			}
+			hits = append(hits, h)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, 0, 0, fmt.Errorf("iterate fused hits: %w", err)
+		}
+
+		// Saturation: when the fused result set is empty, the correlated
+		// subqueries that carry pool counts never fire (they ride on the
+		// row stream). Fall back to a prefix-only query that uses just
+		// the pool CTEs and their args — the trailing rrfk/limit args
+		// are excluded so PG's "expected N arguments" check is satisfied.
 		if !poolSizeRead {
-			ftsPoolSize = ftsPool
-			annPoolSize = annPool
-			poolSizeRead = true
+			prefix := "WITH " + strings.Join(poolCTEs, ",\n") + "\n"
+			prefixArgs := args[:poolArgsLen]
+			if useFTS {
+				if err := b.db.QueryRowContext(ctx,
+					prefix+"SELECT COUNT(*) FROM fts_pool", prefixArgs...).Scan(&ftsPoolSize); err != nil {
+					return nil, 0, 0, fmt.Errorf("count fts_pool: %w", err)
+				}
+			}
+			if useANN {
+				if err := b.db.QueryRowContext(ctx,
+					prefix+"SELECT COUNT(*) FROM ann_pool", prefixArgs...).Scan(&annPoolSize); err != nil {
+					return nil, 0, 0, fmt.Errorf("count ann_pool: %w", err)
+				}
+			}
 		}
-		h.BM25Score = math.NaN()
-		if bm.Valid {
-			h.BM25Score = bm.Float64
-		}
-		h.VectorScore = math.NaN()
-		if vec.Valid {
-			h.VectorScore = vec.Float64
-		}
-		hits = append(hits, h)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, false, fmt.Errorf("iterate fused hits: %w", err)
+		return hits, ftsPoolSize, annPoolSize, nil
 	}
 
-	// Saturation: when the fused result set is empty, the correlated
-	// subqueries that carry pool counts never fire (they ride on the
-	// row stream). Fall back to a prefix-only query that uses just
-	// the pool CTEs and their args — the trailing rrfk/limit args
-	// are excluded so PG's "expected N arguments" check is satisfied.
-	if !poolSizeRead {
-		prefix := "WITH " + strings.Join(poolCTEs, ",\n") + "\n"
-		prefixArgs := args[:poolArgsLen]
-		if useFTS {
-			if err := b.db.QueryRowContext(ctx,
-				prefix+"SELECT COUNT(*) FROM fts_pool", prefixArgs...).Scan(&ftsPoolSize); err != nil {
-				return nil, false, fmt.Errorf("count fts_pool: %w", err)
-			}
+	// Widening loop. Start at (KPerSignal+1)*fusedANNChunksPerMessage so the
+	// common single-chunk case is a single query. Grow innerChunks (doubling,
+	// bounded by chunkCeiling) while the ANN pool dedups below KPerSignal+1
+	// and more chunks remain to scan. The FTS side never collapses (one row
+	// per message_id), so only the ANN pool drives widening. When useANN is
+	// false the loop runs exactly once.
+	var (
+		hits        []vector.FusedHit
+		ftsPoolSize int
+		annPoolSize int
+	)
+	innerChunks := kPlus1 * fusedANNChunksPerMessage
+	for {
+		if useANN && chunkCeiling > 0 && innerChunks > chunkCeiling {
+			innerChunks = chunkCeiling
 		}
-		if useANN {
-			if err := b.db.QueryRowContext(ctx,
-				prefix+"SELECT COUNT(*) FROM ann_pool", prefixArgs...).Scan(&annPoolSize); err != nil {
-				return nil, false, fmt.Errorf("count ann_pool: %w", err)
-			}
+		hits, ftsPoolSize, annPoolSize, err = runFused(innerChunks)
+		if err != nil {
+			return nil, false, err
 		}
+		if !useANN ||
+			annPoolSize >= kPlus1 ||
+			annPoolSize >= filteredCeiling ||
+			innerChunks >= chunkCeiling {
+			break
+		}
+		next := innerChunks * 2
+		if chunkCeiling > 0 && next > chunkCeiling {
+			next = chunkCeiling
+		}
+		if next == innerChunks {
+			break
+		}
+		innerChunks = next
 	}
 
 	if boostActive {
@@ -275,6 +335,33 @@ SELECT message_id, rrf_score, bm25_score, vector_score,
 
 	saturated := ftsPoolSize > req.KPerSignal || annPoolSize > req.KPerSignal
 	return hits, saturated, nil
+}
+
+// filteredChunkMessageCount returns the number of distinct messages that
+// (a) have at least one chunk in the generation and (b) satisfy the live
+// + structured filter. It is the early-exit ceiling for the ANN-pool
+// widening loop: once the pool has surfaced this many distinct messages,
+// every filtered message with a chunk is already in the pool with its
+// best-distance chunk, so further widening can neither add a message nor
+// change a ranking. The WHERE clause is assembled from the same
+// LiveMessagesWhere + buildPGFilterClauses builders the fused query uses,
+// so the ceiling predicate stays aligned with the `filtered` CTE.
+func (b *Backend) filteredChunkMessageCount(ctx context.Context, gen vector.GenerationID, f vector.Filter) (int, error) {
+	args := []any{int64(gen)}
+	bind := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
+	}
+	clauses := append([]string{store.LiveMessagesWhere("m", true)}, buildPGFilterClauses(f, bind)...)
+	query := `SELECT COUNT(DISTINCT e.message_id)
+	            FROM embeddings e
+	            JOIN messages m ON m.id = e.message_id
+	           WHERE e.generation_id = $1 AND ` + strings.Join(clauses, " AND ")
+	var n int
+	if err := b.db.QueryRowContext(ctx, query, args...).Scan(&n); err != nil {
+		return 0, fmt.Errorf("filtered chunk message count: %w", err)
+	}
+	return n, nil
 }
 
 // applyFilterClauses returns the " AND ..." fragment to append after a
