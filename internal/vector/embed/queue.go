@@ -141,13 +141,21 @@ func (q *Queue) Claim(ctx context.Context, gen vector.GenerationID, batch int) (
 // production never reassigns it.
 var completeReleaseChunkRows = 500
 
+// afterChunkHook is a test-only fault-injection seam. When non-nil it is
+// invoked after each chunk's statement executes inside execTokenScoped,
+// receiving the number of ids processed so far. Returning a non-nil error
+// aborts the loop and triggers the transaction rollback, letting tests
+// prove cross-chunk atomicity (a failure after an earlier chunk must leave
+// zero rows changed). It is always nil in production.
+var afterChunkHook func(processed int) error
+
 // Complete deletes the claimed rows from the queue. Only rows whose
 // claim_token matches token are removed; any row that was reclaimed or
 // re-claimed under a different token is left in place. A nil or empty
 // ids slice is a no-op. The ids are processed in chunks (see
-// completeReleaseChunkRows); each chunk is an independent, token-scoped
-// DELETE over a disjoint id subset, so the chunked statements compose to
-// the same effect as a single statement.
+// completeReleaseChunkRows); all chunks run inside a single transaction
+// (see execTokenScoped), so the delete is atomic across chunks — either
+// every matching row is removed or, on any error, none are.
 func (q *Queue) Complete(ctx context.Context, gen vector.GenerationID, token string, ids []int64) error {
 	const stmt = `
         DELETE FROM pending_embeddings
@@ -164,7 +172,9 @@ func (q *Queue) Complete(ctx context.Context, gen vector.GenerationID, token str
 // them up (for embedding failures). Only rows whose claim_token matches
 // token are released. A nil or empty ids slice is a no-op. Like
 // Complete, the ids are processed in token-scoped chunks (see
-// completeReleaseChunkRows).
+// completeReleaseChunkRows) inside a single transaction, so the release
+// is atomic across chunks — all matching rows are cleared or, on error,
+// none are.
 func (q *Queue) Release(ctx context.Context, gen vector.GenerationID, token string, ids []int64) error {
 	const stmt = `
         UPDATE pending_embeddings
@@ -187,7 +197,32 @@ func (q *Queue) Release(ctx context.Context, gen vector.GenerationID, token stri
 // token-scoped semantics are identical to a single statement; because the
 // chunks operate over disjoint id subsets the additive deletes/updates
 // compose correctly. A nil or empty ids slice is a no-op.
+//
+// All chunks run inside a single transaction so the operation is
+// all-or-nothing: before chunking, Complete/Release was one atomic
+// statement, and wrapping the chunks in a tx restores that guarantee. If
+// any chunk fails (DB error or context cancellation) the whole batch is
+// rolled back and no rows are left partially deleted/updated while the
+// caller still sees an error. Works on both SQLite (mattn supports a tx
+// spanning multiple statements) and PostgreSQL (pgx).
 func (q *Queue) execTokenScoped(ctx context.Context, stmtPrefix string, gen vector.GenerationID, token string, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	tx, err := q.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin token-scoped tx: %w", err)
+	}
+	// Roll back unless Commit below succeeds. After a successful Commit
+	// this Rollback is a no-op (sql.ErrTxDone), so it cannot mask success.
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
 	for start := 0; start < len(ids); start += completeReleaseChunkRows {
 		end := min(start+completeReleaseChunkRows, len(ids))
 		chunk := ids[start:end]
@@ -198,10 +233,29 @@ func (q *Queue) execTokenScoped(ctx context.Context, stmtPrefix string, gen vect
 			args = append(args, id)
 		}
 		query := q.rebind(stmtPrefix + inPlaceholders(len(chunk)))
-		if _, err := q.db.ExecContext(ctx, query, args...); err != nil {
-			return err
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			// The deferred Rollback discards every earlier chunk in this
+			// tx, so the failure leaves the queue untouched. Surface the
+			// original error %w-wrapped; the rollback error (if any) is
+			// intentionally not propagated so it cannot mask this one.
+			return fmt.Errorf("exec chunk: %w", err)
+		}
+		// Test-only fault-injection seam (nil in production): lets the
+		// atomicity tests force a failure AFTER an earlier chunk has
+		// already executed inside this tx, exercising the cross-chunk
+		// rollback path deterministically. Mirrors the preReturn/OnEmbed
+		// seams used elsewhere in this package.
+		if afterChunkHook != nil {
+			if err := afterChunkHook(end); err != nil {
+				return fmt.Errorf("exec chunk: %w", err)
+			}
 		}
 	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit token-scoped tx: %w", err)
+	}
+	committed = true
 	return nil
 }
 

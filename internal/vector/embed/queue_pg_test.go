@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"os"
 	"sort"
 	"strings"
@@ -261,6 +262,65 @@ func TestQueuePG_CompleteRelease_ChunkedTokenScoped(t *testing.T) {
 
 	require.NoError(t, q.Release(ctx, 1, "deadbeef", ids), "Release wrong token (chunked)")
 	assert.Equal(t, 0, pgCountAvailable(t, db), "wrong-token chunked Release must leave rows claimed")
+}
+
+// TestQueuePG_CompleteRelease_AtomicAcrossChunks is the pgx counterpart of
+// TestQueue_CompleteRelease_AtomicAcrossChunks: it proves the chunked
+// Complete/Release rolls back entirely when a chunk after the first fails,
+// so the operation is all-or-nothing on PostgreSQL too.
+func TestQueuePG_CompleteRelease_AtomicAcrossChunks(t *testing.T) {
+	ctx := context.Background()
+
+	origChunk := completeReleaseChunkRows
+	completeReleaseChunkRows = 2
+	t.Cleanup(func() { completeReleaseChunkRows = origChunk })
+
+	injected := errors.New("injected mid-batch failure")
+	t.Cleanup(func() { afterChunkHook = nil })
+
+	// --- Complete (DELETE) atomicity ---
+	const n = 5 // 5 ids over chunk size 2 → 3 chunks
+	db := openPGQueueDB(t, n)
+	q := NewQueue(db, pgRebind())
+
+	ids, token, err := q.Claim(ctx, 1, n)
+	require.NoError(t, err, "Claim")
+	require.Len(t, ids, n)
+
+	afterChunkHook = func(int) error { return injected }
+	err = q.Complete(ctx, 1, token, ids)
+	require.Error(t, err, "Complete must surface the injected failure")
+	require.ErrorIs(t, err, injected, "error must wrap the injected cause")
+	afterChunkHook = nil
+
+	var total int
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM pending_embeddings`).Scan(&total))
+	assert.Equal(t, n, total, "failed chunked Complete must delete zero rows (all-or-nothing)")
+
+	require.NoError(t, q.Complete(ctx, 1, token, ids), "retry Complete")
+	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM pending_embeddings`).Scan(&total))
+	assert.Equal(t, 0, total, "clean retry deletes all rows")
+
+	// --- Release (UPDATE) atomicity ---
+	db2 := openPGQueueDB(t, n)
+	q2 := NewQueue(db2, pgRebind())
+
+	ids2, token2, err := q2.Claim(ctx, 1, n)
+	require.NoError(t, err, "Claim (release case)")
+	require.Len(t, ids2, n)
+	require.Equal(t, 0, pgCountAvailable(t, db2), "all claimed before release")
+
+	afterChunkHook = func(int) error { return injected }
+	err = q2.Release(ctx, 1, token2, ids2)
+	require.Error(t, err, "Release must surface the injected failure")
+	require.ErrorIs(t, err, injected, "error must wrap the injected cause")
+	afterChunkHook = nil
+
+	assert.Equal(t, 0, pgCountAvailable(t, db2),
+		"failed chunked Release must clear zero claims (all-or-nothing)")
+
+	require.NoError(t, q2.Release(ctx, 1, token2, ids2), "retry Release")
+	assert.Equal(t, n, pgCountAvailable(t, db2), "clean retry releases all rows")
 }
 
 func TestQueuePG_Complete_AfterReclaim_PreservesNewClaim(t *testing.T) {
