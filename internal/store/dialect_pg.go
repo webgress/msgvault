@@ -223,7 +223,28 @@ func (d *PostgreSQLDialect) LegacyColumnMigrations() []ColumnMigration {
 		{`ALTER TABLE messages ADD COLUMN IF NOT EXISTS delete_batch_id TEXT`, "delete_batch_id"},
 		{`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title TEXT`, "title"},
 		{`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS conversation_type TEXT NOT NULL DEFAULT 'email_thread'`, "conversation_type"},
+		// FTS tsvector column for legacy PG databases created before FTS
+		// support. Inline in schema_pg.sql's CREATE TABLE (a no-op on a
+		// pre-existing table), so without this an upgraded DB never gets the
+		// column and FTS stays unavailable. Its GIN index is created
+		// separately by EnsureFTSIndex AFTER this migration runs. [cr2-10]
+		{`ALTER TABLE messages ADD COLUMN IF NOT EXISTS search_fts TSVECTOR`, "search_fts"},
 	}
+}
+
+// EnsureFTSIndex creates the GIN index on messages.search_fts idempotently.
+// It runs after LegacyColumnMigrations (which adds search_fts on legacy DBs),
+// so the column is guaranteed present. The index is intentionally NOT in
+// schema_pg.sql: that file is Exec'd as one statement before migrations, and
+// a legacy table missing the column would fail the index there and roll back
+// the entire schema apply (cr2-10).
+func (d *PostgreSQLDialect) EnsureFTSIndex(db *sql.DB) error {
+	if _, err := db.Exec(
+		"CREATE INDEX IF NOT EXISTS messages_search_fts_idx ON messages USING GIN (search_fts)",
+	); err != nil {
+		return fmt.Errorf("create messages_search_fts_idx: %w", err)
+	}
+	return nil
 }
 
 // DatabaseSize queries pg_database_size() for the current database.

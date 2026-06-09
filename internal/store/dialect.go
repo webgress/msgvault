@@ -108,6 +108,16 @@ type Dialect interface {
 	// PostgreSQL: TODO (REINDEX / recompute tsvector column).
 	FTSRebuildSchema(db *sql.DB) error
 
+	// EnsureFTSIndex idempotently creates any FTS index that must be created
+	// AFTER LegacyColumnMigrations have added the FTS column. SQLite is a
+	// no-op (its messages_fts virtual table is created via SchemaFTS). For
+	// PostgreSQL it creates the GIN index on messages.search_fts; this lives
+	// here, not in schema_pg.sql, because a legacy PG database missing the
+	// search_fts column would fail the schema-file Exec on the index before
+	// the ADD COLUMN migration could run. Called by InitSchema after
+	// LegacyColumnMigrations. [cr2-10]
+	EnsureFTSIndex(db *sql.DB) error
+
 	// LegacyColumnMigrations returns ALTER TABLE ADD COLUMN statements to
 	// bring older databases up to date with schema columns added over time.
 	// Both dialects return the same logical list, translated to the

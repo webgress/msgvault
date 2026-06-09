@@ -1424,14 +1424,20 @@ func (e *SQLiteEngine) buildSearchQueryParts(ctx context.Context, q *search.Quer
 		conditions = append(conditions, e.dialect.BoolTrueExpr("m.has_attachments"))
 	}
 
-	// Date range filters
+	// Date range filters. Bind time.Time directly rather than a naive
+	// "2006-01-02 15:04:05" string: a formatted, offset-less string compared
+	// against a PG TIMESTAMPTZ column is parsed in the session TimeZone (not
+	// UTC), shifting the boundary under any non-UTC session. pgx encodes
+	// time.Time with an explicit offset (timezone-stable), and go-sqlite3
+	// serializes it to a sortable RFC3339 layout, so SQLite stays correct.
+	// Matches optsToFilterConditions / the store search path. [cr2-9]
 	if q.AfterDate != nil {
 		conditions = append(conditions, "m.sent_at >= ?")
-		args = append(args, q.AfterDate.Format("2006-01-02 15:04:05"))
+		args = append(args, *q.AfterDate)
 	}
 	if q.BeforeDate != nil {
 		conditions = append(conditions, "m.sent_at < ?")
-		args = append(args, q.BeforeDate.Format("2006-01-02 15:04:05"))
+		args = append(args, *q.BeforeDate)
 	}
 
 	// Size filters
