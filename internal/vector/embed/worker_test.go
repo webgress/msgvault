@@ -4,6 +4,7 @@ package embed
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
@@ -1156,6 +1157,97 @@ func TestWorker_DownshiftDrain_CtxCancelMidDrain(t *testing.T) {
 	_, err := w.RunOnce(ctx, f.BuildingGen)
 	requirepkg.ErrorIs(t, err, context.Canceled)
 	assertPending(t, f.VectorsDB, int64(f.BuildingGen), 2)
+}
+
+// embedRunRow captures the embed_runs lifecycle columns for assertions.
+type embedRunRow struct {
+	startedAt int64
+	endedAt   sql.NullInt64
+	claimed   int64
+	succeeded int64
+	failed    int64
+	errText   sql.NullString
+}
+
+// readSingleEmbedRun returns the sole embed_runs row for gen, requiring
+// exactly one to exist.
+func readSingleEmbedRun(t *testing.T, db *sql.DB, gen int64) embedRunRow {
+	t.Helper()
+	var n int
+	requirepkg.NoError(t,
+		db.QueryRow(`SELECT COUNT(*) FROM embed_runs WHERE generation_id = ?`, gen).Scan(&n),
+		"count embed_runs")
+	requirepkg.Equal(t, 1, n, "exactly one embed_runs row must be opened per RunOnce")
+	var r embedRunRow
+	requirepkg.NoError(t,
+		db.QueryRow(`SELECT started_at, ended_at, claimed, succeeded, failed, error
+		               FROM embed_runs WHERE generation_id = ?`, gen).
+			Scan(&r.startedAt, &r.endedAt, &r.claimed, &r.succeeded, &r.failed, &r.errText),
+		"read embed_runs row")
+	return r
+}
+
+// TestWorker_EmbedRun_LifecycleHappyPath asserts that a successful RunOnce
+// opens exactly one embed_runs row and stamps it on exit: started_at set,
+// ended_at non-NULL, error NULL, and counters matching the result.
+func TestWorker_EmbedRun_LifecycleHappyPath(t *testing.T) {
+	f := newWorkerFixture(t, 3)
+	w := NewWorker(WorkerDeps{
+		Backend:   f.Backend,
+		VectorsDB: f.VectorsDB,
+		MainDB:    f.MainDB,
+		Client:    f.FakeClient,
+		BatchSize: 3,
+	})
+	res, err := w.RunOnce(context.Background(), f.BuildingGen)
+	requirepkg.NoError(t, err, "RunOnce")
+
+	r := readSingleEmbedRun(t, f.VectorsDB, int64(f.BuildingGen))
+	assertpkg.Positive(t, r.startedAt, "started_at must be stamped")
+	assertpkg.True(t, r.endedAt.Valid, "ended_at must be stamped on clean exit")
+	assertpkg.False(t, r.errText.Valid, "error must be NULL on success")
+	assertpkg.Equal(t, int64(res.Succeeded), r.succeeded, "succeeded counter")
+	assertpkg.Equal(t, int64(3), r.succeeded, "all three messages embedded")
+}
+
+// TestWorker_EmbedRun_FinalizedOnCancellation pins embed-queue-concurrency-1:
+// even when RunOnce exits because ctx was cancelled mid-drain, the
+// embed_runs row must be finalized (ended_at set, error populated) rather
+// than left open forever. This FAILS against the pre-fix code that ran the
+// finalize UPDATE on the already-cancelled ctx, and PASSES once finalize
+// runs on a detached context.
+func TestWorker_EmbedRun_FinalizedOnCancellation(t *testing.T) {
+	f := newWorkerFixture(t, 3)
+	ctx, cancel := context.WithCancel(context.Background())
+	var singletonCalls int
+	f.FakeClient.OnEmbed = func(inputs []string) ([][]float32, error) {
+		if len(inputs) > 1 {
+			return nil, fmt.Errorf("embed: HTTP 400: %w", ErrPermanent4xx)
+		}
+		singletonCalls++
+		if singletonCalls == 2 {
+			cancel()
+			return nil, context.Canceled
+		}
+		v := make([]float32, 4)
+		v[0] = 1
+		return [][]float32{v}, nil
+	}
+	w := NewWorker(WorkerDeps{
+		Backend:   f.Backend,
+		VectorsDB: f.VectorsDB,
+		MainDB:    f.MainDB,
+		Client:    f.FakeClient,
+		BatchSize: 3,
+	})
+	_, err := w.RunOnce(ctx, f.BuildingGen)
+	requirepkg.ErrorIs(t, err, context.Canceled)
+
+	r := readSingleEmbedRun(t, f.VectorsDB, int64(f.BuildingGen))
+	assertpkg.True(t, r.endedAt.Valid,
+		"ended_at must be stamped even when RunOnce exits via cancellation")
+	assertpkg.True(t, r.errText.Valid,
+		"error must record the cancellation cause, not be left NULL")
 }
 
 func TestWorker_DownshiftDrain_TransientErrorReleasesRemainingAndErrors(t *testing.T) {
