@@ -32,6 +32,15 @@ var (
 	// generation ID that does not exist in index_generations.
 	ErrUnknownGeneration = errors.New("unknown generation")
 
+	// ErrGenerationRetired is returned by Upsert when the target
+	// generation has already been retired. A retired generation's
+	// embeddings may have been deleted (pgvector deletes them so the
+	// shared HNSW graph stays generation-clean), so writing to it would
+	// re-pollute the index and drift message_count. Callers (e.g. a
+	// stale embed worker whose claims were reclaimed) should treat this
+	// as a benign "drop the batch" signal rather than a hard failure.
+	ErrGenerationRetired = errors.New("generation is retired")
+
 	// ErrBuildingInProgress is returned when CreateGeneration is called
 	// while another generation is already being built with a different
 	// fingerprint, so the caller can surface an actionable message
