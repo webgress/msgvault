@@ -171,6 +171,124 @@ func TestQueryEngine_CaseInsensitiveSearch_Subject(t *testing.T) {
 	}
 }
 
+// TestQueryEngine_MultiFromNoDuplication is the real regression guard for
+// the from-side EXISTS conversion (dialect-parity-store-query-1). It builds
+// ONE message that legitimately has TWO 'from' participants sharing both a
+// domain and a display name — the exact shape that a plain 1:N
+// message_recipients JOIN would multiply into two result rows once
+// SELECT DISTINCT was dropped. It asserts that:
+//
+//   - ListMessages under filter.Domain returns exactly one row,
+//   - ListMessages under filter.SenderName returns exactly one row, and
+//   - SubAggregate (which shares buildFilterJoinsAndConditions) counts the
+//     message once, not twice.
+//
+// Runs on whichever backend testutil.NewTestStore selects; setting
+// MSGVAULT_TEST_DB to a postgres:// DSN exercises the PG path too, since
+// NewPostgreSQLEngine wraps the same dialect-parameterized builder.
+func TestQueryEngine_MultiFromNoDuplication(t *testing.T) {
+	require := requirepkg.New(t)
+	st := testutil.NewTestStore(t)
+	src, err := st.GetOrCreateSource("gmail", "multifrom@example.com")
+	require.NoError(err, "GetOrCreateSource")
+	convID, err := st.EnsureConversation(src.ID, "thread-mf", "Thread MF")
+	require.NoError(err, "EnsureConversation")
+
+	// Two distinct 'from' participants that share a domain AND a display
+	// name. A single message will carry both as 'from' rows.
+	const dupDomain = "dup.example"
+	const dupName = "Dup Sender"
+	from1, err := st.EnsureParticipant("first@"+dupDomain, dupName, dupDomain)
+	require.NoError(err, "EnsureParticipant from1")
+	from2, err := st.EnsureParticipant("second@"+dupDomain, dupName, dupDomain)
+	require.NoError(err, "EnsureParticipant from2")
+	// An unrelated message in another domain so aggregates have >1 bucket.
+	otherFrom, err := st.EnsureParticipant("other@other.example", "Other", "other.example")
+	require.NoError(err, "EnsureParticipant other")
+
+	base := time.Date(2024, 7, 1, 9, 0, 0, 0, time.UTC)
+	multiID, err := st.UpsertMessage(&store.Message{
+		ConversationID:  convID,
+		SourceID:        src.ID,
+		SourceMessageID: "gmail-multi-from",
+		MessageType:     "email",
+		SentAt:          sql.NullTime{Time: base, Valid: true},
+		Subject:         sql.NullString{String: "multi from", Valid: true},
+		Snippet:         sql.NullString{String: "snippet", Valid: true},
+		SizeEstimate:    1234,
+	})
+	require.NoError(err, "UpsertMessage multi")
+	// The crux: two 'from' rows on one message, both in dupDomain/dupName.
+	require.NoError(st.ReplaceMessageRecipients(multiID, "from",
+		[]int64{from1, from2}, []string{dupName, dupName}),
+		"ReplaceMessageRecipients two from rows")
+
+	otherID, err := st.UpsertMessage(&store.Message{
+		ConversationID:  convID,
+		SourceID:        src.ID,
+		SourceMessageID: "gmail-other-from",
+		MessageType:     "email",
+		SentAt:          sql.NullTime{Time: base.Add(time.Hour), Valid: true},
+		Subject:         sql.NullString{String: "other from", Valid: true},
+		Snippet:         sql.NullString{String: "snippet", Valid: true},
+		SizeEstimate:    1000,
+	})
+	require.NoError(err, "UpsertMessage other")
+	require.NoError(st.ReplaceMessageRecipients(otherID, "from",
+		[]int64{otherFrom}, []string{"Other"}), "ReplaceMessageRecipients other")
+
+	eng := query.NewEngine(st.DB(), st.IsPostgreSQL())
+	ctx := context.Background()
+
+	t.Run("list_messages_domain", func(t *testing.T) {
+		msgs, err := eng.ListMessages(ctx, query.MessageFilter{
+			SourceID:   &src.ID,
+			Domain:     dupDomain,
+			Sorting:    query.MessageSorting{Field: query.MessageSortByDate, Direction: query.SortDesc},
+			Pagination: query.Pagination{Limit: 50},
+		})
+		requirepkg.NoError(t, err, "ListMessages domain")
+		assertpkg.Len(t, msgs, 1, "multi-from message must appear exactly once under Domain filter")
+		assertpkg.Equal(t, multiID, msgs[0].ID, "the multi-from message")
+	})
+
+	t.Run("list_messages_sender_name", func(t *testing.T) {
+		msgs, err := eng.ListMessages(ctx, query.MessageFilter{
+			SourceID:   &src.ID,
+			SenderName: dupName,
+			Sorting:    query.MessageSorting{Field: query.MessageSortByDate, Direction: query.SortDesc},
+			Pagination: query.Pagination{Limit: 50},
+		})
+		requirepkg.NoError(t, err, "ListMessages sender name")
+		assertpkg.Len(t, msgs, 1, "multi-from message must appear exactly once under SenderName filter")
+		assertpkg.Equal(t, multiID, msgs[0].ID, "the multi-from message")
+	})
+
+	// SubAggregate shares buildFilterJoinsAndConditions. Group by ViewTime
+	// (one bucket per message's year — a single-valued grouping that does
+	// not itself multiply) so the count isolates the Domain filter-join:
+	// the multi-from message must be counted once, not once per 'from' row.
+	t.Run("subaggregate_domain_count", func(t *testing.T) {
+		rows, err := eng.SubAggregate(ctx,
+			query.MessageFilter{SourceID: &src.ID, Domain: dupDomain},
+			query.ViewTime,
+			query.AggregateOptions{
+				TimeGranularity: query.TimeYear,
+				SortField:       query.SortByCount,
+				SortDirection:   query.SortDesc,
+				Limit:           50,
+			},
+		)
+		requirepkg.NoError(t, err, "SubAggregate domain")
+		var total int64
+		for _, r := range rows {
+			total += r.Count
+		}
+		assertpkg.Equal(t, int64(1), total,
+			"Domain sub-filter must count the multi-from message once, not per 'from' row")
+	})
+}
+
 func gmailSourceID(i int) string {
 	return "gmail-msg-" + string(rune('a'+i))
 }

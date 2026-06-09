@@ -327,42 +327,54 @@ func (e *SQLiteEngine) buildFilterJoinsAndConditions(filter MessageFilter, table
 		args = append(args, filter.MessageType)
 	}
 
-	// Sender filter - check both message_recipients (email) and direct sender_id (WhatsApp/chat)
-	// Also checks phone_number for phone-based lookups (e.g., from:+447...)
+	// Sender filter — check both message_recipients (email) and direct sender_id (WhatsApp/chat).
+	// Also checks phone_number for phone-based lookups (e.g., from:+447...).
+	// Uses EXISTS (not a plain JOIN) so a message with multiple 'from' rows is
+	// not multiplied into duplicate result rows.
 	if filter.Sender != "" {
-		joins = append(joins, `
-			LEFT JOIN message_recipients mr_filter_from ON mr_filter_from.message_id = m.id AND mr_filter_from.recipient_type = 'from'
-			LEFT JOIN participants p_filter_from ON p_filter_from.id = mr_filter_from.participant_id
-			LEFT JOIN participants p_direct_sender ON p_direct_sender.id = m.sender_id
-		`)
-		conditions = append(conditions, "(p_filter_from.email_address = ? OR p_filter_from.phone_number = ? OR p_direct_sender.email_address = ? OR p_direct_sender.phone_number = ?)")
+		conditions = append(conditions, `(EXISTS (
+			SELECT 1 FROM message_recipients mr_filter_from
+			JOIN participants p_filter_from ON p_filter_from.id = mr_filter_from.participant_id
+			WHERE mr_filter_from.message_id = m.id
+			  AND mr_filter_from.recipient_type = 'from'
+			  AND (p_filter_from.email_address = ? OR p_filter_from.phone_number = ?)
+		) OR EXISTS (
+			SELECT 1 FROM participants p_direct_sender
+			WHERE p_direct_sender.id = m.sender_id
+			  AND (p_direct_sender.email_address = ? OR p_direct_sender.phone_number = ?)
+		))`)
 		args = append(args, filter.Sender, filter.Sender, filter.Sender, filter.Sender)
 	} else if filter.MatchesEmpty(ViewSenders) {
-		// A message has an "empty sender" only if it has no from-recipient AND no direct sender_id.
-		joins = append(joins, `
-			LEFT JOIN message_recipients mr_filter_from ON mr_filter_from.message_id = m.id AND mr_filter_from.recipient_type = 'from'
-			LEFT JOIN participants p_filter_from ON p_filter_from.id = mr_filter_from.participant_id
-			LEFT JOIN participants p_direct_sender ON p_direct_sender.id = m.sender_id
-		`)
-		conditions = append(conditions, `((mr_filter_from.id IS NULL OR (
-			(p_filter_from.email_address IS NULL OR p_filter_from.email_address = '') AND
-			(p_filter_from.phone_number IS NULL OR p_filter_from.phone_number = '')
-		)) AND m.sender_id IS NULL)`)
+		// A message has an "empty sender" only if it has no from-recipient with a
+		// non-empty email/phone AND no direct sender_id. NOT EXISTS keeps the
+		// predicate message-scoped (no per-from-row multiplication).
+		conditions = append(conditions, `(NOT EXISTS (
+			SELECT 1 FROM message_recipients mr_filter_from
+			JOIN participants p_filter_from ON p_filter_from.id = mr_filter_from.participant_id
+			WHERE mr_filter_from.message_id = m.id
+			  AND mr_filter_from.recipient_type = 'from'
+			  AND (
+			    (p_filter_from.email_address IS NOT NULL AND p_filter_from.email_address != '') OR
+			    (p_filter_from.phone_number IS NOT NULL AND p_filter_from.phone_number != '')
+			  )
+		) AND m.sender_id IS NULL)`)
 	}
 
-	// Sender name filter - check both message_recipients (email) and direct sender_id (WhatsApp/chat)
+	// Sender name filter — check both message_recipients (email) and direct sender_id (WhatsApp/chat).
+	// Uses EXISTS so a message with multiple 'from' rows sharing the queried
+	// display name is not multiplied into duplicate result rows.
 	if filter.SenderName != "" {
-		if filter.Sender == "" && !filter.MatchesEmpty(ViewSenders) {
-			joins = append(joins, `
-				LEFT JOIN message_recipients mr_filter_from ON mr_filter_from.message_id = m.id AND mr_filter_from.recipient_type = 'from'
-				LEFT JOIN participants p_filter_from ON p_filter_from.id = mr_filter_from.participant_id
-				LEFT JOIN participants p_direct_sender ON p_direct_sender.id = m.sender_id
-			`)
-		}
-		conditions = append(conditions, fmt.Sprintf(`(
-			%s = ?
-			OR %s = ?
-		)`, participantNameExpr("p_filter_from"), participantNameExpr("p_direct_sender")))
+		conditions = append(conditions, fmt.Sprintf(`(EXISTS (
+			SELECT 1 FROM message_recipients mr_filter_from
+			JOIN participants p_filter_from ON p_filter_from.id = mr_filter_from.participant_id
+			WHERE mr_filter_from.message_id = m.id
+			  AND mr_filter_from.recipient_type = 'from'
+			  AND %s = ?
+		) OR EXISTS (
+			SELECT 1 FROM participants p_direct_sender
+			WHERE p_direct_sender.id = m.sender_id
+			  AND %s = ?
+		))`, participantNameExpr("p_filter_from"), participantNameExpr("p_direct_sender")))
 		args = append(args, filter.SenderName, filter.SenderName)
 	} else if filter.MatchesEmpty(ViewSenderNames) {
 		// A message has an "empty sender name" only if it has no from-recipient name AND no direct sender_id with a name.
@@ -417,25 +429,28 @@ func (e *SQLiteEngine) buildFilterJoinsAndConditions(filter MessageFilter, table
 		)`, participantNameExpr("p_rn")))
 	}
 
-	// Domain filter
-	// Note: MatchEmptySenderName uses NOT EXISTS (no join), so it doesn't provide p_filter_from.
+	// Domain filter — use EXISTS so a message with multiple 'from' rows sharing
+	// the queried domain is not multiplied into duplicate result rows.
 	if filter.Domain != "" {
-		if filter.Sender == "" && !filter.MatchesEmpty(ViewSenders) && filter.SenderName == "" {
-			joins = append(joins, `
-				JOIN message_recipients mr_filter_from ON mr_filter_from.message_id = m.id AND mr_filter_from.recipient_type = 'from'
-				JOIN participants p_filter_from ON p_filter_from.id = mr_filter_from.participant_id
-			`)
-		}
-		conditions = append(conditions, "p_filter_from.domain = ?")
+		conditions = append(conditions, `EXISTS (
+			SELECT 1 FROM message_recipients mr_filter_from
+			JOIN participants p_filter_from ON p_filter_from.id = mr_filter_from.participant_id
+			WHERE mr_filter_from.message_id = m.id
+			  AND mr_filter_from.recipient_type = 'from'
+			  AND p_filter_from.domain = ?
+		)`)
 		args = append(args, filter.Domain)
 	} else if filter.MatchesEmpty(ViewDomains) {
-		if filter.Sender == "" && !filter.MatchesEmpty(ViewSenders) && filter.SenderName == "" {
-			joins = append(joins, `
-				LEFT JOIN message_recipients mr_filter_from ON mr_filter_from.message_id = m.id AND mr_filter_from.recipient_type = 'from'
-				LEFT JOIN participants p_filter_from ON p_filter_from.id = mr_filter_from.participant_id
-			`)
-		}
-		conditions = append(conditions, "(p_filter_from.domain IS NULL OR p_filter_from.domain = '')")
+		// A message has an "empty domain" only if it has no from-recipient with a
+		// non-empty domain. NOT EXISTS keeps the predicate message-scoped.
+		conditions = append(conditions, `NOT EXISTS (
+			SELECT 1 FROM message_recipients mr_filter_from
+			JOIN participants p_filter_from ON p_filter_from.id = mr_filter_from.participant_id
+			WHERE mr_filter_from.message_id = m.id
+			  AND mr_filter_from.recipient_type = 'from'
+			  AND p_filter_from.domain IS NOT NULL
+			  AND p_filter_from.domain != ''
+		)`)
 	}
 
 	// Label filter — use EXISTS to avoid 1:N join multiplication.
@@ -634,10 +649,15 @@ func (e *SQLiteEngine) executeAggregateQuery(ctx context.Context, query string, 
 func (e *SQLiteEngine) ListMessages(ctx context.Context, filter MessageFilter) ([]MessageSummary, error) {
 	filterJoins, conditions, args := e.buildFilterJoinsAndConditions(filter, "m")
 
-	// Build ORDER BY with validation. Filter joins use EXISTS subqueries
-	// (never plain JOINs) so no row multiplication occurs and SELECT DISTINCT
-	// is not needed. The sender is resolved via a correlated scalar subquery
-	// (LIMIT 1) so messages with multiple 'from' rows produce exactly one result row.
+	// Build ORDER BY with validation. Every structured filter in
+	// buildFilterJoinsAndConditions resolves through an EXISTS / NOT EXISTS
+	// correlated subquery — including the from-side Sender, SenderName and
+	// Domain branches — so the message_recipients/participants 1:N
+	// relationships cannot multiply a message into duplicate result rows, and
+	// SELECT DISTINCT is therefore unnecessary (and avoided per the SQL
+	// guideline: never DISTINCT + JOIN). The displayed sender is resolved via
+	// a correlated scalar subquery (LIMIT 1) so messages with multiple 'from'
+	// rows still produce exactly one result row.
 	var orderBy string
 	switch filter.Sorting.Field {
 	case MessageSortByDate:
