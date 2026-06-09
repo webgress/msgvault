@@ -414,14 +414,36 @@ func (b *Backend) Upsert(ctx context.Context, gen vector.GenerationID, chunks []
 		return nil
 	}
 
+	tx, err := b.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin upsert tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Read the generation's dimension and lifecycle state under a row lock
+	// inside the SAME transaction that writes the embeddings. FOR UPDATE
+	// serializes this Upsert against ActivateGeneration/RetireGeneration,
+	// which UPDATE this same index_generations row in their txs. This closes
+	// the race where a stale worker (whose claims were reclaimed) or an
+	// operator `embeddings retire --force-active` retires+deletes the
+	// generation and the Upsert then re-inserts its vectors into the shared
+	// HNSW graph (re-pollution) and inflates message_count. A retire that
+	// commits first makes this read observe state='retired' and bail; an
+	// Upsert that commits first blocks the retire until done (its subsequent
+	// DELETE then cleans the just-written rows).
 	var dim int
-	err := b.db.QueryRowContext(ctx,
-		`SELECT dimension FROM index_generations WHERE id = $1`, int64(gen)).Scan(&dim)
+	var state string
+	err = tx.QueryRowContext(ctx,
+		`SELECT dimension, state FROM index_generations WHERE id = $1 FOR UPDATE`,
+		int64(gen)).Scan(&dim, &state)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("%w: %d", vector.ErrUnknownGeneration, gen)
 	}
 	if err != nil {
 		return fmt.Errorf("lookup generation %d: %w", gen, err)
+	}
+	if state == string(vector.GenerationRetired) {
+		return fmt.Errorf("%w: %d", vector.ErrGenerationRetired, gen)
 	}
 	for _, c := range chunks {
 		if len(c.Vector) != dim {
@@ -429,12 +451,6 @@ func (b *Backend) Upsert(ctx context.Context, gen vector.GenerationID, chunks []
 				vector.ErrDimensionMismatch, c.MessageID, len(c.Vector), dim)
 		}
 	}
-
-	tx, err := b.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin upsert tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
 
 	// message_count tracks distinct messages, not chunks. Count how many
 	// of the batch's message_ids already have any row in the generation

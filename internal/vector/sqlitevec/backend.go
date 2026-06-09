@@ -448,14 +448,32 @@ func (b *Backend) Upsert(ctx context.Context, gen vector.GenerationID, chunks []
 		return nil
 	}
 
+	tx, err := b.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin upsert tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Read the generation's dimension and lifecycle state inside the write
+	// transaction and refuse to write to a retired generation. SQLite has
+	// no SELECT ... FOR UPDATE, but a write tx serializes against other
+	// writers (Activate/Retire), so this read is consistent for the life of
+	// the upsert. sqlitevec's vec0 PARTITION KEY isolates retired rows so it
+	// does not delete them on retire, making re-pollution impossible here;
+	// the guard is kept for symmetry with the pgvector backend and to
+	// document the invariant that retired generations are immutable.
 	var dim int
-	err := b.db.QueryRowContext(ctx,
-		`SELECT dimension FROM index_generations WHERE id = ?`, int64(gen)).Scan(&dim)
+	var state string
+	err = tx.QueryRowContext(ctx,
+		`SELECT dimension, state FROM index_generations WHERE id = ?`, int64(gen)).Scan(&dim, &state)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("%w: %d", vector.ErrUnknownGeneration, gen)
 	}
 	if err != nil {
 		return fmt.Errorf("lookup generation %d: %w", gen, err)
+	}
+	if state == string(vector.GenerationRetired) {
+		return fmt.Errorf("%w: %d", vector.ErrGenerationRetired, gen)
 	}
 	for _, c := range chunks {
 		if len(c.Vector) != dim {
@@ -463,12 +481,6 @@ func (b *Backend) Upsert(ctx context.Context, gen vector.GenerationID, chunks []
 				vector.ErrDimensionMismatch, c.ChunkIndex, c.MessageID, len(c.Vector), dim)
 		}
 	}
-
-	tx, err := b.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin upsert tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
 
 	// message_count tracks distinct messages, not chunks. Count how
 	// many of the message_ids in this batch already have any row in

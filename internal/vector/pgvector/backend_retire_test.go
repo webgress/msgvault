@@ -23,6 +23,77 @@ func countEmbeddingRows(t *testing.T, b *Backend, gen vector.GenerationID) int {
 	return n
 }
 
+// genMessageCount returns index_generations.message_count for a generation.
+func genMessageCount(t *testing.T, b *Backend, gen vector.GenerationID) int {
+	t.Helper()
+	var n int
+	require.NoError(t, b.db.QueryRowContext(context.Background(),
+		`SELECT message_count FROM index_generations WHERE id = $1`, int64(gen)).Scan(&n),
+		"read message_count for generation %d", gen)
+	return n
+}
+
+// TestBackend_Upsert_RejectsRetiredGeneration pins the cf-1 race guard. After a
+// generation is retired (which deletes its embeddings so the shared HNSW graph
+// stays generation-clean), a stale worker — or `embeddings retire
+// --force-active` racing in-flight claims — must NOT be able to re-insert
+// vectors into it. Upsert now reads dimension+state under FOR UPDATE inside the
+// write tx and aborts with ErrGenerationRetired, leaving zero rows and an
+// unchanged message_count.
+func TestBackend_Upsert_RejectsRetiredGeneration(t *testing.T) {
+	b, ctx, _ := newBackendForTest(t)
+
+	gen := buildGenWithVectors(t, b, "model-a", 4, map[int64][]float32{
+		1: unitVec(4, 0),
+		2: unitVec(4, 1),
+	})
+	require.Equal(t, 2, countEmbeddingRows(t, b, gen), "precondition: vectors present before retire")
+	mcBefore := genMessageCount(t, b, gen)
+	require.Equal(t, 2, mcBefore, "precondition: message_count reflects 2 messages")
+
+	require.NoError(t, b.RetireGeneration(ctx, gen), "RetireGeneration")
+	require.Equal(t, 0, countEmbeddingRows(t, b, gen), "retire deletes the gen's embeddings")
+
+	// A stale worker's Upsert lands AFTER the retire+delete. It must be
+	// rejected with the sentinel and write nothing.
+	err := b.Upsert(ctx, gen, []vector.Chunk{
+		{MessageID: 1, ChunkIndex: 0, Vector: unitVec(4, 0)},
+		{MessageID: 2, ChunkIndex: 0, Vector: unitVec(4, 1)},
+	})
+	require.ErrorIs(t, err, vector.ErrGenerationRetired,
+		"Upsert to a retired generation must fail with ErrGenerationRetired")
+
+	assert.Equal(t, 0, countEmbeddingRows(t, b, gen),
+		"rejected Upsert must not re-pollute the retired generation")
+	assert.Equal(t, mcBefore, genMessageCount(t, b, gen),
+		"rejected Upsert must not drift message_count")
+}
+
+// TestBackend_Upsert_AcceptsBuildingGeneration is the positive control for the
+// cf-1 guard: a normal Upsert to a still-building generation continues to
+// succeed and write rows.
+func TestBackend_Upsert_AcceptsBuildingGeneration(t *testing.T) {
+	b, ctx, db := newBackendForTest(t)
+
+	for _, id := range []int64{1, 2} {
+		_, err := db.ExecContext(ctx,
+			`INSERT INTO messages (id) VALUES ($1) ON CONFLICT DO NOTHING`, id)
+		require.NoErrorf(t, err, "seed message %d", id)
+	}
+	gen, err := b.CreateGeneration(ctx, "model-a", 4, "model-a")
+	require.NoError(t, err, "CreateGeneration")
+
+	require.NoError(t, b.Upsert(ctx, gen, []vector.Chunk{
+		{MessageID: 1, ChunkIndex: 0, Vector: unitVec(4, 0)},
+		{MessageID: 2, ChunkIndex: 0, Vector: unitVec(4, 1)},
+	}), "Upsert to a building generation must succeed")
+
+	assert.Equal(t, 2, countEmbeddingRows(t, b, gen), "building-gen Upsert writes rows")
+	assert.Equal(t, 2, genMessageCount(t, b, gen), "building-gen Upsert bumps message_count")
+	assert.Equal(t, string(vector.GenerationBuilding), genState(t, b, gen),
+		"generation stays building after Upsert")
+}
+
 // genState returns the index_generations.state for a generation.
 func genState(t *testing.T, b *Backend, gen vector.GenerationID) string {
 	t.Helper()
