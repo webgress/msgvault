@@ -391,16 +391,34 @@ func activateGateError(ctx context.Context, tx *sql.Tx, gen vector.GenerationID,
 // active generation's recall. The index_generations row is preserved
 // (state='retired'); only its embeddings are removed. This intentionally
 // differs from sqlitevec, whose vec0 PARTITION KEY isolates retired rows.
-func (b *Backend) RetireGeneration(ctx context.Context, gen vector.GenerationID) error {
+//
+// Unless force is true, the state-flip UPDATE refuses to retire a generation
+// in state='active' (WHERE state != 'active'): if it affects zero rows the
+// active guard tripped, so the tx rolls back returning ErrRefuseRetireActive
+// WITHOUT touching embeddings or pending rows. The guard lives in the same tx
+// as the flip — closing the CLI's pre-flight TOCTOU so a concurrent
+// activation cannot delete the now-serving generation's embeddings without
+// --force-active. force retires unconditionally (operator override).
+func (b *Backend) RetireGeneration(ctx context.Context, gen vector.GenerationID, force bool) error {
 	tx, err := b.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin retire tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE index_generations SET state = 'retired' WHERE id = $1`, int64(gen)); err != nil {
+	// The active-gen guard is the WHERE clause itself: when force is false we
+	// only retire a generation that is NOT active, so a concurrent activation
+	// that flipped gen to active between the caller's pre-flight read and this
+	// statement leaves zero rows affected and we bail out before deleting
+	// anything. force=true drops the guard (true OR ... is always satisfiable).
+	res, err := tx.ExecContext(ctx,
+		`UPDATE index_generations SET state = 'retired'
+		  WHERE id = $1 AND ($2 OR state != 'active')`, int64(gen), force)
+	if err != nil {
 		return fmt.Errorf("retire generation %d: %w", gen, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return retireGateError(ctx, tx, gen, force)
 	}
 	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM embeddings WHERE generation_id = $1`, int64(gen)); err != nil {
@@ -419,6 +437,30 @@ func (b *Backend) RetireGeneration(ctx context.Context, gen vector.GenerationID)
 		return fmt.Errorf("commit retire generation %d: %w", gen, err)
 	}
 	return nil
+}
+
+// retireGateError re-reads gen inside the retire tx to explain why the gated
+// state flip affected zero rows: the generation is active (and force was not
+// passed), it is already retired (idempotent no-op, not an error), or it does
+// not exist. Mirrors activateGateError so the management command gets precise,
+// actionable errors now that the guard lives in the backend.
+func retireGateError(ctx context.Context, tx *sql.Tx, gen vector.GenerationID, force bool) error {
+	var state vector.GenerationState
+	if err := tx.QueryRowContext(ctx,
+		`SELECT state FROM index_generations WHERE id = $1`, int64(gen)).Scan(&state); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: %d", vector.ErrUnknownGeneration, gen)
+		}
+		return fmt.Errorf("lookup generation %d: %w", gen, err)
+	}
+	if state == vector.GenerationActive && !force {
+		return fmt.Errorf("%w: generation %d", vector.ErrRefuseRetireActive, gen)
+	}
+	// A non-active row always matches `state != 'active'`, so the gated UPDATE
+	// would have affected it (a no-op flip still counts as a matched row on
+	// both backends). Reaching here for a non-active, existing generation means
+	// the row vanished mid-tx; surface it rather than reporting a phantom retire.
+	return fmt.Errorf("retire generation %d: state flip affected no rows (state=%q)", gen, state)
 }
 
 // ActiveGeneration returns the current active generation, or

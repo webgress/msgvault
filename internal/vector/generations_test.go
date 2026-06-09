@@ -24,7 +24,7 @@ func (f *fakeBackend) CreateGeneration(context.Context, string, int, string) (Ge
 func (f *fakeBackend) ActivateGeneration(context.Context, GenerationID, bool) error {
 	return errors.New("not implemented")
 }
-func (f *fakeBackend) RetireGeneration(context.Context, GenerationID) error {
+func (f *fakeBackend) RetireGeneration(context.Context, GenerationID, bool) error {
 	return errors.New("not implemented")
 }
 func (f *fakeBackend) ActiveGeneration(context.Context) (Generation, error) {

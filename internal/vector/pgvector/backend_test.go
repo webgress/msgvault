@@ -37,7 +37,7 @@ func TestBackend_CreateActivateRetire(t *testing.T) {
 	assert.Equal(t, vector.GenerationActive, g.State, "State want active")
 	assert.Equal(t, "nomic-embed-text-v1.5:768", g.Fingerprint, "Fingerprint mismatch")
 
-	require.NoError(t, b.RetireGeneration(ctx, gid), "RetireGeneration")
+	require.NoError(t, b.RetireGeneration(ctx, gid, true), "RetireGeneration")
 	_, err = b.ActiveGeneration(ctx)
 	assert.Error(t, err, "ActiveGeneration should error after retire")
 }

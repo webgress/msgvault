@@ -47,6 +47,16 @@ var (
 	// instead of a raw unique-index violation.
 	ErrBuildingInProgress = errors.New("a rebuild with a different fingerprint is already in progress")
 
+	// ErrRefuseRetireActive is returned by RetireGeneration when force is
+	// false and the target generation is in state='active'. Retiring the
+	// serving generation is destructive on backends that delete a retired
+	// generation's embeddings (pgvector), so the backend refuses without an
+	// explicit force (the CLI surfaces this as `--force-active`). The state
+	// guard is enforced atomically inside the retire transaction, so a
+	// concurrent activation between a caller's pre-flight read and the flip
+	// cannot delete the now-serving generation's embeddings.
+	ErrRefuseRetireActive = errors.New("refusing to retire the active (serving) generation without force")
+
 	// ErrGenerationNotBuilding is returned by EnsureSeeded when the
 	// target generation is no longer in state='building' — e.g. a
 	// concurrent activation flipped it to active, or a retire call

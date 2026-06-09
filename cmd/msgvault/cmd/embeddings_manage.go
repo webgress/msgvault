@@ -110,14 +110,19 @@ func runEmbeddingsRetire(cmd *cobra.Command, args []string) error {
 	// Route the state transition through the vector backend so the
 	// delete-on-retire invariant lives in one place (pgvector deletes the
 	// retired generation's embeddings; sqlitevec retains them). The
-	// active/building/retired gating above mirrors what the backend needs;
-	// backend.RetireGeneration itself retires unconditionally.
+	// active-gen preflight above is a friendly fast-fail, but the backend's
+	// RetireGeneration enforces the same guard ATOMICALLY inside the retire
+	// transaction: when force is false it refuses to retire a generation that
+	// is state='active' (returning vector.ErrRefuseRetireActive) WITHOUT
+	// deleting embeddings — so a concurrent activation between the preflight
+	// read and this call cannot delete the now-serving generation's
+	// embeddings. We pass --force-active as force to bypass the gate.
 	backend, closeBackend, err := openEmbeddingsBackend(cmd.Context())
 	if err != nil {
 		return err
 	}
 	defer closeBackend()
-	if err := backend.RetireGeneration(cmd.Context(), gen); err != nil {
+	if err := backend.RetireGeneration(cmd.Context(), gen, embeddingsRetireForceActive); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Generation %d retired.\n", gen)

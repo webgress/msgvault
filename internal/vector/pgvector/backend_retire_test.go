@@ -77,7 +77,7 @@ func TestBackend_Upsert_RejectsRetiredGeneration(t *testing.T) {
 	mcBefore := genMessageCount(t, b, gen)
 	require.Equal(t, 2, mcBefore, "precondition: message_count reflects 2 messages")
 
-	require.NoError(t, b.RetireGeneration(ctx, gen), "RetireGeneration")
+	require.NoError(t, b.RetireGeneration(ctx, gen, false), "RetireGeneration")
 	require.Equal(t, 0, countEmbeddingRows(t, b, gen), "retire deletes the gen's embeddings")
 
 	// A stale worker's Upsert lands AFTER the retire+delete. It must be
@@ -172,7 +172,7 @@ func TestBackend_RetireGeneration_DeletesEmbeddings(t *testing.T) {
 	})
 	require.Equal(t, 3, countEmbeddingRows(t, b, gen), "precondition: vectors present before retire")
 
-	require.NoError(t, b.RetireGeneration(ctx, gen), "RetireGeneration")
+	require.NoError(t, b.RetireGeneration(ctx, gen, false), "RetireGeneration")
 
 	assert.Equal(t, 0, countEmbeddingRows(t, b, gen),
 		"retired generation's embedding rows must be deleted")
@@ -263,12 +263,71 @@ func TestBackend_RetireGeneration_CleansPending(t *testing.T) {
 	seedPending(t, b, gen, 11)
 	require.Equal(t, 2, countPendingRows(t, b, gen), "precondition: pending rows present")
 
-	require.NoError(t, b.RetireGeneration(ctx, gen), "RetireGeneration")
+	require.NoError(t, b.RetireGeneration(ctx, gen, false), "RetireGeneration")
 
 	assert.Equal(t, 0, countPendingRows(t, b, gen),
 		"retire must delete the generation's pending_embeddings rows")
 	assert.Equal(t, string(vector.GenerationRetired), genState(t, b, gen),
 		"index_generations row must remain, flipped to retired")
+}
+
+// TestBackend_RetireGeneration_ActiveGuard pins the retire-TOCTOU
+// class-closing fix: the active-gen guard lives ATOMICALLY inside
+// RetireGeneration's tx (mirroring ActivateGeneration's force gate). On
+// pgvector, retire DELETES the generation's embeddings (shared HNSW graph) and
+// reaps its pending rows — so refusing the active generation without force is
+// what prevents a concurrent activation from wiping the now-serving graph.
+//   - force=false against the ACTIVE generation is refused with
+//     ErrRefuseRetireActive, leaving state='active' and BOTH its embeddings and
+//     pending rows untouched.
+//   - force=true retires the active generation, deleting embeddings + pending.
+//   - force=false against a NON-active (building) generation retires fine.
+func TestBackend_RetireGeneration_ActiveGuard(t *testing.T) {
+	b, ctx, _ := newBackendForTest(t)
+
+	genA := buildGenWithVectors(t, b, "model-a", 4, map[int64][]float32{
+		1: unitVec(4, 0),
+		2: unitVec(4, 1),
+	})
+	require.NoError(t, b.ActivateGeneration(ctx, genA, true), "activate A")
+	// Leave an undrained pending row on the active gen.
+	seedPending(t, b, genA, 30)
+	require.Equal(t, 2, countEmbeddingRows(t, b, genA), "precondition: A has embeddings")
+	require.Equal(t, 1, countPendingRows(t, b, genA), "precondition: A has a pending row")
+	require.Equal(t, string(vector.GenerationActive), genState(t, b, genA), "precondition: A active")
+
+	// (1) Non-forced retire of the ACTIVE gen is refused atomically: sentinel
+	// error, state unchanged, and NEITHER embeddings NOR pending rows deleted.
+	err := b.RetireGeneration(ctx, genA, false)
+	require.ErrorIs(t, err, vector.ErrRefuseRetireActive,
+		"non-forced retire of active gen must return ErrRefuseRetireActive")
+	assert.Equal(t, string(vector.GenerationActive), genState(t, b, genA),
+		"refused retire must leave the active gen's state unchanged")
+	assert.Equal(t, 2, countEmbeddingRows(t, b, genA),
+		"refused retire must NOT delete the active gen's embeddings")
+	assert.Equal(t, 1, countPendingRows(t, b, genA),
+		"refused retire must NOT reap the active gen's pending rows")
+
+	// (2) Forced retire succeeds: state flips to retired, embeddings deleted,
+	// pending reaped.
+	require.NoError(t, b.RetireGeneration(ctx, genA, true),
+		"forced retire of active gen must succeed")
+	assert.Equal(t, string(vector.GenerationRetired), genState(t, b, genA),
+		"forced retire flips state to retired")
+	assert.Equal(t, 0, countEmbeddingRows(t, b, genA),
+		"forced retire deletes the gen's embeddings")
+	assert.Equal(t, 0, countPendingRows(t, b, genA),
+		"forced retire reaps the gen's pending rows")
+
+	// (3) A NON-active (building) generation retires fine without force.
+	genB := buildGenWithVectors(t, b, "model-b", 4, map[int64][]float32{
+		3: unitVec(4, 2),
+	})
+	require.Equal(t, string(vector.GenerationBuilding), genState(t, b, genB), "precondition: B building")
+	require.NoError(t, b.RetireGeneration(ctx, genB, false),
+		"non-forced retire of a non-active gen must succeed")
+	assert.Equal(t, string(vector.GenerationRetired), genState(t, b, genB),
+		"non-active gen retires to retired without force")
 }
 
 // TestBackend_ActivateGeneration_AutoRetireCleansPending pins the
