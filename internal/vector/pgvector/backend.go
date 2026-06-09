@@ -641,7 +641,11 @@ func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec 
 			 GROUP BY ann.message_id
 			 ORDER BY distance
 			 LIMIT $4`, dim, store.LiveMessagesWhere("m", true))
-		return searchWiden(k, chunkCeiling, func(innerLimit int) ([]vector.Hit, error) {
+		// Empty-filter path: the candidate universe is the whole
+		// generation, so the inner-LIMIT ceiling is the generation chunk
+		// count and there is no separate distinct-message early exit
+		// (passing k makes that check a no-op beyond len(hits) >= k).
+		return searchWiden(k, chunkCeiling, k, func(innerLimit int) ([]vector.Hit, error) {
 			return b.scanHits(ctx, stmt, queryVecLit, int64(gen), innerLimit, k)
 		})
 	}
@@ -657,11 +661,27 @@ func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec 
 	// message-ID set, so we use the same inner-subquery shape for
 	// consistency but accept a sequential scan within the filtered set.
 	// The inner ORDER BY <=> LIMIT still short-circuits on chunk count.
-	// The widening loop mirrors the empty-filter path so a multi-chunk
-	// filtered universe still reaches k distinct messages; the candidate
-	// ceiling is the filtered set size (capped at chunkCeiling) so a
-	// selective filter does not drive the loop to the full generation.
-	filteredCeiling := min(len(ids), chunkCeiling)
+	// The widening loop mirrors the empty-filter (and sqlitevec) pattern
+	// so a multi-chunk filtered universe still reaches k distinct
+	// messages.
+	//
+	// The inner LIMIT counts CHUNKS, so the loop ceiling must be a CHUNK
+	// count, not a message count. Using min(len(ids), chunkCeiling) — a
+	// MESSAGE count — would under-shoot on multi-chunk filtered corpora:
+	// the inner LIMIT would saturate at the message count before the
+	// GROUP BY surfaced k distinct messages, short-returning (the exact
+	// failure sqlitevec's comment warns against). Bound the loop by the
+	// CHUNK count of the filtered set instead, and use the DISTINCT
+	// filtered-message count (messages with a chunk in this generation)
+	// only as an early exit so a selective filter does not drive the loop
+	// to the full generation.
+	filteredChunks, filteredMessages, err := b.filteredChunkAndMessageCount(ctx, gen, ids)
+	if err != nil {
+		return nil, err
+	}
+	if filteredChunks == 0 {
+		return nil, nil
+	}
 	stmt := fmt.Sprintf(`
 		SELECT ann.message_id,
 		       MIN(ann.distance) AS distance
@@ -679,9 +699,30 @@ func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec 
 		 ORDER BY distance
 		 LIMIT $6`, dim, dim)
 	idArr := int64Array(ids)
-	return searchWiden(k, filteredCeiling, func(innerLimit int) ([]vector.Hit, error) {
+	return searchWiden(k, filteredChunks, filteredMessages, func(innerLimit int) ([]vector.Hit, error) {
 		return b.scanHits(ctx, stmt, queryVecLit, int64(gen), int64(dim), idArr, innerLimit, k)
 	})
+}
+
+// filteredChunkAndMessageCount returns, for the given generation and
+// filtered message-ID set, (a) the number of embedding CHUNKS belonging
+// to those messages and (b) the number of DISTINCT messages among them
+// that actually have a chunk in the generation. The chunk count is the
+// inner-LIMIT ceiling for the filtered widening loop (the LIMIT counts
+// chunks); the distinct-message count is the early exit. Both come from a
+// single scan over the gen+message index.
+func (b *Backend) filteredChunkAndMessageCount(ctx context.Context, gen vector.GenerationID, ids []int64) (chunks, messages int, err error) {
+	if len(ids) == 0 {
+		return 0, 0, nil
+	}
+	if err := b.db.QueryRowContext(ctx,
+		`SELECT COUNT(*), COUNT(DISTINCT message_id)
+		   FROM embeddings
+		  WHERE generation_id = $1 AND message_id = ANY($2::bigint[])`,
+		int64(gen), int64Array(ids)).Scan(&chunks, &messages); err != nil {
+		return 0, 0, fmt.Errorf("lookup filtered chunk count: %w", err)
+	}
+	return chunks, messages, nil
 }
 
 // chunkCount returns the number of embedding rows in the generation.
@@ -699,11 +740,28 @@ func (b *Backend) chunkCount(ctx context.Context, gen vector.GenerationID) (int,
 
 // searchWiden runs the inner ANN scan with a doubling inner LIMIT until
 // at least k distinct messages survive the outer GROUP BY dedup, the
-// candidate ceiling is reached, or no further widening is possible.
-// Mirrors sqlitevec.Search's widening loop. The common single-chunk case
-// is satisfied by the first fetch (k*annOverFetchFactor) so it stays a
-// single query; only multi-chunk corpora trigger additional passes.
-func searchWiden(k, ceiling int, run func(innerLimit int) ([]vector.Hit, error)) ([]vector.Hit, error) {
+// distinct-message early exit is reached, the candidate ceiling is
+// reached, or no further widening is possible. Mirrors sqlitevec.Search's
+// widening loop. The common single-chunk case is satisfied by the first
+// fetch (k*annOverFetchFactor) so it stays a single query; only
+// multi-chunk corpora trigger additional passes.
+//
+// ceiling counts CHUNKS (the inner LIMIT operates on embedding rows): it
+// is the chunk count of the candidate universe (the whole generation for
+// the empty-filter path, or just the filtered set for the filtered path)
+// and bounds the inner LIMIT so the loop always terminates. Passing a
+// MESSAGE count here would under-shoot on multi-chunk corpora — the inner
+// LIMIT would saturate before the GROUP BY has surfaced k distinct
+// messages — which is the bug sqlitevec's own comment warns against.
+//
+// distinctEarlyExit counts distinct MESSAGES that can possibly appear in
+// the result (e.g. distinct filtered messages that have a chunk in this
+// generation). It is an early exit only: once len(hits) reaches it, every
+// candidate message is already in the result with its best-distance
+// chunk, so further widening cannot change the answer. For the
+// empty-filter path it equals k, making the check a no-op beyond the
+// existing len(hits) >= k condition.
+func searchWiden(k, ceiling, distinctEarlyExit int, run func(innerLimit int) ([]vector.Hit, error)) ([]vector.Hit, error) {
 	innerLimit := max(k*annOverFetchFactor, k)
 	for {
 		if innerLimit > ceiling {
@@ -713,7 +771,7 @@ func searchWiden(k, ceiling int, run func(innerLimit int) ([]vector.Hit, error))
 		if err != nil {
 			return nil, err
 		}
-		if len(hits) >= k || innerLimit >= ceiling {
+		if len(hits) >= k || len(hits) >= distinctEarlyExit || innerLimit >= ceiling {
 			if len(hits) > k {
 				hits = hits[:k]
 			}
