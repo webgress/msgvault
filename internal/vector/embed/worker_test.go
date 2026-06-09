@@ -14,6 +14,8 @@ import (
 
 	assertpkg "github.com/stretchr/testify/assert"
 	requirepkg "github.com/stretchr/testify/require"
+
+	"go.kenn.io/msgvault/internal/vector"
 )
 
 func TestDerivedStaleThreshold(t *testing.T) {
@@ -1248,6 +1250,110 @@ func TestWorker_EmbedRun_FinalizedOnCancellation(t *testing.T) {
 		"ended_at must be stamped even when RunOnce exits via cancellation")
 	assertpkg.True(t, r.errText.Valid,
 		"error must record the cancellation cause, not be left NULL")
+}
+
+// retiredUpsertBackend wraps a real vector.Backend but forces every
+// Upsert to return vector.ErrGenerationRetired, simulating a generation
+// that was retired out from under a stale worker mid-run. All other
+// methods delegate to the embedded backend.
+type retiredUpsertBackend struct {
+	vector.Backend
+}
+
+func (b retiredUpsertBackend) Upsert(_ context.Context, gen vector.GenerationID, _ []vector.Chunk) error {
+	return fmt.Errorf("%w: %d", vector.ErrGenerationRetired, gen)
+}
+
+// TestWorker_RetiredGenerationDrainsWithoutHardError pins
+// concurrency-locks-1/2: when Backend.Upsert returns
+// vector.ErrGenerationRetired, the worker must treat it as a benign
+// "drop the batch" signal — NOT a hard failure. RunOnce must return nil,
+// the queue must fully drain (the retired rows are token-dropped via
+// Complete), and the embedding client must be invoked at most once per
+// batch (no re-embed loop burning API cost up to MaxConsecutiveFailures).
+//
+// Revert-proof: without the ErrGenerationRetired guards in RunOnce's
+// Upsert path, the worker would Release the rows, re-Claim them, and
+// re-embed identically until MaxConsecutiveFailures, then return a
+// spurious "embed worker aborting" error — failing both the nil-error
+// and the embed-call-count assertions.
+func TestWorker_RetiredGenerationDrainsWithoutHardError(t *testing.T) {
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	ctx := context.Background()
+	f := newWorkerFixture(t, 3)
+
+	var embedCalls int
+	f.FakeClient.OnEmbed = func(inputs []string) ([][]float32, error) {
+		embedCalls++
+		out := make([][]float32, len(inputs))
+		for i := range inputs {
+			v := make([]float32, 4)
+			v[0] = 1
+			out[i] = v
+		}
+		return out, nil
+	}
+
+	w := NewWorker(WorkerDeps{
+		Backend:                retiredUpsertBackend{Backend: f.Backend},
+		VectorsDB:              f.VectorsDB,
+		MainDB:                 f.MainDB,
+		Client:                 f.FakeClient,
+		BatchSize:              1, // one message per batch → at most one embed call each
+		MaxConsecutiveFailures: 5,
+	})
+
+	res, err := w.RunOnce(ctx, f.BuildingGen)
+	require.NoError(err, "RunOnce must return nil for a retired generation (benign drop)")
+	assert.Equal(0, res.Failed, "retired-generation drop must not count as a failure")
+	assert.Equal(0, res.Succeeded, "nothing was actually embedded (rows dropped)")
+
+	// Queue fully drained: every retired row was token-dropped via Complete.
+	assert.Equal(0, countAvailable(t, f.VectorsDB, int64(f.BuildingGen)), "available after drain")
+	assertPending(t, f.VectorsDB, int64(f.BuildingGen), 0)
+
+	// At most one embed call per batch (3 messages, BatchSize=1 → exactly 3).
+	// Without the guard the worker would re-embed each row up to
+	// MaxConsecutiveFailures times before aborting.
+	assert.LessOrEqualf(embedCalls, 3, "embed client invoked %d times; expected <= 1 per batch (no re-embed loop)", embedCalls)
+}
+
+// TestWorker_RetiredGenerationDrainsViaDownshift covers the downshift
+// drain arm of concurrency-locks-2: a multi-message batch trips
+// ErrPermanent4xx (forcing the singleton downshift), each singleton then
+// embeds fine but Upsert returns ErrGenerationRetired. The drain must
+// treat the retired generation as a benign drop (token-drop + continue)
+// rather than wrapping it into a non-4xx error that hard-aborts RunOnce.
+func TestWorker_RetiredGenerationDrainsViaDownshift(t *testing.T) {
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	ctx := context.Background()
+	f := newWorkerFixture(t, 3)
+
+	f.FakeClient.OnEmbed = func(inputs []string) ([][]float32, error) {
+		if len(inputs) > 1 {
+			// Force the downshift to BatchSize=1.
+			return nil, fmt.Errorf("embed: HTTP 400: too long: %w", ErrPermanent4xx)
+		}
+		v := make([]float32, 4)
+		v[0] = 1
+		return [][]float32{v}, nil
+	}
+
+	w := NewWorker(WorkerDeps{
+		Backend:                retiredUpsertBackend{Backend: f.Backend},
+		VectorsDB:              f.VectorsDB,
+		MainDB:                 f.MainDB,
+		Client:                 f.FakeClient,
+		BatchSize:              3, // multi-message batch → 4xx → downshift
+		MaxConsecutiveFailures: 5,
+	})
+
+	res, err := w.RunOnce(ctx, f.BuildingGen)
+	require.NoError(err, "RunOnce must return nil when the generation is retired mid-drain")
+	assert.Equal(0, res.Succeeded, "nothing durably embedded (rows dropped)")
+	assertPending(t, f.VectorsDB, int64(f.BuildingGen), 0)
 }
 
 func TestWorker_DownshiftDrain_TransientErrorReleasesRemainingAndErrors(t *testing.T) {
