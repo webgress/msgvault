@@ -115,6 +115,8 @@ branch:
 | 2 | FTS weight parity (SQLite ↔ PG) | `SQLiteDialect.FTSSearchClause()` now orders by `bm25(messages_fts, 1.0, 10.0, 1.0, 4.0, 1.0, 1.0)` — weights are positional over every declared FTS5 column (the leading 1.0 is the slot for `message_id UNINDEXED`; the rest map to subject, body, from, to, cc). The 10:4:1 ratio across subject/sender/body mirrors PostgreSQL's `setweight 'A'=1.0 / 'B'=0.4 / 'D'=0.1`, so subject-only matches outrank sender-only, which outrank body-only on both backends. Verified by `TestFTSRankWeightsAcrossBackends` (runs on both SQLite and PG via `MSGVAULT_TEST_DB`). |
 | 3 | Deletion execution path on PostgreSQL | `internal/deletion/executor_e2e_test.go` exercises the full staged-deletion → mock Gmail → store pipeline on a multi-source, multi-attachment corpus. Covered: trash-mode soft delete (`deleted_from_source_at` set, source isolation), permanent-mode row deletion with `ON DELETE CASCADE` of attachment rows, batch-mode cross-source `IN (...)` UPDATEs (`MarkMessagesDeletedByGmailIDBatch`), and post-delete `AttachmentPathsUniqueToSource` consistency. Runs unchanged on both backends via `MSGVAULT_TEST_DB`. |
 | 4 | Attachment storage paths on PostgreSQL | `internal/store/attachment_e2e_test.go` exercises the multi-message / multi-source attachment lifecycle: intra-source dedup (idempotent `UpsertAttachment`), `ON DELETE CASCADE` from `messages` to `attachments`, cross-source `AttachmentPathsUniqueToSource` promotion when one source is removed, the full orphan-cleanup pipeline (`AttachmentPathsUniqueToSource` → `RemoveSourceSerialized` → `IsAttachmentPathReferenced`), and exclusion of NULL-hash / empty-path rows. The query helpers route through `Store.Rebind` so `?` placeholders are translated for PG. |
+| 5 | embed.Queue / pipeline portability | `internal/vector/embed/queue.go` is portable: it uses `?` placeholders run through `rebind`, a chunked multi-row `VALUES` enqueue (`enqueue.go`; the old SQLite-only `json_each` path is gone), and `FOR UPDATE SKIP LOCKED` for safe concurrent claims on PG. The full worker loop (claim/complete) runs on PostgreSQL; covered by `internal/vector/embed/queue_pg_test.go` and `worker_pg_test.go` against a live DSN. |
+| 6 | FusedSearch on pgvector | `pgvector.Backend` implements `vector.FusingBackend` (compile-time assertion at `internal/vector/pgvector/fused.go:20`) via a single-query hybrid CTE combining `ts_rank_cd` and the `<=>` cosine operator. `hybrid.NewEngine` selects it automatically, so PostgreSQL takes the native fused path — identical in shape to sqlitevec. |
 
 The pgvector backend covers `CreateGeneration`, `ActivateGeneration`,
 `RetireGeneration`, `Active/BuildingGeneration`, `Upsert`, `Search`,
@@ -125,23 +127,15 @@ The per-dimension HNSW cosine index is created lazily by
 guard so generations of different dimensions can coexist in the same
 `embeddings` table.
 
-Not yet handled by PR4a:
-
-- **embed.Queue portability**: `internal/vector/embed/queue.go` still uses
-  SQLite-only constructs (`json_each(?)`, `?` placeholders). Until that is
-  ported, the full embed pipeline (worker loop, claim/complete) on
-  PostgreSQL is not yet functional even though the backend interface is.
-  The pgvector `Backend` itself is fully usable in tests and in any code
-  path that bypasses the embed.Queue.
-- **FusedSearch on pgvector**: `hybrid.NewEngine` checks for the optional
-  `vector.FusingBackend`; pgvector currently implements only `Backend`,
-  so PostgreSQL hybrid search falls back to the two-query path (BM25 +
-  ANN run separately). A native fused CTE that combines `ts_rank_cd` and
-  `embedding <=> $query` in one statement is a follow-up.
-
 ## Remaining for PR4
 
-- **embed.Queue portability** (see PR4a notes above).
+Nothing outstanding for the vector pipeline: the pgvector backend, the
+portable embed.Queue / worker loop, and native FusedSearch are all
+implemented and covered by live-PG tests (see items 5–6 above). Note there
+is no "two-query fallback" path anywhere in the engine — `hybrid.NewEngine`
+requires a `vector.FusingBackend` and returns an error if the backend does
+not implement it (`internal/vector/hybrid/engine.go`); both concrete
+backends do, so the native fused path always runs.
 
 ## Running Tests Against PostgreSQL
 

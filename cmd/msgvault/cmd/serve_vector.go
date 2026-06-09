@@ -16,14 +16,24 @@ import (
 	"go.kenn.io/msgvault/internal/vector/sqlitevec"
 )
 
-// setupVectorFeatures opens vectors.db and builds the vector backend,
-// hybrid engine, embed worker, and enqueuer used by the serve daemon
-// and the MCP command. Returns (nil, nil) when cfg.Vector.Enabled is
-// false. The returned Close function must be called on shutdown.
+// setupVectorFeatures builds the vector backend, hybrid engine, embed
+// worker, and enqueuer used by the serve daemon and the MCP command. The
+// backend is dialect-selected from mainPath: a postgres:// DSN uses the
+// pgvector backend sharing mainDB (no separate vectors.db, no ATTACH);
+// otherwise the sqlitevec backend opens/attaches vectors.db. Returns
+// (nil, nil) when cfg.Vector.Enabled is false. The returned Close function
+// must be called on shutdown.
 //
-// mainDB is the already-opened handle to msgvault.db; mainPath is the
-// filesystem path used by FusedSearch to ATTACH vectors.db on a fresh
-// connection.
+// mainDB is the already-opened handle to the main database. On SQLite,
+// mainPath is the msgvault.db filesystem path FusedSearch uses to ATTACH
+// vectors.db; on PostgreSQL it is the DSN, used only for dialect detection
+// (store.IsPostgresURL).
+//
+// readOnly skips schema migration on the PostgreSQL backend
+// (pgvector.Options.SkipMigrate); set it true when mainDB is a read-only
+// connection — e.g. the MCP server — so CREATE EXTENSION / DDL are not
+// attempted (PostgreSQL rejects them with SQLSTATE 25006). Ignored on
+// SQLite.
 func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string, readOnly bool) (*vectorFeatures, error) {
 	if !cfg.Vector.Enabled {
 		return nil, nil //nolint:nilnil // vector disabled: callers nil-check vf; (nil, nil) means "no features, no error"

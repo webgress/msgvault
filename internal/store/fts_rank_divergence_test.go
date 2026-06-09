@@ -34,8 +34,8 @@ var longPadding = strings.Repeat("alpha beta gamma delta epsilon ", 600)
 // and serves as a regression net against either backend's scoring model
 // silently changing.
 //
-// This is EXPECTED BEHAVIOR, not a bug. See the "FTS rank ordering"
-// entry under docs/PG_STATUS.md "Remaining for PR4":
+// This is EXPECTED BEHAVIOR, not a bug. See docs/search-ranking.md
+// ("Where the two diverge"):
 //
 //   - SQLite's bm25() applies Okapi BM25 document-length normalization.
 //     A long subject-hit document is penalised so heavily that a short
@@ -49,7 +49,7 @@ var longPadding = strings.Repeat("alpha beta gamma delta epsilon ", 600)
 // approximation of PG's field priority for normal-length emails; they are
 // NOT a strict cross-backend parity contract. If either backend's score
 // model changes in a way that flips the ordering recorded below, this
-// test fails and the divergence claim in docs/PG_STATUS.md must be
+// test fails and the divergence claim in docs/search-ranking.md must be
 // re-evaluated.
 //
 // Corpus shape (per the adversarial review of PR #337):
@@ -129,7 +129,7 @@ func assertSQLiteBodyHitWins(t *testing.T) {
 				"  subject-hit id=%d, body-hit id=%d\n"+
 				"BM25 length normalization should make the short body-hit "+
 				"outrank the long subject-hit. If this is no longer true, "+
-				"update the docs/PG_STATUS.md FTS rank ordering entry to match the new behavior.",
+				"update docs/search-ranking.md (\"Where the two diverge\") to match the new behavior.",
 			gotFirst, gotSecond, wantFirst, wantSecond,
 			subjectHitID, bodyHitID,
 		)
@@ -193,7 +193,7 @@ ORDER BY score DESC`
 				"ts_rank() called without a normalization flag must not apply "+
 				"document-length normalization, so setweight('A') on subject "+
 				"should beat default 'D' on body. If this is no longer true, "+
-				"update the docs/PG_STATUS.md FTS rank ordering entry to match the new behavior.",
+				"update docs/search-ranking.md (\"Where the two diverge\") to match the new behavior.",
 			order, scores,
 		)
 	}
