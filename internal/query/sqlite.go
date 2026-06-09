@@ -305,7 +305,10 @@ func sortClause(opts AggregateOptions) (string, error) {
 // Returns joinClauses (already joined by \n), conditions (slice), and args.
 // This is used for SubAggregate to apply drill-down filters before sub-grouping.
 func (e *SQLiteEngine) buildFilterJoinsAndConditions(filter MessageFilter, tableAlias string) (string, []string, []any) {
-	var joins []string
+	// Every structured filter below resolves through an EXISTS / NOT EXISTS
+	// correlated subquery, so this builder emits no JOIN of its own. The
+	// empty join slot is preserved in the return shape because callers
+	// (SubAggregate) concatenate the search-side FTS join onto it.
 	var conditions []string
 	var args []any
 
@@ -515,7 +518,7 @@ func (e *SQLiteEngine) buildFilterJoinsAndConditions(filter MessageFilter, table
 		args = append(args, filter.TimeRange.Period)
 	}
 
-	return strings.Join(joins, "\n"), conditions, args
+	return "", conditions, args
 }
 
 // SubAggregate performs aggregation on a filtered subset of messages.
@@ -597,21 +600,14 @@ func (e *SQLiteEngine) buildAggregateSearchParts(
 		q.Labels = nil
 	}
 
-	searchConds, searchArgs, searchJns, ftsJoin :=
+	searchConds, searchArgs, ftsJoin :=
 		e.buildSearchQueryParts(ctx, q)
 	conditions = append(conditions, searchConds...)
 	args = append(args, searchArgs...)
-	var joinParts []string
-	if ftsJoin != "" {
-		joinParts = append(joinParts, ftsJoin)
-	}
-	joinParts = append(joinParts, searchJns...)
 
-	var joins string
-	if len(joinParts) > 0 {
-		joins = strings.Join(joinParts, "\n")
-	}
-	return joins, conditions, args
+	// The only join buildSearchQueryParts emits is the optional FTS join;
+	// all structured filters are EXISTS subqueries.
+	return ftsJoin, conditions, args
 }
 
 // executeAggregate is the shared implementation for Aggregate and SubAggregate.
@@ -975,11 +971,10 @@ func (e *SQLiteEngine) GetTotalStats(ctx context.Context, opts StatsOptions) (*T
 	// Build search conditions when SearchQuery is set.
 	var searchConditions []string
 	var searchArgs []any
-	var searchJoins []string
 	var searchFTSJoin string
 	if opts.SearchQuery != "" {
 		q := search.Parse(opts.SearchQuery)
-		searchConditions, searchArgs, searchJoins, searchFTSJoin = e.buildSearchQueryParts(ctx, q)
+		searchConditions, searchArgs, searchFTSJoin = e.buildSearchQueryParts(ctx, q)
 	}
 
 	// Build WHERE clause for messages — always use m. prefix since we alias
@@ -1008,19 +1003,18 @@ func (e *SQLiteEngine) GetTotalStats(ctx context.Context, opts StatsOptions) (*T
 		whereClause = strings.Join(conditions, " AND ")
 	}
 
-	// Build join clause for search
+	// Build join clause for search. buildSearchQueryParts only ever emits
+	// the optional FTS join (every structured filter is an EXISTS
+	// subquery), so the FTS join is the sole join template here.
 	joinClause := ""
 	if searchFTSJoin != "" {
 		joinClause += searchFTSJoin + "\n"
 	}
-	if len(searchJoins) > 0 {
-		joinClause += strings.Join(searchJoins, "\n")
-	}
 
-	// Message stats — when search joins are present (e.g. FTS JOIN), use a
-	// subquery so the outer COUNT sees only messages rows. The search joins
-	// from buildSearchQueryParts are all EXISTS-based (no 1:N multiplication);
-	// the FTS JOIN is 1:1. SELECT without DISTINCT is correct and avoids the
+	// Message stats — when the FTS join is present, use a subquery so the
+	// outer COUNT sees only messages rows. The FTS JOIN is 1:1, and the
+	// search filters from buildSearchQueryParts are all EXISTS-based (no
+	// 1:N multiplication). SELECT without DISTINCT is correct and avoids the
 	// PostgreSQL restriction that bans SELECT DISTINCT in subqueries with ORDER BY.
 	var msgQuery string
 	if joinClause != "" {
@@ -1305,18 +1299,16 @@ func (e *SQLiteEngine) SearchByDomains(ctx context.Context, domains []string, af
 		limit = 1000
 	}
 
-	return e.executeSearchQuery(ctx, conditions, args, nil, "", limit, offset)
+	return e.executeSearchQuery(ctx, conditions, args, "", limit, offset)
 }
 
 // Search performs a Gmail-style search query.
-// buildSearchQueryParts builds the WHERE conditions, args, joins, and FTS join
+// buildSearchQueryParts builds the WHERE conditions, args, and FTS join
 // for a search query. This is shared between Search and SearchFastCount.
-// joins is a reserved slot in the returned tuple that executeSearchQuery's
-// shared SELECT template interpolates; current filters emit none, but the shape
-// stays uniform with executeSearchQuery's signature.
-//
-//nolint:unparam // joins slot kept for uniformity with executeSearchQuery
-func (e *SQLiteEngine) buildSearchQueryParts(ctx context.Context, q *search.Query) (conditions []string, args []any, joins []string, ftsJoin string) {
+// Every structured filter resolves through an EXISTS / NOT EXISTS
+// correlated subquery, so the only join this ever emits is the optional
+// FTS join (ftsJoin); there is no separate non-EXISTS join slot.
+func (e *SQLiteEngine) buildSearchQueryParts(ctx context.Context, q *search.Query) (conditions []string, args []any, ftsJoin string) {
 	// Exclude rows soft-deleted by deduplicate; gate source-deleted on
 	// q.HideDeleted via the helper.
 	conditions = append(conditions, store.LiveMessagesWhere("m", q.HideDeleted))
@@ -1475,25 +1467,26 @@ func (e *SQLiteEngine) buildSearchQueryParts(ctx context.Context, q *search.Quer
 	// Account filter
 	conditions, args = appendSourceFilter(conditions, args, "m.", nil, q.AccountIDs)
 
-	return conditions, args, joins, ftsJoin
+	return conditions, args, ftsJoin
 }
 
 func (e *SQLiteEngine) Search(ctx context.Context, q *search.Query, limit, offset int) ([]MessageSummary, error) {
-	conditions, args, joins, ftsJoin := e.buildSearchQueryParts(ctx, q)
-	return e.executeSearchQuery(ctx, conditions, args, joins, ftsJoin, limit, offset)
+	conditions, args, ftsJoin := e.buildSearchQueryParts(ctx, q)
+	return e.executeSearchQuery(ctx, conditions, args, ftsJoin, limit, offset)
 }
 
 // SearchFast searches using the same FTS5 path as Search but merges
 // MessageFilter context into the query (drill-down filters, hide-deleted, etc.).
 func (e *SQLiteEngine) SearchFast(ctx context.Context, q *search.Query, filter MessageFilter, limit, offset int) ([]MessageSummary, error) {
 	mergedQuery := MergeFilterIntoQuery(q, filter)
-	conditions, args, joins, ftsJoin := e.buildSearchQueryParts(ctx, mergedQuery)
-	return e.executeSearchQuery(ctx, conditions, args, joins, ftsJoin, limit, offset)
+	conditions, args, ftsJoin := e.buildSearchQueryParts(ctx, mergedQuery)
+	return e.executeSearchQuery(ctx, conditions, args, ftsJoin, limit, offset)
 }
 
-// executeSearchQuery runs a search query built from conditions/joins and returns
-// paginated MessageSummary results. Shared by Search and SearchFast.
-func (e *SQLiteEngine) executeSearchQuery(ctx context.Context, conditions []string, args []any, joins []string, ftsJoin string, limit, offset int) ([]MessageSummary, error) {
+// executeSearchQuery runs a search query built from conditions and the
+// optional FTS join, returning paginated MessageSummary results. Shared
+// by Search and SearchFast.
+func (e *SQLiteEngine) executeSearchQuery(ctx context.Context, conditions []string, args []any, ftsJoin string, limit, offset int) ([]MessageSummary, error) {
 	if limit == 0 {
 		limit = 100
 	}
@@ -1534,11 +1527,10 @@ func (e *SQLiteEngine) executeSearchQuery(ctx context.Context, conditions []stri
 		)
 		LEFT JOIN conversations conv ON conv.id = m.conversation_id
 		%s
-		%s
 		WHERE %s
 		ORDER BY m.sent_at DESC
 		LIMIT ? OFFSET ?
-	`, ftsJoin, strings.Join(joins, "\n"), whereClause)
+	`, ftsJoin, whereClause)
 
 	args = append(args, limit, offset)
 
@@ -1737,7 +1729,7 @@ func timePeriodToBounds(period string) (after, before time.Time, ok bool) {
 // Uses the same query logic as SearchFast to ensure consistent counts.
 func (e *SQLiteEngine) SearchFastCount(ctx context.Context, q *search.Query, filter MessageFilter) (int64, error) {
 	mergedQuery := MergeFilterIntoQuery(q, filter)
-	conditions, args, joins, ftsJoin := e.buildSearchQueryParts(ctx, mergedQuery)
+	conditions, args, ftsJoin := e.buildSearchQueryParts(ctx, mergedQuery)
 
 	whereClause := strings.Join(conditions, " AND ")
 	if whereClause == "" {
@@ -1748,9 +1740,8 @@ func (e *SQLiteEngine) SearchFastCount(ctx context.Context, q *search.Query, fil
 		SELECT COUNT(DISTINCT m.id)
 		FROM messages m
 		%s
-		%s
 		WHERE %s
-	`, ftsJoin, strings.Join(joins, "\n"), whereClause)
+	`, ftsJoin, whereClause)
 
 	var count int64
 	if err := e.queryRowContext(ctx, query, args...).Scan(&count); err != nil {
