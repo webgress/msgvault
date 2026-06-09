@@ -117,7 +117,7 @@ func NewWorker(d WorkerDeps) *Worker {
 	if rebind == nil {
 		rebind = func(q string) string { return q }
 	}
-	return &Worker{deps: d, q: NewQueue(d.VectorsDB, d.Rebind), rebind: rebind}
+	return &Worker{deps: d, q: NewQueue(d.VectorsDB, rebind), rebind: rebind}
 }
 
 // derivedStaleThreshold picks a default StaleThreshold from the
