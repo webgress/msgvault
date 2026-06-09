@@ -34,7 +34,7 @@ type embeddingGenerationRow struct {
 }
 
 func runEmbeddingsList(cmd *cobra.Command, _ []string) error {
-	db, rebind, closeDB, err := openEmbeddingsMetadataDB()
+	db, rebind, closeDB, err := openEmbeddingsMetadataDB(cmd.Context())
 	if err != nil {
 		return err
 	}
@@ -77,7 +77,7 @@ func runEmbeddingsRetire(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	db, rebind, closeDB, err := openEmbeddingsMetadataDB()
+	db, rebind, closeDB, err := openEmbeddingsMetadataDB(cmd.Context())
 	if err != nil {
 		return err
 	}
@@ -117,7 +117,7 @@ func runEmbeddingsActivate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	db, rebind, closeDB, err := openEmbeddingsMetadataDB()
+	db, rebind, closeDB, err := openEmbeddingsMetadataDB(cmd.Context())
 	if err != nil {
 		return err
 	}
@@ -176,7 +176,7 @@ func runEmbeddingsActivate(cmd *cobra.Command, args []string) error {
 //
 // rebind converts ? placeholders to $1, $2, … for PostgreSQL; it is the
 // identity function for SQLite so all query helpers can use it unconditionally.
-func openEmbeddingsMetadataDB() (*sql.DB, func(string) string, func(), error) {
+func openEmbeddingsMetadataDB(ctx context.Context) (*sql.DB, func(string) string, func(), error) {
 	dsn := cfg.DatabaseDSN()
 	if store.IsPostgresURL(dsn) {
 		// Use the store-level PG opener so that connection runtime params
@@ -196,7 +196,7 @@ func openEmbeddingsMetadataDB() (*sql.DB, func(string) string, func(), error) {
 		// Return a friendly message mirroring the SQLite "vectors.db not found"
 		// UX and pointing at `msgvault embeddings build`.
 		var reg sql.NullString
-		if err := db.QueryRow(`SELECT to_regclass('index_generations')`).Scan(&reg); err != nil {
+		if err := db.QueryRowContext(ctx, `SELECT to_regclass('index_generations')`).Scan(&reg); err != nil {
 			closeDB()
 			return nil, nil, nil, fmt.Errorf("check embeddings metadata: %w", err)
 		}

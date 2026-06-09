@@ -139,7 +139,7 @@ func TestOpenEmbeddingsMetadataDB_PG(t *testing.T) {
 	cfg = &config.Config{}
 	cfg.Data.DatabaseURL = dsn
 
-	mdb, rebind, closeDB, err := openEmbeddingsMetadataDB()
+	mdb, rebind, closeDB, err := openEmbeddingsMetadataDB(ctx)
 	require.NoError(t, err, "openEmbeddingsMetadataDB on a migrated PG schema must succeed")
 	require.NotNil(t, mdb, "metadata DB handle")
 	require.NotNil(t, closeDB, "close callback")
@@ -171,7 +171,7 @@ func TestOpenEmbeddingsMetadataDB_PG_FriendlyErrorWhenUnmigrated(t *testing.T) {
 	cfg = &config.Config{}
 	cfg.Data.DatabaseURL = dsn
 
-	_, _, closeDB, err := openEmbeddingsMetadataDB()
+	_, _, closeDB, err := openEmbeddingsMetadataDB(context.Background())
 	if closeDB != nil {
 		closeDB()
 	}
