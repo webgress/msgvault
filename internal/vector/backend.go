@@ -176,10 +176,13 @@ type Backend interface {
 //
 // FusedSearch returns the RRF-ordered hits, a saturation flag, and
 // any error. saturated is true when either the BM25 or the ANN
-// per-signal pool produced KPerSignal candidates — the pool hit its
-// cap, and the final result set has truncated potentially-relevant
-// hits. Callers surface this to clients as pool_saturated so the
-// user can raise KPerSignal or narrow the query.
+// per-signal pool produced MORE THAN KPerSignal candidates — each pool
+// is over-fetched by one probe row (cap KPerSignal+1) and that probe
+// slot filled, so the final result set may have truncated
+// potentially-relevant hits. (The over-fetch/probe is the implementation's
+// chosen way to detect the cap; both concrete backends use it.) Callers
+// surface this to clients as pool_saturated so the user can raise
+// KPerSignal or narrow the query.
 type FusingBackend interface {
 	Backend
 	FusedSearch(ctx context.Context, req FusedRequest) (hits []FusedHit, saturated bool, err error)

@@ -12,19 +12,21 @@ import (
 )
 
 // enqueueChunkRows caps how many (gen, message) tuples go into a single
-// INSERT statement. Each row contributes 3 placeholders (generation_id,
-// message_id, enqueued_at), so 500 rows = 1,500 bound parameters — well
-// under SQLite's default SQLITE_MAX_VARIABLE_NUMBER (999 on older builds,
-// 32k on newer ones; 1,500 is safe on the latter and the loop simply
-// issues more statements on the former is moot because we stay at 500).
+// INSERT statement. Each row binds 3 placeholders (generation_id,
+// message_id, enqueued_at), so 500 rows = 1,500 bound parameters. The
+// compiled SQLite driver (mattn/go-sqlite3) allows up to 32,766 bound
+// variables per statement, so 1,500 is comfortably within budget; the
+// value is also small enough to avoid an oversized prepared statement on
+// PostgreSQL. (For reference, the store package caps multi-row inserts at
+// 900 params to stay under SQLite's historical 999 limit — see
+// insertInChunks.)
 //
 // The Enqueuer can be handed up to ~5,000 IDs by sync, fanned out across
 // up to two non-retired generations; without chunking that would be
-// 3×5,000 = 15,000 placeholders per statement, which exceeds the old
-// SQLite cap and bloats the prepared statement. 500 keeps every
-// statement comfortably small on both SQLite and PostgreSQL while still
-// amortizing the per-statement overhead (a 5,000-ID batch becomes 10
-// statements, not 5,000 single-row inserts).
+// 3×5,000 = 15,000 placeholders per statement, which bloats the prepared
+// statement. 500 keeps every statement comfortably small on both SQLite
+// and PostgreSQL while still amortizing the per-statement overhead (a
+// 5,000-ID batch becomes 10 statements, not 5,000 single-row inserts).
 const enqueueChunkRows = 500
 
 // Compile-time assertion that *Enqueuer satisfies the sync.EmbedEnqueuer

@@ -125,9 +125,13 @@ type Dialect interface {
 
 	// Connection lifecycle
 
-	// InitConn performs driver-specific connection initialization.
-	// Called after opening a connection. For SQLite: no-op (PRAGMAs are set via
-	// DSN parameters). For PostgreSQL: SET search_path, statement_timeout, etc.
+	// InitConn performs driver-specific connection initialization, called
+	// after opening a connection. Both backends are currently no-ops:
+	// SQLite PRAGMAs are set via DSN parameters, and PostgreSQL
+	// per-connection settings (statement_timeout, hnsw.ef_search, and
+	// search_path when present) are applied via pgx RuntimeParams / DSN
+	// parameters at open time — a SET on a pooled *sql.DB would not
+	// deterministically reach every pooled connection.
 	InitConn(db *sql.DB) error
 
 	// SchemaFiles returns the filenames of embedded schema files to execute during InitSchema.

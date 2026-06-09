@@ -62,8 +62,9 @@ func runHybridSearch(cmd *cobra.Command, queryStr, mode string, explain bool, sc
 	if store.IsPostgresURL(dsn) {
 		// PostgreSQL: pgvector embeddings live in the SAME database as
 		// messages, so there is no separate vectors.db. Open the main
-		// store (registers the pgx driver and applies search_path /
-		// statement_timeout via dialect InitConn) and share its handle
+		// store (which registers the pgx driver and sets statement_timeout
+		// via pgx RuntimeParams during connect; search_path is taken from
+		// the DSN if present — InitConn is a no-op) and share its handle
 		// with the pgvector backend.
 		st, err := store.Open(dsn)
 		if err != nil {
