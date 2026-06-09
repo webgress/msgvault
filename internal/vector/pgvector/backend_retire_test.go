@@ -196,6 +196,11 @@ func TestBackend_ActivateGeneration_AutoRetireDeletesPrevious(t *testing.T) {
 	require.NoError(t, b.ActivateGeneration(ctx, genA, true), "activate A")
 	require.Equal(t, 2, countEmbeddingRows(t, b, genA), "A populated before re-embed")
 
+	// Leave an undrained queue row on A so we can prove the auto-retire reaps
+	// pending for the SAME id whose state it flipped (RETURNING-id provability).
+	seedPending(t, b, genA, 30)
+	require.Equal(t, 1, countPendingRows(t, b, genA), "precondition: A has a pending row")
+
 	// Generation B: a new building generation at the same dimension (the
 	// normal re-embed flow). Activating it auto-retires A.
 	genB := buildGenWithVectors(t, b, "model-b", 4, map[int64][]float32{
@@ -211,9 +216,35 @@ func TestBackend_ActivateGeneration_AutoRetireDeletesPrevious(t *testing.T) {
 	assert.Equal(t, 2, countEmbeddingRows(t, b, genB),
 		"newly-activated generation B's rows must be untouched")
 
+	// RETURNING-id provability: the demote folds into one
+	// `UPDATE ... WHERE state='active' RETURNING id` statement, so the id whose
+	// embeddings+pending get deleted is exactly the row that flipped to retired.
+	// Assert the previously-active gen (genA) is the sole retired row AND that
+	// both its embeddings and its pending were the ones cleaned, while the new
+	// active gen (genB) keeps its rows. This pins that the RETURNING'd id ==
+	// the deleted id == the previously-active generation.
+	retired := singleRetiredGen(t, b)
+	assert.Equal(t, genA, retired, "the previously-active gen must be the sole retired row")
+	assert.Equal(t, 0, countEmbeddingRows(t, b, retired),
+		"embeddings deleted for exactly the RETURNING'd (retired) id")
+	assert.Equal(t, 0, countPendingRows(t, b, retired),
+		"pending reaped for exactly the RETURNING'd (retired) id")
+
 	active, err := b.ActiveGeneration(ctx)
 	require.NoError(t, err, "ActiveGeneration after activate B")
 	assert.Equal(t, genB, active.ID, "B is the serving generation")
+}
+
+// singleRetiredGen returns the id of the one generation in state='retired',
+// failing if there is not exactly one. Used by the auto-retire RETURNING-id
+// tests to prove the deleted id is the same row whose state flipped to retired.
+func singleRetiredGen(t *testing.T, b *Backend) vector.GenerationID {
+	t.Helper()
+	var id int64
+	require.NoError(t, b.db.QueryRowContext(context.Background(),
+		`SELECT id FROM index_generations WHERE state = 'retired'`).Scan(&id),
+		"expected exactly one retired generation")
+	return vector.GenerationID(id)
 }
 
 // TestBackend_ActivateGeneration_PreservesBuildingGenerations ensures the

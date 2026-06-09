@@ -359,19 +359,19 @@ func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationI
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// Capture the generation being demoted (if any) so we can reap its queue
-	// rows after flipping its state, in the same tx as the activation below.
+	// Demote the current active generation and capture its id in a single
+	// statement via RETURNING (SQLite 3.35+), so the id whose queue rows we reap
+	// below is provably the row this UPDATE retired (no separate SELECT that
+	// could diverge). No active row -> no row returned -> demoted invalid -> the
+	// reap is skipped, exactly as before. Done inside the tx so the demote+reap
+	// is atomic with the activation below.
 	var demoted sql.NullInt64
 	if err := tx.QueryRowContext(ctx,
-		`SELECT id FROM index_generations WHERE state = 'active'`).Scan(&demoted); err != nil &&
-		!errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("lookup active generation to demote: %w", err)
-	}
-
-	if _, err := tx.ExecContext(ctx,
 		`UPDATE index_generations
 		 SET state = 'retired', completed_at = COALESCE(completed_at, ?)
-		 WHERE state = 'active'`, now); err != nil {
+		 WHERE state = 'active'
+		 RETURNING id`, now).Scan(&demoted); err != nil &&
+		!errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("retire previous active: %w", err)
 	}
 	if demoted.Valid {

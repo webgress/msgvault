@@ -161,6 +161,31 @@ func TestBackend_ActivateGeneration_AutoRetireCleansPending(t *testing.T) {
 
 	assertpkg.Equal(t, 0, pendingCount(t, b, genA),
 		"auto-retire must delete the demoted generation's pending_embeddings rows")
+
+	// RETURNING-id provability: the demote folds into one
+	// `UPDATE ... WHERE state='active' RETURNING id` statement (SQLite 3.35+),
+	// so the id whose pending rows get reaped is exactly the row that flipped to
+	// retired. Assert the previously-active gen (genA) is the sole retired row
+	// AND that it is the one whose pending was reaped, while the new active gen
+	// (genB) is not retired. This pins that the RETURNING'd id == the reaped id
+	// == the previously-active generation.
+	retired := singleRetiredGenSV(t, b)
+	assertpkg.Equal(t, genA, retired, "the previously-active gen must be the sole retired row")
+	assertpkg.NotEqual(t, genB, retired, "the newly-activated gen must not be retired")
+	assertpkg.Equal(t, 0, pendingCount(t, b, retired),
+		"pending reaped for exactly the RETURNING'd (retired) id")
+}
+
+// singleRetiredGenSV returns the id of the one generation in state='retired',
+// failing if there is not exactly one. Used by the auto-retire RETURNING-id
+// test to prove the reaped id is the same row whose state flipped to retired.
+func singleRetiredGenSV(t *testing.T, b *Backend) vector.GenerationID {
+	t.Helper()
+	var id int64
+	requirepkg.NoError(t, b.db.QueryRowContext(context.Background(),
+		`SELECT id FROM index_generations WHERE state = 'retired'`).Scan(&id),
+		"expected exactly one retired generation")
+	return vector.GenerationID(id)
 }
 
 func TestBackend_CreateGeneration_SeedsPending(t *testing.T) {

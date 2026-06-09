@@ -286,20 +286,19 @@ func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationI
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// Capture the generation being demoted (if any) so we can delete its
-	// embedding rows after flipping its state. Done inside the tx so the
-	// demote+delete is atomic with the activation below.
+	// Demote the current active generation and capture its id in a single
+	// statement via RETURNING, so the id whose embeddings we delete below is
+	// provably the row this UPDATE retired (no separate non-locking SELECT that
+	// a concurrent activation could race). No active row -> no row returned ->
+	// demoted invalid -> the deletes are skipped, exactly as before. Done inside
+	// the tx so the demote+delete is atomic with the activation below.
 	var demoted sql.NullInt64
 	if err := tx.QueryRowContext(ctx,
-		`SELECT id FROM index_generations WHERE state = 'active'`).Scan(&demoted); err != nil &&
-		!errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("lookup active generation to demote: %w", err)
-	}
-
-	if _, err := tx.ExecContext(ctx,
 		`UPDATE index_generations
 		    SET state = 'retired', completed_at = COALESCE(completed_at, $1)
-		  WHERE state = 'active'`, now); err != nil {
+		  WHERE state = 'active'
+		  RETURNING id`, now).Scan(&demoted); err != nil &&
+		!errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("retire previous active: %w", err)
 	}
 	if demoted.Valid {
