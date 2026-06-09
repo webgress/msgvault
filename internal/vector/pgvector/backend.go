@@ -820,7 +820,7 @@ func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec 
 			         LIMIT $3
 			       ) ann
 			 GROUP BY ann.message_id
-			 ORDER BY distance
+			 ORDER BY distance, ann.message_id
 			 LIMIT $4`, dim, store.LiveMessagesWhere("m", true))
 		// Empty-filter path: the candidate universe is the whole
 		// generation, so the inner-LIMIT ceiling is the generation chunk
@@ -877,7 +877,7 @@ func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec 
 		         LIMIT $5
 		       ) ann
 		 GROUP BY ann.message_id
-		 ORDER BY distance
+		 ORDER BY distance, ann.message_id
 		 LIMIT $6`, dim, dim)
 	idArr := int64Array(ids)
 	return searchWiden(k, filteredChunks, filteredMessages, func(innerLimit int) ([]vector.Hit, error) {
