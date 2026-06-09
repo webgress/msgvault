@@ -21,10 +21,13 @@ import (
 	"go.kenn.io/msgvault/internal/vector/pgvector"
 )
 
-// openPGQueueDB stands up a per-test schema on MSGVAULT_TEST_DB, applies
-// the pgvector schema, and seeds one building generation with n pending
-// rows. It returns the *sql.DB; cleanup drops the schema via t.Cleanup.
-func openPGQueueDB(t *testing.T, n int) *sql.DB {
+// newPGQueueSchema stands up a per-test schema on MSGVAULT_TEST_DB, applies
+// the pgvector schema, and seeds one building generation (id=1) with n
+// pending rows. It returns BOTH the *sql.DB and the schema-scoped DSN so
+// callers that need a SECOND independent handle on the SAME schema (e.g. the
+// SKIP-LOCKED concurrency test) can sql.Open the returned dsn. The schema is
+// dropped on cleanup. Skips when MSGVAULT_TEST_DB is not a PostgreSQL DSN.
+func newPGQueueSchema(t *testing.T, n int) (db *sql.DB, dsn string) {
 	t.Helper()
 	url := os.Getenv("MSGVAULT_TEST_DB")
 	if !strings.HasPrefix(url, "postgres://") && !strings.HasPrefix(url, "postgresql://") {
@@ -42,14 +45,13 @@ func openPGQueueDB(t *testing.T, n int) *sql.DB {
 	_, err = setup.Exec("CREATE SCHEMA " + schemaName)
 	require.NoError(t, err, "create schema")
 
-	testURL := url
 	sep := "?"
 	if strings.Contains(url, "?") {
 		sep = "&"
 	}
-	testURL += sep + "search_path=" + schemaName + ",public"
+	dsn = url + sep + "search_path=" + schemaName + ",public"
 
-	db, err := sql.Open("pgx", testURL)
+	db, err = sql.Open("pgx", dsn)
 	require.NoError(t, err, "open")
 	t.Cleanup(func() {
 		_ = db.Close()
@@ -75,6 +77,15 @@ func openPGQueueDB(t *testing.T, n int) *sql.DB {
 			i)
 		require.NoError(t, err, "insert pending")
 	}
+	return db, dsn
+}
+
+// openPGQueueDB stands up a per-test schema seeded with n pending rows and
+// returns the *sql.DB. Thin wrapper over newPGQueueSchema for the common
+// single-handle case; cleanup drops the schema via t.Cleanup.
+func openPGQueueDB(t *testing.T, n int) *sql.DB {
+	t.Helper()
+	db, _ := newPGQueueSchema(t, n)
 	return db
 }
 
@@ -243,59 +254,26 @@ func TestQueuePG_ConcurrentClaim_SkipLocked(t *testing.T) {
 	const n = 20
 	ctx := context.Background()
 
-	url := os.Getenv("MSGVAULT_TEST_DB")
-	if !strings.HasPrefix(url, "postgres://") && !strings.HasPrefix(url, "postgresql://") {
-		t.Skip("pgvector queue tests require MSGVAULT_TEST_DB to point at a PostgreSQL DSN")
-	}
+	// One isolated schema seeded with n pending rows. newPGQueueSchema returns
+	// the schema-scoped DSN so the second handle below targets the SAME schema
+	// — essential for this test, since two different schemas would make the
+	// SKIP-LOCKED assertion pass vacuously (two queues over disjoint tables).
+	db1, dsn := newPGQueueSchema(t, n)
 
-	// Create an isolated schema for this test.
-	buf := make([]byte, 8)
-	_, err := rand.Read(buf)
-	require.NoError(t, err, "random schema name")
-	schemaName := "embed_conc_test_" + hex.EncodeToString(buf)
-
-	setup, err := sql.Open("pgx", url)
-	require.NoError(t, err, "open setup")
-	defer func() { _ = setup.Close() }()
-	_, err = setup.Exec("CREATE SCHEMA " + schemaName)
-	require.NoError(t, err, "create schema")
-
-	sep := "?"
-	if strings.Contains(url, "?") {
-		sep = "&"
-	}
-	testURL := url + sep + "search_path=" + schemaName + ",public"
-
-	db1, err := sql.Open("pgx", testURL)
-	require.NoError(t, err, "open db1")
-	t.Cleanup(func() {
-		_ = db1.Close()
-		cleanup, cerr := sql.Open("pgx", url)
-		if cerr != nil {
-			return
-		}
-		defer func() { _ = cleanup.Close() }()
-		_, _ = cleanup.Exec("DROP SCHEMA " + schemaName + " CASCADE")
-	})
-
-	require.NoError(t, pgvector.Migrate(ctx, db1, 0), "pgvector.Migrate")
-
-	_, err = db1.ExecContext(ctx, `
-		INSERT INTO index_generations (id, model, dimension, fingerprint, started_at, state)
-		OVERRIDING SYSTEM VALUE
-		VALUES (1, 'm', 768, 'm:768', 0, 'building')`)
-	require.NoError(t, err, "insert generation")
-	for i := 1; i <= n; i++ {
-		_, err := db1.ExecContext(ctx,
-			`INSERT INTO pending_embeddings (generation_id, message_id, enqueued_at) VALUES (1, $1, 0)`, i)
-		require.NoError(t, err, "insert pending row %d", i)
-	}
-
-	// Open a second independent connection so the two Queue instances use
-	// separate connection pools and their transactions do not share state.
-	db2, err := sql.Open("pgx", testURL)
+	// Open a second independent connection on the SAME schema so the two Queue
+	// instances use separate connection pools and their transactions do not
+	// share state.
+	db2, err := sql.Open("pgx", dsn)
 	require.NoError(t, err, "open db2")
 	t.Cleanup(func() { _ = db2.Close() })
+
+	// Guard against an accidental two-schema refactor: a row visible via db1
+	// must also be visible via db2 (they resolve the same pending table).
+	var visible int
+	require.NoError(t,
+		db2.QueryRowContext(ctx, `SELECT COUNT(*) FROM pending_embeddings WHERE generation_id = 1`).Scan(&visible),
+		"db2 must see db1's seeded rows (same schema)")
+	require.Equal(t, n, visible, "db1 and db2 must target the same schema's pending table")
 
 	q1 := NewQueue(db1, pgRebind())
 	q2 := NewQueue(db2, pgRebind())

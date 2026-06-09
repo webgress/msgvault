@@ -2,8 +2,6 @@ package store_test
 
 import (
 	"database/sql"
-	"os"
-	"strings"
 	"testing"
 
 	assertpkg "github.com/stretchr/testify/assert"
@@ -13,34 +11,19 @@ import (
 	"go.kenn.io/msgvault/internal/testutil/storetest"
 )
 
-// isPostgresTest reports whether the test is running against PostgreSQL.
-func isPostgresTest() bool {
-	testDB := os.Getenv("MSGVAULT_TEST_DB")
-	return strings.HasPrefix(testDB, "postgres://") || strings.HasPrefix(testDB, "postgresql://")
-}
-
 // assertFTSContains verifies that exactly wantCount messages match the given
-// term via the backend-appropriate FTS query. On SQLite it uses the FTS5
-// virtual table; on PostgreSQL it queries the tsvector column inline.
-func assertFTSContains(t *testing.T, db *sql.DB, term string, wantCount int) {
+// term through the SAME production search pipeline the app uses
+// (Store.SearchMessages → BuildFTSArg → FTSSearchClause). Routing through
+// SearchMessages — rather than hand-writing dialect FTS SQL — exercises the
+// real query parser for whichever backend is active (to_tsquery('simple', …)
+// with prefix lexemes on PG; the BuildFTSArg prefix shape on SQLite), so the
+// helper cannot drift from production the way a bare websearch_to_tsquery /
+// MATCH query did.
+func assertFTSContains(t *testing.T, st *store.Store, term string, wantCount int) {
 	t.Helper()
-	assert := assertpkg.New(t)
-	require := requirepkg.New(t)
-	var count int
-	if isPostgresTest() {
-		// PostgreSQL FTS is via the search_fts tsvector column.
-		require.NoError(db.QueryRow(
-			"SELECT COUNT(*) FROM messages WHERE search_fts @@ websearch_to_tsquery('simple', $1)",
-			term).Scan(&count),
-			"PG FTS query for %q", term)
-	} else {
-		// SQLite FTS5 virtual table.
-		require.NoError(db.QueryRow(
-			"SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH ?",
-			term).Scan(&count),
-			"SQLite FTS MATCH %q", term)
-	}
-	assert.Equal(wantCount, count, "FTS match count for %q", term)
+	_, total, err := st.SearchMessages(term, 0, 100)
+	requirepkg.NoError(t, err, "SearchMessages %q", term)
+	assertpkg.Equal(t, int64(wantCount), total, "FTS match count for %q", term)
 }
 
 // TestStore_RebuildFTS_HappyPath verifies RebuildFTS on a healthy database
@@ -72,8 +55,8 @@ func TestStore_RebuildFTS_HappyPath(t *testing.T) {
 	require.NoError(err, "RebuildFTS")
 	assert.Equal(int64(2), n, "RebuildFTS rows")
 
-	assertFTSContains(t, f.Store.DB(), "banana", 1)
-	assertFTSContains(t, f.Store.DB(), "alice", 1)
+	assertFTSContains(t, f.Store, "banana", 1)
+	assertFTSContains(t, f.Store, "alice", 1)
 }
 
 // TestStore_RebuildFTS_BypassesAvailabilityFlag verifies the critical
@@ -107,7 +90,7 @@ func TestStore_RebuildFTS_BypassesAvailabilityFlag(t *testing.T) {
 
 	assert.True(f.Store.FTS5Available(), "FTS5Available() after rebuild")
 
-	assertFTSContains(t, f.Store.DB(), "cherry", 1)
+	assertFTSContains(t, f.Store, "cherry", 1)
 }
 
 // TestStore_RebuildFTS_AfterTableDropped verifies that RebuildFTS recreates

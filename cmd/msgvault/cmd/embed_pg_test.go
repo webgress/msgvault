@@ -4,18 +4,26 @@ package cmd
 
 import (
 	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"os"
+	"strings"
 	"testing"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/pgvector"
 )
 
-// openEmbedManagePGDB opens a per-test isolated PG schema and migrates the
-// pgvector tables into it, then returns the sql.DB, the PG rebind func, and
-// the pgvector backend. Skips when MSGVAULT_TEST_DB is unset.
+// openEmbedManagePGDB opens a per-test isolated PG schema, migrates the
+// pgvector tables into it (via pgvector.Open), and returns the pgvector
+// backend and the PG rebind func. The underlying *sql.DB is reachable via
+// the returned backend's DB() method. Skips when MSGVAULT_TEST_DB is unset.
 func openEmbedManagePGDB(t *testing.T) (*pgvector.Backend, func(string) string) {
 	t.Helper()
 	_, dsn := openServePGSchema(t)
@@ -113,20 +121,100 @@ func TestActivateEmbeddingGeneration_PG(t *testing.T) {
 	assert.NotNil(t, g.ActivatedAt, "activated_at must be set")
 }
 
-// TestOpenEmbeddingsMetadataDB_PG exercises the openEmbeddingsMetadataDB
-// helper on a real PG DSN. Confirms that it returns a live handle backed by
-// the store-level PG opener (not raw sql.Open) and that a simple query
-// succeeds.
+// TestOpenEmbeddingsMetadataDB_PG exercises the real openEmbeddingsMetadataDB
+// helper against a live PG DSN. It pins the PG branch's contract: the helper
+// routes through store.OpenPostgresDB (not raw sql.Open), returns the PG
+// rebind (not the SQLite identity rebind), and yields a live handle that the
+// production query helpers can use. The cfg-global swap mirrors
+// TestSetupVectorFeatures_SucceedsOnPostgres.
 func TestOpenEmbeddingsMetadataDB_PG(t *testing.T) {
-	pgb, _ := openEmbedManagePGDB(t)
+	// Stand up an isolated schema and migrate the pgvector metadata tables
+	// into it so the helper's existence pre-check passes.
+	db, dsn := openServePGSchema(t)
 	ctx := context.Background()
+	require.NoError(t, pgvector.Migrate(ctx, db, 4), "pgvector.Migrate")
 
-	// Confirm the handle returned by pgb.DB() (which represents the
-	// store-opened connection) supports the embedding tables.
-	var n int
-	err := pgb.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM index_generations`).Scan(&n)
-	require.NoError(t, err, "query via pgb.DB() (store-opened PG handle) must succeed")
-	// We created one generation in openEmbedManagePGDB via CreateGeneration in
-	// other subtests — this subtest uses its own isolated schema so n=0 is fine.
-	assert.GreaterOrEqual(t, n, 0)
+	savedCfg := cfg
+	defer func() { cfg = savedCfg }()
+	cfg = &config.Config{}
+	cfg.Data.DatabaseURL = dsn
+
+	mdb, rebind, closeDB, err := openEmbeddingsMetadataDB()
+	require.NoError(t, err, "openEmbeddingsMetadataDB on a migrated PG schema must succeed")
+	require.NotNil(t, mdb, "metadata DB handle")
+	require.NotNil(t, closeDB, "close callback")
+	defer closeDB()
+
+	// The PG branch must return the PG rebind, not the SQLite identity rebind.
+	assert.Equal(t, "$1", rebind("?"), "PG rebind must convert ? to $1")
+
+	// The handle must be live and usable by the production query helper.
+	rows, err := listEmbeddingGenerations(ctx, mdb, rebind)
+	require.NoError(t, err, "listEmbeddingGenerations via openEmbeddingsMetadataDB handle")
+	assert.Empty(t, rows, "freshly migrated schema has no generations yet")
+}
+
+// TestOpenEmbeddingsMetadataDB_PG_FriendlyErrorWhenUnmigrated pins
+// cmd-glue-stubs-2: on a PG deployment where the vector schema has not been
+// migrated (no embed run yet), openEmbeddingsMetadataDB must return a
+// friendly, build-pointing error rather than leaking a raw
+// `relation "index_generations" does not exist (SQLSTATE 42P01)`.
+func TestOpenEmbeddingsMetadataDB_PG_FriendlyErrorWhenUnmigrated(t *testing.T) {
+	// Use a search_path scoped to ONLY the fresh isolated schema (no
+	// "public") so to_regclass cannot resolve against tables that prior
+	// non-isolated test runs may have left in public — the schema genuinely
+	// has no metadata tables, matching an un-migrated PG deployment.
+	dsn := openEmptyPGSchemaSolo(t)
+
+	savedCfg := cfg
+	defer func() { cfg = savedCfg }()
+	cfg = &config.Config{}
+	cfg.Data.DatabaseURL = dsn
+
+	_, _, closeDB, err := openEmbeddingsMetadataDB()
+	if closeDB != nil {
+		closeDB()
+	}
+	require.Error(t, err, "must error when metadata tables are absent")
+	assert.Contains(t, err.Error(), "embeddings build",
+		"error must point the user at \"msgvault embeddings build\"")
+	assert.NotContains(t, err.Error(), "42P01",
+		"raw PostgreSQL SQLSTATE must not leak to the user")
+}
+
+// openEmptyPGSchemaSolo creates an isolated empty schema and returns a DSN
+// whose search_path is that schema ALONE (no public). Used by the
+// un-migrated negative test so to_regclass('index_generations') resolves to
+// NULL regardless of what prior test runs left in public. Skips when
+// MSGVAULT_TEST_DB is not a PostgreSQL DSN.
+func openEmptyPGSchemaSolo(t *testing.T) string {
+	t.Helper()
+	url := os.Getenv("MSGVAULT_TEST_DB")
+	if !strings.HasPrefix(url, "postgres://") && !strings.HasPrefix(url, "postgresql://") {
+		t.Skip("requires MSGVAULT_TEST_DB to point at a PostgreSQL DSN")
+	}
+	buf := make([]byte, 8)
+	_, err := rand.Read(buf)
+	require.NoError(t, err, "random schema name")
+	schemaName := "embed_solo_test_" + hex.EncodeToString(buf)
+
+	setup, err := sql.Open("pgx", url)
+	require.NoError(t, err, "open setup")
+	defer func() { _ = setup.Close() }()
+	_, err = setup.Exec("CREATE SCHEMA " + schemaName)
+	require.NoError(t, err, "create schema")
+	t.Cleanup(func() {
+		cleanup, err := sql.Open("pgx", url)
+		if err != nil {
+			return
+		}
+		defer func() { _ = cleanup.Close() }()
+		_, _ = cleanup.Exec("DROP SCHEMA " + schemaName + " CASCADE")
+	})
+
+	sep := "?"
+	if strings.Contains(url, "?") {
+		sep = "&"
+	}
+	return url + sep + "search_path=" + schemaName
 }
