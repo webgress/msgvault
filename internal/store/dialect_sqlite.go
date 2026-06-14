@@ -210,7 +210,7 @@ func (d *SQLiteDialect) FTSRebuildSchema(db *sql.DB) error {
 // EnsureFTSIndex is a no-op for SQLite: its messages_fts virtual table (and
 // the index it implies) is created via the SchemaFTS file during InitSchema,
 // not a post-migration step (cr2-10).
-func (d *SQLiteDialect) EnsureFTSIndex(*sql.DB) error { return nil }
+func (d *SQLiteDialect) EnsureFTSIndex(querier) error { return nil }
 
 // LegacyColumnMigrations returns the ALTER TABLE ADD COLUMN statements that
 // bring older SQLite databases up to the current schema. IsDuplicateColumnError
@@ -315,6 +315,11 @@ func (d *SQLiteDialect) BeginWriteSQL() string { return "BEGIN IMMEDIATE" }
 // SelectForUpdate returns "" — SQLite has no FOR UPDATE; serialization
 // comes from BEGIN IMMEDIATE.
 func (d *SQLiteDialect) SelectForUpdate() string { return "" }
+
+// MaintenanceTimeoutResetSQL returns "" — SQLite has no statement_timeout,
+// so Store.runMaintenance issues no reset statement and SQLite's
+// transactional behavior is unchanged.
+func (d *SQLiteDialect) MaintenanceTimeoutResetSQL() string { return "" }
 
 // IsBusyError returns true for SQLITE_BUSY and SQLITE_LOCKED. Matching on
 // the result code is more robust than substring matching: BUSY surfaces as

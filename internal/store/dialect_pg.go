@@ -261,8 +261,8 @@ func (d *PostgreSQLDialect) LegacyColumnMigrations() []ColumnMigration {
 // schema_pg.sql: that file is Exec'd as one statement before migrations, and
 // a legacy table missing the column would fail the index there and roll back
 // the entire schema apply (cr2-10).
-func (d *PostgreSQLDialect) EnsureFTSIndex(db *sql.DB) error {
-	if _, err := db.Exec(
+func (d *PostgreSQLDialect) EnsureFTSIndex(q querier) error {
+	if _, err := q.Exec(
 		"CREATE INDEX IF NOT EXISTS messages_search_fts_idx ON messages USING GIN (search_fts)",
 	); err != nil {
 		return fmt.Errorf("create messages_search_fts_idx: %w", err)
@@ -271,7 +271,7 @@ func (d *PostgreSQLDialect) EnsureFTSIndex(db *sql.DB) error {
 	// on search_fts cannot answer an IS NULL predicate). It only indexes the
 	// rows still awaiting backfill, so it self-prunes to empty as backfill
 	// completes and stays tiny thereafter.
-	if _, err := db.Exec(
+	if _, err := q.Exec(
 		"CREATE INDEX IF NOT EXISTS idx_messages_search_fts_null ON messages (id) WHERE search_fts IS NULL",
 	); err != nil {
 		return fmt.Errorf("create idx_messages_search_fts_null: %w", err)
@@ -350,6 +350,34 @@ func (d *PostgreSQLDialect) IsBusyError(err error) bool {
 	return isPgError(err, "55P03") || isPgError(err, "40P01") || isPgError(err, "57014")
 }
 
+// exclusiveLockTables is the table list BeginExclusive locks IN EXCLUSIVE
+// MODE. It mirrors every INSERT/UPDATE/DELETE the sync/import pipeline emits
+// (verified against internal/store/messages.go, internal/store/sync.go,
+// internal/store/account_identities.go, internal/store/migrations.go, and
+// internal/sync/*.go) PLUS every table reached by ON DELETE CASCADE when
+// RemoveSourceSerialized deletes a source.
+//
+// Invariant: every table with an ON DELETE CASCADE foreign-key chain to
+// sources(id) MUST appear here, otherwise the cascade DELETE can race a
+// concurrent writer to that table and reopen the very race the EXCLUSIVE
+// lock exists to close. TestExclusiveLockTablesCoverCascade pins this by
+// diffing the catalog against this list.
+//
+//   - source_import_items: written by UpsertSourceImportItem (internal/store/sync.go)
+//     and cascade-reachable from sources — a real race before it was added here.
+//   - sync_checkpoints: cascade-reachable from sources; no writer today, but
+//     included so a future checkpoint writer cannot race the cascade.
+//
+// collections is included (despite not being a direct sources cascade target)
+// so a concurrent collection rename cannot race the collection_sources cascade.
+var exclusiveLockTables = []string{
+	"sync_runs", "sources", "conversations", "conversation_participants",
+	"messages", "message_recipients", "message_labels", "message_bodies", "message_raw",
+	"attachments", "labels", "participants", "participant_identifiers", "reactions",
+	"collections", "collection_sources", "account_identities", "applied_migrations",
+	"source_import_items", "sync_checkpoints",
+}
+
 // BeginExclusive opens a transaction on conn and locks every table the
 // sync path writes to in EXCLUSIVE mode. SQLite's BEGIN EXCLUSIVE blocks
 // all writers database-wide, so the PG counterpart must cover the full
@@ -359,24 +387,23 @@ func (d *PostgreSQLDialect) IsBusyError(err error) bool {
 // lock that INSERT/UPDATE/DELETE acquire; ACCESS SHARE (reads) is still
 // permitted.
 //
-// The table list mirrors every INSERT/UPDATE/DELETE the sync/import
-// pipeline emits (verified against internal/store/messages.go,
-// internal/store/sync.go, internal/store/account_identities.go,
-// internal/store/migrations.go, and internal/sync/*.go) plus the
-// collection_sources / account_identities / applied_migrations rows
-// reached by ON DELETE CASCADE when RemoveSourceSerialized deletes a
-// source. collections is included so a concurrent collection rename
-// cannot race the cascade.
+// The locked set lives in exclusiveLockTables. A SET LOCAL
+// statement_timeout = 0 is issued first so a busy daemon's lock-wait
+// (and the cascade DELETE / FTSDelete that RemoveSourceSerialized runs on
+// this same connection afterwards) cannot be cancelled by the pool-wide
+// 30s statement_timeout on a large archive (finding S1). SET LOCAL
+// auto-resets at COMMIT/ROLLBACK, so it cannot leak to other pooled
+// connections.
 func (d *PostgreSQLDialect) BeginExclusive(ctx context.Context, conn *sql.Conn) error {
 	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
 		return err
 	}
+	if _, err := conn.ExecContext(ctx, "SET LOCAL statement_timeout = 0"); err != nil {
+		_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		return err
+	}
 	if _, err := conn.ExecContext(ctx,
-		"LOCK TABLE sync_runs, sources, conversations, conversation_participants, "+
-			"messages, message_recipients, message_labels, message_bodies, message_raw, "+
-			"attachments, labels, participants, participant_identifiers, reactions, "+
-			"collections, collection_sources, account_identities, applied_migrations "+
-			"IN EXCLUSIVE MODE",
+		"LOCK TABLE "+strings.Join(exclusiveLockTables, ", ")+" IN EXCLUSIVE MODE",
 	); err != nil {
 		_, _ = conn.ExecContext(ctx, "ROLLBACK")
 		return err
@@ -391,6 +418,13 @@ func (d *PostgreSQLDialect) BeginWriteSQL() string { return "BEGIN" }
 // SelectForUpdate returns " FOR UPDATE" so a SELECT inside a write
 // transaction takes a row-level lock that serializes subsequent merges.
 func (d *PostgreSQLDialect) SelectForUpdate() string { return " FOR UPDATE" }
+
+// MaintenanceTimeoutResetSQL disables the per-statement timeout for the
+// current transaction. SET LOCAL auto-resets at tx end, so the pool-wide
+// statement_timeout cannot leak away on other connections.
+func (d *PostgreSQLDialect) MaintenanceTimeoutResetSQL() string {
+	return "SET LOCAL statement_timeout = 0"
+}
 
 // isPgError checks if err is a pgconn.PgError with the given SQLSTATE code.
 func isPgError(err error, code string) bool {

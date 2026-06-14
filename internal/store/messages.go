@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"compress/zlib"
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -983,7 +984,13 @@ func (s *Store) BackfillFTS(progress func(done, total int64)) (int64, error) {
 		return 0, nil
 	}
 
-	if _, err := s.db.Exec(s.dialect.FTSClearSQL()); err != nil {
+	// runMaintenance disables the pool-wide 30s statement_timeout for the
+	// clear: FTSClearSQL is a full-table tsvector rewrite that exceeds 30s on
+	// a large archive (finding S1). No-op timeout reset on SQLite.
+	if err := s.runMaintenance(context.Background(), func(ctx context.Context, tx *loggedTx) error {
+		_, err := tx.ExecContext(ctx, s.dialect.FTSClearSQL())
+		return err
+	}); err != nil {
 		return 0, fmt.Errorf("clear FTS: %w", err)
 	}
 
@@ -1086,12 +1093,23 @@ func (s *Store) backfillFTSRowByRow(fromID, toID int64) int64 {
 }
 
 // backfillFTSBatch inserts FTS rows for messages with id in [fromID, toID).
+//
+// Each batch runs under runMaintenance so the pool-wide 30s statement_timeout
+// is disabled for the batch: a 5000-row tsvector rewrite can exceed 30s on a
+// large archive (finding S1). Each batch remains its own committed transaction,
+// preserving the existing "partial progress is preserved if interrupted"
+// semantics. No-op timeout reset on SQLite.
 func (s *Store) backfillFTSBatch(fromID, toID int64) (int64, error) {
-	result, err := s.db.Exec(s.dialect.FTSBackfillBatchSQL(), fromID, toID)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected()
+	var affected int64
+	err := s.runMaintenance(context.Background(), func(ctx context.Context, tx *loggedTx) error {
+		result, err := tx.ExecContext(ctx, s.dialect.FTSBackfillBatchSQL(), fromID, toID)
+		if err != nil {
+			return err
+		}
+		affected, err = result.RowsAffected()
+		return err
+	})
+	return affected, err
 }
 
 // RecomputeConversationStats updates the denormalized stats columns on all conversations

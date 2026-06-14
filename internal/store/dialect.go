@@ -116,7 +116,12 @@ type Dialect interface {
 	// search_fts column would fail the schema-file Exec on the index before
 	// the ADD COLUMN migration could run. Called by InitSchema after
 	// LegacyColumnMigrations. [cr2-10]
-	EnsureFTSIndex(db *sql.DB) error
+	//
+	// Takes a querier (not *sql.DB) so InitSchema can run it on the
+	// maintenance transaction whose statement_timeout has been disabled —
+	// the GIN build over a populated messages table can exceed the pool-wide
+	// 30s timeout on a large archive (finding S1).
+	EnsureFTSIndex(q querier) error
 
 	// LegacyColumnMigrations returns ALTER TABLE ADD COLUMN statements to
 	// bring older databases up to date with schema columns added over time.
@@ -235,4 +240,22 @@ type Dialect interface {
 	// to lock the matched row; SQLite already serializes writers under
 	// BEGIN IMMEDIATE and returns "".
 	SelectForUpdate() string
+
+	// MaintenanceTimeoutResetSQL returns a statement that disables any
+	// per-statement execution timeout for the remainder of the current
+	// transaction, or "" if the backend has no such timeout.
+	//
+	// PostgreSQL: "SET LOCAL statement_timeout = 0". The pool-wide 30s
+	// statement_timeout (postgresConnConfig) would otherwise cancel
+	// maintenance operations whose cost scales with archive size — cascade
+	// source deletes, FTS clear/backfill rewrites, GIN index builds, the
+	// attachment-dedup unique-index migration, and dedup cascade deletes —
+	// with SQLSTATE 57014 on a large archive. SET LOCAL applies only to the
+	// enclosing transaction and auto-resets at COMMIT/ROLLBACK, so it can
+	// never leak the GUC to another pooled connection (unlike a bare session
+	// SET). Callers MUST run this inside an explicit transaction.
+	//
+	// SQLite: "" (no statement_timeout concept). Store.runMaintenance skips
+	// the statement when this is empty, preserving SQLite behavior exactly.
+	MaintenanceTimeoutResetSQL() string
 }
