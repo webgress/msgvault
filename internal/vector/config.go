@@ -48,6 +48,14 @@ type Config struct {
 	Preprocess PreprocessConfig `toml:"preprocess"`
 	Search     SearchConfig     `toml:"search"`
 	Embed      EmbedConfig      `toml:"embed"`
+
+	// SkipExtensionCreate skips the `CREATE EXTENSION IF NOT EXISTS
+	// vector` step on the pgvector backend while still letting Migrate
+	// create the schema tables and indexes. Set this on a managed or
+	// locked-down PostgreSQL where the `vector` extension is installed by
+	// an administrator and the msgvault role lacks the superuser privilege
+	// CREATE EXTENSION requires. Ignored on the sqlite-vec backend.
+	SkipExtensionCreate bool `toml:"skip_extension_create"`
 }
 
 // EmbeddingsConfig configures the external OpenAI-compatible

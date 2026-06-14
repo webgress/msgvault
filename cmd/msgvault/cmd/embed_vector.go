@@ -41,8 +41,9 @@ func runEmbed(cmd *cobra.Command) error {
 		// dialect-aware via rebind, so the build pipeline runs directly
 		// against pgx.
 		pgb, err := pgvector.Open(ctx, pgvector.Options{
-			DB:        s.DB(),
-			Dimension: cfg.Vector.Embeddings.Dimension,
+			DB:            s.DB(),
+			Dimension:     cfg.Vector.Embeddings.Dimension,
+			SkipExtension: cfg.Vector.SkipExtensionCreate,
 		})
 		if err != nil {
 			return fmt.Errorf("open pgvector backend: %w", err)

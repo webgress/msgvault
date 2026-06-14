@@ -22,9 +22,10 @@ var ErrNotBuilt = errors.New(
 // builds can compile call sites that reference it. None of the fields
 // are read because Open() always fails.
 type Options struct {
-	DB          *sql.DB
-	Dimension   int
-	SkipMigrate bool
+	DB            *sql.DB
+	Dimension     int
+	SkipMigrate   bool
+	SkipExtension bool
 }
 
 // Backend is a placeholder type so non-pgvector builds can compile

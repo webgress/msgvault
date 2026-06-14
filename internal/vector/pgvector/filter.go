@@ -25,8 +25,9 @@ func escapeLikeSubject(s string) string {
 // matching $N placeholder.
 //
 // The returned slice never contains the live-message predicate; callers
-// are expected to prepend that themselves (filteredMessageIDs seeds it
-// from store.LiveMessagesWhere; applyFilterClauses uses it inline).
+// are expected to prepend that themselves (filterExistsClause and
+// filteredChunkAndMessageCount seed it from store.LiveMessagesWhere;
+// applyFilterClauses uses it inline).
 func buildPGFilterClauses(f vector.Filter, bind func(any) string) []string {
 	var clauses []string
 

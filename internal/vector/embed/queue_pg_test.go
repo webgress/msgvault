@@ -65,7 +65,7 @@ func newPGQueueSchema(t *testing.T, n int) (db *sql.DB, dsn string) {
 	})
 
 	ctx := context.Background()
-	require.NoError(t, pgvector.Migrate(ctx, db, 0), "pgvector.Migrate")
+	require.NoError(t, pgvector.Migrate(ctx, db, 0, false), "pgvector.Migrate")
 
 	_, err = db.ExecContext(ctx, `
 		INSERT INTO index_generations (id, model, dimension, fingerprint, started_at, state)

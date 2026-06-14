@@ -62,7 +62,6 @@ CREATE TABLE IF NOT EXISTS embeddings (
 );
 CREATE INDEX IF NOT EXISTS idx_embeddings_msg ON embeddings(message_id);
 CREATE INDEX IF NOT EXISTS idx_embeddings_dim ON embeddings(dimension);
-CREATE INDEX IF NOT EXISTS idx_embeddings_gen_msg ON embeddings(generation_id, message_id);
 
 CREATE TABLE IF NOT EXISTS pending_embeddings (
     generation_id BIGINT NOT NULL REFERENCES index_generations(id) ON DELETE CASCADE,

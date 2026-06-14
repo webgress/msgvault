@@ -212,7 +212,7 @@ func TestOpenEmbeddingsMetadataDB_PG(t *testing.T) {
 	// into it so the helper's existence pre-check passes.
 	db, dsn := openServePGSchema(t)
 	ctx := context.Background()
-	require.NoError(t, pgvector.Migrate(ctx, db, 4), "pgvector.Migrate")
+	require.NoError(t, pgvector.Migrate(ctx, db, 4, false), "pgvector.Migrate")
 
 	savedCfg := cfg
 	defer func() { cfg = savedCfg }()
