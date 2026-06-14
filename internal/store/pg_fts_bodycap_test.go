@@ -200,32 +200,40 @@ func TestPG_FTSUpsert_MultibyteOversizedBody(t *testing.T) {
 		"search_fts must be non-NULL after byte-truncated multibyte upsert")
 }
 
-// TestPG_FTSUpsert_OversizedSubjectAndRecipients (finding C2) verifies that the
-// LEFT cap now applies to EVERY tsvector input field, not just the body. A
-// message whose SUBJECT and recipient (to) lists each exceed the tsvector cap
-// must still UpsertFTS-succeed (no hard SQLSTATE 54000 to the caller) and end up
-// indexed (search_fts non-NULL). Before the C2 fix subject/from/to/cc were fed
-// to to_tsvector uncapped, so an oversized subject alone could trip 54000.
+// TestPG_FTSUpsert_OversizedSubjectAndRecipients (finding C2/D1) verifies that
+// the byte-truncation now applies to EVERY tsvector input field, not just the
+// body. The inputs here are MULTIBYTE oversized documents (distinct 2-byte
+// tokens, >1MB tsvector pre-cap) — the adversarial shape the SQL LEFT char cap
+// CANNOT bound. A message whose SUBJECT and recipient (to) lists each exceed
+// the tsvector cap must still UpsertFTS-succeed (no hard SQLSTATE 54000 to the
+// caller) and end up indexed (search_fts non-NULL). Before the D1 fix
+// subject/from/to/cc got only the SQL LEFT char cap, so a multibyte oversized
+// subject alone could still trip 54000 and leave the row NULL; this test fails
+// without the per-field Go byte-truncation in FTSUpsert.
 func TestPG_FTSUpsert_OversizedSubjectAndRecipients(t *testing.T) {
 	skipUnlessPostgres(t)
 	f := storetest.New(t)
 	requirepkg.True(t, f.Store.FTS5Available(), "FTS must be available on PG")
 
-	bigSubject := oversizedBody() // distinct tokens, >1MB pre-cap
-	bigTo := oversizedBody()      // oversized recipient list as well
+	// Multibyte oversized inputs: the char-only LEFT cap cannot bound these, so
+	// reaching a non-NULL search_fts proves the D1 per-field byte-truncation ran.
+	bigSubject := multibyteOversizedBody() // distinct 2-byte tokens, >1MB pre-cap
+	bigTo := multibyteOversizedBody()      // oversized multibyte recipient list
+	requirepkg.Greater(t, len(bigSubject), 1_100_000, "multibyte subject must exceed 1MB of bytes")
+	requirepkg.Less(t, len([]rune(bigSubject)), len(bigSubject), "subject must contain multibyte runes")
 
 	t.Run("oversized subject only", func(t *testing.T) {
 		msgID := f.CreateMessage("oversized-subject")
 		err := f.Store.UpsertFTS(msgID, bigSubject, "normal body apricot",
 			"alice@example.com", "bob@example.com", "")
 		requirepkg.NoError(t, err,
-			"UpsertFTS with an oversized subject must succeed (subject is now LEFT-capped)")
+			"UpsertFTS with a multibyte oversized subject must succeed (subject is now byte-truncated)")
 
 		var isNull bool
 		requirepkg.NoError(t, f.Store.DB().QueryRow(
 			"SELECT search_fts IS NULL FROM messages WHERE id = $1", msgID).Scan(&isNull),
 			"probe search_fts")
-		assertpkg.False(t, isNull, "search_fts must be non-NULL after capped subject upsert")
+		assertpkg.False(t, isNull, "search_fts must be non-NULL after byte-truncated subject upsert")
 	})
 
 	t.Run("oversized subject and recipient list", func(t *testing.T) {
@@ -233,13 +241,13 @@ func TestPG_FTSUpsert_OversizedSubjectAndRecipients(t *testing.T) {
 		err := f.Store.UpsertFTS(msgID, bigSubject, "normal body banana",
 			"alice@example.com", bigTo, "")
 		requirepkg.NoError(t, err,
-			"UpsertFTS with oversized subject + recipient list must succeed (all fields LEFT-capped)")
+			"UpsertFTS with multibyte oversized subject + recipient list must succeed (all fields byte-truncated)")
 
 		var isNull bool
 		requirepkg.NoError(t, f.Store.DB().QueryRow(
 			"SELECT search_fts IS NULL FROM messages WHERE id = $1", msgID).Scan(&isNull),
 			"probe search_fts")
-		assertpkg.False(t, isNull, "search_fts must be non-NULL after capped subject+recipients upsert")
+		assertpkg.False(t, isNull, "search_fts must be non-NULL after byte-truncated subject+recipients upsert")
 	})
 }
 
