@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/rand"
 	"strings"
 	"time"
@@ -1046,7 +1047,12 @@ func (s *Store) backfillFTSRange(minID, maxID int64, progress func(done, total i
 		batchEnd := cursor + batchSize
 		n, err := s.backfillFTSBatch(cursor, batchEnd)
 		if err != nil {
-			return indexed, fmt.Errorf("backfill batch [%d,%d): %w", cursor, batchEnd, err)
+			// A single pathological row (e.g. a body that overflows
+			// PostgreSQL's tsvector limit) must not wedge the whole
+			// archive. Retry the batch one id at a time, skipping only
+			// the offending row(s) so every other message — including
+			// those after the bad row — still gets indexed.
+			n = s.backfillFTSRowByRow(cursor, batchEnd)
 		}
 		indexed += n
 		cursor = batchEnd
@@ -1057,6 +1063,26 @@ func (s *Store) backfillFTSRange(minID, maxID int64, progress func(done, total i
 		}
 	}
 	return indexed, nil
+}
+
+// backfillFTSRowByRow re-runs the batch backfill one message id at a time over
+// [fromID, toID), skipping (with a logged warning naming the id) any row whose
+// indexing fails. It is the row-level fallback for a batch that errored as a
+// whole, so a single bad row can never abort the surrounding backfill. Returns
+// the number of rows successfully indexed.
+func (s *Store) backfillFTSRowByRow(fromID, toID int64) int64 {
+	var indexed int64
+	for id := fromID; id < toID; id++ {
+		n, err := s.backfillFTSBatch(id, id+1)
+		if err != nil {
+			slog.Warn("skipping message in FTS backfill",
+				slog.Int64("message_id", id),
+				slog.Any("error", err))
+			continue
+		}
+		indexed += n
+	}
+	return indexed
 }
 
 // backfillFTSBatch inserts FTS rows for messages with id in [fromID, toID).
