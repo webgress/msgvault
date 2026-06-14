@@ -22,9 +22,9 @@ func TestPostgreSQLSanitizeFTSQuery_NoMetacharacters(t *testing.T) {
 	assert.Equal(t, "3:*", got)
 
 	// Inputs that are entirely metacharacters yield an empty arg.
-	assert.Equal(t, "", d.SanitizeFTSQuery("<>=#$"))
-	assert.Equal(t, "", d.SanitizeFTSQuery(""))
-	assert.Equal(t, "", d.SanitizeFTSQuery("   "))
+	assert.Empty(t, d.SanitizeFTSQuery("<>=#$"))
+	assert.Empty(t, d.SanitizeFTSQuery(""))
+	assert.Empty(t, d.SanitizeFTSQuery("   "))
 }
 
 // TestPostgreSQLSanitizeFTSQuery_AllowlistOnly asserts the output never contains

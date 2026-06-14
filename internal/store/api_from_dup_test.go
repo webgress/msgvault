@@ -3,6 +3,7 @@ package store_test
 import (
 	"database/sql"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -61,7 +62,7 @@ func TestStoreAPI_MultipleFromRows_NoDuplication(t *testing.T) {
 			SourceMessageID: fmt.Sprintf("fromdup-msg-%d", i),
 			MessageType:     "email",
 			SentAt:          sql.NullTime{Time: sameTime, Valid: true},
-			Subject:         sql.NullString{String: subjectTag + " " + fmt.Sprintf("%d", i), Valid: true},
+			Subject:         sql.NullString{String: subjectTag + " " + strconv.Itoa(i), Valid: true},
 			Snippet:         sql.NullString{String: subjectTag + " snippet", Valid: true},
 			SizeEstimate:    1000,
 		})

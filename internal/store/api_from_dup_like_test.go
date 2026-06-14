@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -44,7 +45,7 @@ func TestSearchMessagesLike_MultipleFromRows_NoDuplication(t *testing.T) {
 			SourceMessageID: fmt.Sprintf("fromduplike-msg-%d", i),
 			MessageType:     "email",
 			SentAt:          sql.NullTime{Time: sameTime, Valid: true},
-			Subject:         sql.NullString{String: tag + " " + fmt.Sprintf("%d", i), Valid: true},
+			Subject:         sql.NullString{String: tag + " " + strconv.Itoa(i), Valid: true},
 			Snippet:         sql.NullString{String: tag + " snippet", Valid: true},
 			SizeEstimate:    100,
 		})

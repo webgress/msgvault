@@ -77,7 +77,7 @@ func multibyteOversizedBody() string {
 	emitted := 0
 	for i := 0; emitted < targetRunes; i++ {
 		n := i
-		for d := 0; d < runesPerToken; d++ {
+		for range runesPerToken {
 			b.WriteRune(alphabet[n%len(alphabet)])
 			n /= len(alphabet)
 			emitted++
