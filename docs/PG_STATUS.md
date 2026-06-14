@@ -179,6 +179,23 @@ re-documented here: the pool-wide `statement_timeout` maintenance escape
 hatch (S1) and the live-PG test-coverage tag note — see the corresponding
 code and test changes for those.
 
+### A2 — Gmail-ID deletion match unscoped by `source_id`
+
+The deletion write path (`MarkMessageDeletedByGmailID` /
+`MarkMessagesDeletedByGmailIDBatch` in `internal/store/messages.go`, plus the
+read-side `GetMessageBySourceID`) matches on `source_message_id` **without a
+`source_id` scope**, so a Gmail-ID collision across two accounts would
+soft-delete/permanent-delete the wrong account's row (blast radius: one row).
+Scoping is **deferred**, not fixed: the deletion `Manifest`
+(`internal/deletion/manifest.go`) carries only a flat `GmailIDs []string` with
+no per-id `source_id`, and a single manifest can legitimately span multiple
+accounts (the account filter is optional in both `internal/tui/actions.go`
+`resolveGmailIDs` and `internal/mcp/handlers.go`), so a single
+`Filters.Account` cannot scope every id correctly. A correct fix needs a
+manifest schema/version change, which is out of scope. Gmail message IDs are
+random enough that a cross-account collision is astronomically unlikely. This
+behaves identically on SQLite and PG.
+
 ### A3 — No Parquet acceleration on PG
 
 On SQLite, the TUI and aggregate analytics run over denormalized DuckDB /
