@@ -914,6 +914,11 @@ func (e *SQLiteEngine) GetMessage(ctx context.Context, id int64) (*MessageDetail
 // message IDs are unique per account but theoretically could collide across accounts.
 // In practice, Gmail IDs are random enough that collisions are astronomically unlikely.
 // If you need to guarantee uniqueness, use the internal ID from GetMessage instead.
+//
+// A2 (deferred): the unscoped match mirrors the deletion write path
+// (internal/store/messages.go MarkMessageDeletedByGmailID). Adding a source_id
+// scope here is deferred for the same reason — see that function's doc and
+// docs/PG_STATUS.md.
 func (e *SQLiteEngine) GetMessageBySourceID(ctx context.Context, sourceMessageID string) (*MessageDetail, error) {
 	return e.getMessageByQuery(ctx, "m.source_message_id = ?", sourceMessageID)
 }
