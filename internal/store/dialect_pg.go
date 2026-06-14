@@ -208,14 +208,20 @@ func (d *PostgreSQLDialect) SchemaFTS() string {
 // CREATE INDEX pair is the PG analogue of SQLite's DROP-and-recreate
 // of the messages_fts virtual table; it covers a malformed index just
 // as the SQLite path covers a malformed shadow table.
-func (d *PostgreSQLDialect) FTSRebuildSchema(db *sql.DB) error {
-	if _, err := db.Exec("DROP INDEX IF EXISTS messages_search_fts_idx"); err != nil {
+//
+// Runs on the querier so RebuildFTS can route it through the maintenance
+// transaction: the full-table `UPDATE messages SET search_fts = NULL` here
+// has the same cost as FTSClearSQL (which is already hatched), and the GIN
+// rebuild over a populated table can likewise exceed the pool-wide 30s
+// statement_timeout on a large archive (finding S1).
+func (d *PostgreSQLDialect) FTSRebuildSchema(q querier) error {
+	if _, err := q.Exec("DROP INDEX IF EXISTS messages_search_fts_idx"); err != nil {
 		return fmt.Errorf("drop messages_search_fts_idx: %w", err)
 	}
-	if _, err := db.Exec("UPDATE messages SET search_fts = NULL"); err != nil {
+	if _, err := q.Exec("UPDATE messages SET search_fts = NULL"); err != nil {
 		return fmt.Errorf("clear search_fts: %w", err)
 	}
-	if _, err := db.Exec(
+	if _, err := q.Exec(
 		"CREATE INDEX IF NOT EXISTS messages_search_fts_idx ON messages USING GIN (search_fts)",
 	); err != nil {
 		return fmt.Errorf("create messages_search_fts_idx: %w", err)

@@ -1025,7 +1025,16 @@ func (s *Store) BackfillFTS(progress func(done, total int64)) (int64, error) {
 // exists to recover from. On successful completion, fts5Available is set to
 // true. Returns an error if the binary was built without FTS5 support.
 func (s *Store) RebuildFTS(progress func(done, total int64)) (int64, error) {
-	if err := s.dialect.FTSRebuildSchema(s.db.DB); err != nil {
+	// runMaintenance disables the pool-wide 30s statement_timeout for the
+	// schema teardown/rebuild. On PG, FTSRebuildSchema runs a full-table
+	// `UPDATE messages SET search_fts = NULL` (identical cost to the hatched
+	// FTSClearSQL) plus a GIN rebuild over a populated table — both can exceed
+	// 30s on a large archive and would cancel the rebuild-fts recovery command
+	// with SQLSTATE 57014 (finding S1). On SQLite the reset SQL is "" so this
+	// is an ordinary transaction around the DROP/CREATE of messages_fts.
+	if err := s.runMaintenance(context.Background(), func(ctx context.Context, tx *loggedTx) error {
+		return s.dialect.FTSRebuildSchema(tx)
+	}); err != nil {
 		return 0, err
 	}
 
@@ -1111,6 +1120,14 @@ func (s *Store) backfillFTSRowByRow(fromID, toID int64) int64 {
 	return indexed
 }
 
+// backfillFTSBatchErrHook is a test-only seam: when non-nil it is consulted
+// before each batch's UPDATE, and a non-nil return forces backfillFTSBatch to
+// fail for the given id range. It lets tests exercise backfillFTSRowByRow's
+// skip-and-continue fallback deterministically without depending on a body that
+// happens to overflow PostgreSQL's tsvector limit after the LEFT cap. Nil (and
+// thus a no-op) in production; only export_test.go ever sets it.
+var backfillFTSBatchErrHook func(fromID, toID int64) error
+
 // backfillFTSBatch inserts FTS rows for messages with id in [fromID, toID).
 //
 // Each batch runs under runMaintenance so the pool-wide 30s statement_timeout
@@ -1119,6 +1136,11 @@ func (s *Store) backfillFTSRowByRow(fromID, toID int64) int64 {
 // preserving the existing "partial progress is preserved if interrupted"
 // semantics. No-op timeout reset on SQLite.
 func (s *Store) backfillFTSBatch(fromID, toID int64) (int64, error) {
+	if backfillFTSBatchErrHook != nil {
+		if err := backfillFTSBatchErrHook(fromID, toID); err != nil {
+			return 0, err
+		}
+	}
 	var affected int64
 	err := s.runMaintenance(context.Background(), func(ctx context.Context, tx *loggedTx) error {
 		result, err := tx.ExecContext(ctx, s.dialect.FTSBackfillBatchSQL(), fromID, toID)
