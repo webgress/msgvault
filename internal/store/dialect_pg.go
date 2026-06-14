@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -84,15 +85,32 @@ func (d *PostgreSQLDialect) InsertOrIgnoreSuffix() string {
 	return " ON CONFLICT DO NOTHING"
 }
 
+// maxFTSBodyChars bounds the message-body text fed to to_tsvector. PostgreSQL
+// imposes a hard 1MB (1048575 bytes) limit on a single tsvector value and
+// errors ("string is too long for tsvector") when a document exceeds it, which
+// would otherwise leave the row's search_fts NULL forever and wedge backfill.
+//
+// The body is only one of several fields concatenated into the final tsvector
+// (subject + participants are appended), and a tsvector grows with the number
+// of distinct lexemes and their positions, not raw length. We cap at 600000
+// characters rather than the 1000000-char headline: bodies are arbitrary UTF-8
+// where a single character can be up to 4 bytes, and a pathological document of
+// many short distinct tokens packs near one lexeme per few bytes, so the
+// margin keeps the resulting tsvector comfortably under 1MB even in the worst
+// case. SQLite's FTS5 has no such limit, so this cap is PostgreSQL-only.
+const maxFTSBodyChars = 600000
+
 // FTSUpsert updates the tsvector column on messages for a single message.
 // PostgreSQL stores the FTS index inline on `messages.search_fts`, so there
 // is no separate virtual table — the operation is an UPDATE, not an INSERT.
+// The body ($3) is truncated to maxFTSBodyChars to stay under PostgreSQL's 1MB
+// tsvector limit.
 func (d *PostgreSQLDialect) FTSUpsert(q querier, doc FTSDoc) error {
 	_, err := q.Exec(
 		`UPDATE messages SET search_fts =
 			setweight(to_tsvector('simple', COALESCE($2, '')), 'A') ||
 			setweight(to_tsvector('simple', COALESCE($4, '')), 'B') ||
-			to_tsvector('simple', COALESCE($3, '')) ||
+			to_tsvector('simple', LEFT(COALESCE($3, ''), `+strconv.Itoa(maxFTSBodyChars)+`)) ||
 			to_tsvector('simple', COALESCE($5, '')) ||
 			to_tsvector('simple', COALESCE($6, ''))
 		WHERE id = $1`,
@@ -127,7 +145,7 @@ func (d *PostgreSQLDialect) FTSDeleteSQL() string {
 func (d *PostgreSQLDialect) FTSBackfillBatchSQL() string {
 	return `UPDATE messages m SET search_fts =
 		setweight(to_tsvector('simple', COALESCE(m.subject, '')), 'A') ||
-		to_tsvector('simple', COALESCE(src.body_text, '')) ||
+		to_tsvector('simple', LEFT(COALESCE(src.body_text, ''), ` + strconv.Itoa(maxFTSBodyChars) + `)) ||
 		setweight(to_tsvector('simple', COALESCE(
 			CASE WHEN m.message_type != 'email' AND m.message_type IS NOT NULL AND m.message_type != ''
 			     THEN (SELECT COALESCE(p.phone_number, p.email_address) FROM participants p WHERE p.id = m.sender_id)
@@ -155,18 +173,23 @@ func (d *PostgreSQLDialect) FTSAvailable(db *sql.DB) bool {
 }
 
 // FTSNeedsBackfill reports whether the tsvector column needs population.
-// Counts NULL search_fts rows directly so an interrupted backfill that
-// leaves a low-id row NULL (and later inserts continue normally) still
-// flags the gap — the previous max-vs-max comparison missed that case.
-// Costs one indexable WHERE COUNT(*) per startup probe.
+// Probes for the existence of any NULL search_fts row so an interrupted
+// backfill that leaves a low-id row NULL (and later inserts continue normally)
+// still flags the gap — the previous max-vs-max comparison missed that case.
+//
+// Uses EXISTS rather than COUNT(*): a GIN index on search_fts cannot serve an
+// `IS NULL` predicate, so COUNT(*) was a full sequential scan of every message
+// on each startup. EXISTS short-circuits at the first NULL row. The partial
+// btree index idx_messages_search_fts_null (created by EnsureFTSIndex) makes
+// even the false case index-served and self-pruning as backfill completes.
 func (d *PostgreSQLDialect) FTSNeedsBackfill(db *sql.DB) bool {
-	var nullCount int64
+	var exists bool
 	if err := db.QueryRow(
-		"SELECT COUNT(*) FROM messages WHERE search_fts IS NULL",
-	).Scan(&nullCount); err != nil {
+		"SELECT EXISTS (SELECT 1 FROM messages WHERE search_fts IS NULL)",
+	).Scan(&exists); err != nil {
 		return false
 	}
-	return nullCount > 0
+	return exists
 }
 
 // FTSClearSQL returns the SQL to clear all tsvector data.
@@ -244,6 +267,15 @@ func (d *PostgreSQLDialect) EnsureFTSIndex(db *sql.DB) error {
 	); err != nil {
 		return fmt.Errorf("create messages_search_fts_idx: %w", err)
 	}
+	// Partial btree index that serves the FTSNeedsBackfill probe (a GIN index
+	// on search_fts cannot answer an IS NULL predicate). It only indexes the
+	// rows still awaiting backfill, so it self-prunes to empty as backfill
+	// completes and stays tiny thereafter.
+	if _, err := db.Exec(
+		"CREATE INDEX IF NOT EXISTS idx_messages_search_fts_null ON messages (id) WHERE search_fts IS NULL",
+	); err != nil {
+		return fmt.Errorf("create idx_messages_search_fts_null: %w", err)
+	}
 	return nil
 }
 
@@ -301,12 +333,21 @@ func (d *PostgreSQLDialect) IsNoSuchModuleError(err error) bool { return false }
 // IsReturningError always returns false for PostgreSQL (RETURNING always supported).
 func (d *PostgreSQLDialect) IsReturningError(err error) bool { return false }
 
-// IsBusyError reports whether err indicates the database is held by another
-// connection. PostgreSQL surfaces this as SQLSTATE 55P03 (lock_not_available)
-// for statement_timeout-triggered lock waits and 40P01 (deadlock_detected)
-// for deadlocks; both mean "retry later.".
+// IsBusyError reports whether err indicates write contention that a bounded
+// retry loop should treat as "retry later". The SQLSTATEs covered:
+//
+//   - 55P03 (lock_not_available): a NOWAIT request (or lock_timeout) could not
+//     acquire a lock. We do not set lock_timeout here, so this fires for NOWAIT
+//     callers; included for completeness.
+//   - 40P01 (deadlock_detected): the deadlock detector aborted this transaction.
+//   - 57014 (query_canceled): raised when statement_timeout fires. Under
+//     contention a statement blocks on a lock until statement_timeout cancels
+//     it, so 57014 is the common contention symptom on PostgreSQL. 57014 is
+//     also raised by user/context cancellation; treating it as busy is
+//     acceptable because every busy-retry loop here is bounded, so a genuine
+//     cancel cannot spin indefinitely.
 func (d *PostgreSQLDialect) IsBusyError(err error) bool {
-	return isPgError(err, "55P03") || isPgError(err, "40P01")
+	return isPgError(err, "55P03") || isPgError(err, "40P01") || isPgError(err, "57014")
 }
 
 // BeginExclusive opens a transaction on conn and locks every table the
