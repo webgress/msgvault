@@ -166,6 +166,129 @@ requires a `vector.FusingBackend` and returns an error if the backend does
 not implement it (`internal/vector/hybrid/engine.go`); both concrete
 backends do, so the native fused path always runs.
 
+## Known Trade-offs at Scale
+
+The PostgreSQL path is functionally complete for the happy path and the
+concurrency-sensitive paths, and is exercised end-to-end against live PG in
+CI. The remaining risks are **operational-at-scale**, not logical. This
+section documents the trade-offs a code review flagged as real but either
+out-of-scope to fix now (schema/perf changes) or operational guidance.
+
+Two related hazards are addressed in code and are intentionally *not*
+re-documented here: the pool-wide `statement_timeout` maintenance escape
+hatch (S1) and the live-PG test-coverage tag note — see the corresponding
+code and test changes for those.
+
+### A3 — No Parquet acceleration on PG
+
+On SQLite, the TUI and aggregate analytics run over denormalized DuckDB /
+Parquet files (~3000× faster than SQLite JOINs, per `CLAUDE.md`). The PG
+path has **no counterpart to that acceleration layer**: the TUI / aggregate
+surface runs live relational SQL through the dialect-parameterized query
+engine. At the stated target (20+ years, 1M+ messages), drill-down
+aggregates such as `buildAggregateSQL` (which `LEFT JOIN`s an
+`attachments GROUP BY message_id` derived table) execute live on every
+navigation. These live plans have **not yet been validated with
+`EXPLAIN ANALYZE` on a realistic corpus**, and there is no
+materialized-view or caching story on PG yet. PG's planner is far stronger
+than SQLite's, but expect live aggregation latency rather than
+Parquet-instant results until this is measured and (if needed) cached.
+
+### A4 — `TextEngine` feature gap on PG
+
+Features exposed only through `query.TextEngine` — the conversation / text
+views built on FTS5 `MATCH` and `strftime` — are **SQLite-only**. On PG
+these surfaces are intentionally unavailable: the type assertion to
+`TextEngine` fails cleanly rather than emitting SQLite-specific SQL against
+PostgreSQL. UI surfaces that depend on `TextEngine` therefore lose those
+features on the PG backend by design.
+
+### A5 — `CopySubset` is SQLite-only
+
+Subset export (`internal/store/subset.go` / `CopySubset`) always targets a
+SQLite destination and is **not part of the PG path**; callers gate it off
+PostgreSQL. This ties into the missing SQLite→PG migration tool — see S6
+below.
+
+### P1 — Inline `tsvector` write amplification
+
+`search_fts` lives **inline on the `messages` table** (GIN-indexed) rather
+than in a separate FTS table the way SQLite uses `messages_fts`. As a
+result, each FTS upsert is a non-HOT update of a GIN-indexed column, and
+`FTSDelete` / `FTSClear` rewrite full message rows. The effect is write
+amplification and MVCC bloat during bulk sync, relative to SQLite's
+separate-table design. A future schema change (moving FTS to a separate
+table) would mitigate this, but it is **deferred** — schema/migration
+changes are out of scope for the current work.
+
+### V4 — Retire churn and vacuum expectations
+
+To keep the shared per-dimension HNSW graph clean, retiring a pgvector
+generation **deletes that generation's embedding rows** (see "Retiring a
+generation deletes its embedding rows" above). Each rebuild cycle therefore
+churns roughly corpus-size rows (delete + re-insert). Until autovacuum
+catches up, dead tuples linger in the heap and in the HNSW graph and degrade
+scan performance. **Tune autovacuum on the `embeddings` table** (or run a
+manual `VACUUM` after a retire) for archives where rebuilds are frequent.
+
+### V6 — Three FTS query grammars
+
+Full-text query parsing differs across mode and backend, so the *same query
+string can match different documents*:
+
+- **Non-fused PG search** uses `to_tsquery` with `:*` prefix matching.
+- **Fused (hybrid) PG search** uses `websearch_to_tsquery`, which has **no**
+  prefix matching.
+- **SQLite** uses FTS5 `MATCH`.
+
+The most visible consequence: prefix matching that works in non-fused PG
+search is absent in fused/hybrid PG search.
+
+### S6 — `IDENTITY` columns and a future migrator
+
+PG tables use `GENERATED ALWAYS AS IDENTITY` for primary keys. Any future
+SQLite→PG migrator that needs to **preserve existing message ids** must
+insert with `INSERT ... OVERRIDING SYSTEM VALUE` and then `setval()` the
+identity sequences afterward so server-generated ids continue from the right
+point. (FTS and embeddings can be rebuilt rather than copied.)
+
+### T1 — No scale / plan validation yet
+
+All live-PG tests run against **small corpora**. Small-corpus tests cannot
+catch the at-scale risks above — the `statement_timeout` maintenance hazard
+(S1), live-aggregate latency (A3), and the fused-query plan shape (V1 / V2).
+Before trusting PG as the primary backend, run a **one-off seeded 1M-row
+benchmark** and capture `EXPLAIN ANALYZE` for both fused hybrid search and
+the TUI aggregates. **Record the results here when done.**
+
+### T4 — TUI is not driven against PG directly
+
+The TUI is exercised against PG only at the **query-engine layer**
+(`pg_compat_test.go`). The Bubble Tea layer is engine-agnostic and is not
+driven against PostgreSQL directly. This is acceptable given the TUI's
+engine independence, but note that "TUI on PG" coverage is engine-level, not
+UI-level.
+
+### Security / deployment
+
+- **SEC1 — DSN / password handling.** The PostgreSQL DSN, including the
+  password, lives in `~/.msgvault/config.toml` and is held in memory as
+  `Store.dbPath`. Recommendations:
+  - `chmod 600 ~/.msgvault/config.toml`.
+  - To keep the password out of the file entirely, use pgx's native
+    `PGPASSWORD` environment variable or a `~/.pgpass` entry combined with a
+    password-less DSN.
+  - Set `sslmode` explicitly for a LAN deployment (`require` or
+    `verify-full`). CI uses `sslmode=disable`, which is fine for CI but
+    should **not** be cargo-culted into a real deployment.
+- **SEC2 — Read-only is a session default, not a role.** Read-only
+  enforcement is `default_transaction_read_only=on`, applied per pooled
+  connection as a **session default** — in-session SQL could flip it back.
+  This is sufficient for the single-user trust model. However, if `serve` /
+  MCP is ever exposed beyond localhost, provision a **dedicated read-only
+  PostgreSQL role** as the real security boundary instead of relying on the
+  session default.
+
 ## Running Tests Against PostgreSQL
 
 ```bash
