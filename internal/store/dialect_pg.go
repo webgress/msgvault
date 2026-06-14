@@ -130,15 +130,16 @@ const maxFTSBodyChars = 600000
 // path keeps the char cap and relies on the row-by-row skip for any residual.
 const maxFTSBodyBytes = 700000
 
-// truncateBytesRuneSafe returns s truncated to at most maxBytes bytes without
-// splitting a multibyte UTF-8 rune. If s already fits it is returned unchanged.
-func truncateBytesRuneSafe(s string, maxBytes int) string {
-	if len(s) <= maxBytes {
+// truncateBytesRuneSafe returns s truncated to at most maxFTSBodyBytes bytes
+// without splitting a multibyte UTF-8 rune. If s already fits it is returned
+// unchanged.
+func truncateBytesRuneSafe(s string) string {
+	if len(s) <= maxFTSBodyBytes {
 		return s
 	}
-	// Walk back from maxBytes to the start of the rune that straddles the
-	// boundary so we never emit a partial rune.
-	cut := maxBytes
+	// Walk back from maxFTSBodyBytes to the start of the rune that straddles
+	// the boundary so we never emit a partial rune.
+	cut := maxFTSBodyBytes
 	for cut > 0 && !utf8.RuneStart(s[cut]) {
 		cut--
 	}
@@ -160,19 +161,19 @@ func truncateBytesRuneSafe(s string, maxBytes int) string {
 // callers treat the returned error as warn-only on the sync path (search_fts
 // stays NULL), so a bad input can never wedge FTS.
 func (d *PostgreSQLDialect) FTSUpsert(q querier, doc FTSDoc) error {
-	subject := truncateBytesRuneSafe(doc.Subject, maxFTSBodyBytes)
-	body := truncateBytesRuneSafe(doc.Body, maxFTSBodyBytes)
-	fromAddr := truncateBytesRuneSafe(doc.FromAddr, maxFTSBodyBytes)
-	toAddrs := truncateBytesRuneSafe(doc.ToAddrs, maxFTSBodyBytes)
-	ccAddrs := truncateBytesRuneSafe(doc.CcAddrs, maxFTSBodyBytes)
-	cap := strconv.Itoa(maxFTSBodyChars)
+	subject := truncateBytesRuneSafe(doc.Subject)
+	body := truncateBytesRuneSafe(doc.Body)
+	fromAddr := truncateBytesRuneSafe(doc.FromAddr)
+	toAddrs := truncateBytesRuneSafe(doc.ToAddrs)
+	ccAddrs := truncateBytesRuneSafe(doc.CcAddrs)
+	charCap := strconv.Itoa(maxFTSBodyChars)
 	_, err := q.Exec(
 		`UPDATE messages SET search_fts =
-			setweight(to_tsvector('simple', LEFT(COALESCE($2, ''), `+cap+`)), 'A') ||
-			setweight(to_tsvector('simple', LEFT(COALESCE($4, ''), `+cap+`)), 'B') ||
-			to_tsvector('simple', LEFT(COALESCE($3, ''), `+cap+`)) ||
-			to_tsvector('simple', LEFT(COALESCE($5, ''), `+cap+`)) ||
-			to_tsvector('simple', LEFT(COALESCE($6, ''), `+cap+`))
+			setweight(to_tsvector('simple', LEFT(COALESCE($2, ''), `+charCap+`)), 'A') ||
+			setweight(to_tsvector('simple', LEFT(COALESCE($4, ''), `+charCap+`)), 'B') ||
+			to_tsvector('simple', LEFT(COALESCE($3, ''), `+charCap+`)) ||
+			to_tsvector('simple', LEFT(COALESCE($5, ''), `+charCap+`)) ||
+			to_tsvector('simple', LEFT(COALESCE($6, ''), `+charCap+`))
 		WHERE id = $1`,
 		doc.MessageID, subject, body,
 		fromAddr, toAddrs, ccAddrs,
@@ -203,19 +204,19 @@ func (d *PostgreSQLDialect) FTSDeleteSQL() string {
 // Parameters: $1=fromID, $2=toID. Uses LEFT JOIN on message_bodies via a subquery
 // so messages without a body row are still indexed (subject + participants).
 func (d *PostgreSQLDialect) FTSBackfillBatchSQL() string {
-	cap := strconv.Itoa(maxFTSBodyChars)
+	charCap := strconv.Itoa(maxFTSBodyChars)
 	return `UPDATE messages m SET search_fts =
-		setweight(to_tsvector('simple', LEFT(COALESCE(m.subject, ''), ` + cap + `)), 'A') ||
-		to_tsvector('simple', LEFT(COALESCE(src.body_text, ''), ` + cap + `)) ||
+		setweight(to_tsvector('simple', LEFT(COALESCE(m.subject, ''), ` + charCap + `)), 'A') ||
+		to_tsvector('simple', LEFT(COALESCE(src.body_text, ''), ` + charCap + `)) ||
 		setweight(to_tsvector('simple', LEFT(COALESCE(
 			CASE WHEN m.message_type != 'email' AND m.message_type IS NOT NULL AND m.message_type != ''
 			     THEN (SELECT COALESCE(p.phone_number, p.email_address) FROM participants p WHERE p.id = m.sender_id)
 			END,
 			(SELECT STRING_AGG(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'from'),
 			''
-		), ` + cap + `)), 'B') ||
-		to_tsvector('simple', LEFT(COALESCE((SELECT STRING_AGG(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'to'), ''), ` + cap + `)) ||
-		to_tsvector('simple', LEFT(COALESCE((SELECT STRING_AGG(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'cc'), ''), ` + cap + `))
+		), ` + charCap + `)), 'B') ||
+		to_tsvector('simple', LEFT(COALESCE((SELECT STRING_AGG(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'to'), ''), ` + charCap + `)) ||
+		to_tsvector('simple', LEFT(COALESCE((SELECT STRING_AGG(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = 'cc'), ''), ` + charCap + `))
 	FROM (
 		SELECT m2.id, mb.body_text
 		FROM messages m2

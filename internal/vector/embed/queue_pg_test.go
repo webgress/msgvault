@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -426,7 +427,7 @@ func TestQueuePG_ConcurrentClaim_SkipLocked(t *testing.T) {
 	}
 
 	// The union of claimed IDs must equal exactly {1..n} with no duplicates.
-	sort.Slice(allIDs, func(i, j int) bool { return allIDs[i] < allIDs[j] })
+	slices.Sort(allIDs)
 	require.Len(t, allIDs, n, "total claimed rows must equal n (no rows unclaimed and no duplicates)")
 	for i, id := range allIDs {
 		assert.Equal(t, int64(i+1), id, "claimed ID at position %d", i)

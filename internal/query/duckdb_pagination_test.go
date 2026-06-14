@@ -35,7 +35,7 @@ func TestDuckDBPaginationStability_IdenticalSortKey(t *testing.T) {
 	// conversations whose last_message_at is identical (for ListConversations).
 	wantMsgIDs := make(map[int64]struct{}, n)
 	wantConvIDs := make(map[int64]struct{}, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		convID := int64(100 + i)
 		mid := b.AddMessage(MessageOpt{
 			MessageType:    "sms",
@@ -90,7 +90,7 @@ func TestDuckDBPaginationStability_IdenticalSortKey(t *testing.T) {
 func pageDuckOneByOne(t *testing.T, n int, fetch func(offset int) (int64, bool)) []int64 {
 	t.Helper()
 	seen := make([]int64, 0, n)
-	for offset := 0; offset < n; offset++ {
+	for offset := range n {
 		id, ok := fetch(offset)
 		requirepkg.Truef(t, ok, "page at offset=%d returned no row (pagination skipped a row)", offset)
 		seen = append(seen, id)

@@ -3,6 +3,7 @@ package store_test
 import (
 	"database/sql"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -47,7 +48,7 @@ func TestStoreAPI_PaginationStability_IdenticalSentAt(t *testing.T) {
 			SourceMessageID: fmt.Sprintf("api-page-msg-%d", i),
 			MessageType:     "email",
 			SentAt:          sql.NullTime{Time: sameTime, Valid: true},
-			Subject:         sql.NullString{String: subjectTag + " " + fmt.Sprintf("%d", i), Valid: true},
+			Subject:         sql.NullString{String: subjectTag + " " + strconv.Itoa(i), Valid: true},
 			Snippet:         sql.NullString{String: "snippet", Valid: true},
 			SizeEstimate:    1000,
 		})

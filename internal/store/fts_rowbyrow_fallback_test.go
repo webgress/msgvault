@@ -133,7 +133,7 @@ func TestPG_BackfillFTS_RowByRowFallbackSkipsBadRow(t *testing.T) {
 		"a skip warning must be logged")
 	assertpkg.Contains(t, logs, fmt.Sprintf(`"message_id":%d`, badID),
 		"the skip warning must name the skipped message id")
-	assertpkg.Equal(t, strings.Count(logs, "skipping message in FTS backfill"), 1,
+	assertpkg.Equal(t, 1, strings.Count(logs, "skipping message in FTS backfill"),
 		"exactly one row should be skipped")
 }
 
@@ -185,7 +185,7 @@ func TestPG_BackfillFTS_NonSizeErrorAborts(t *testing.T) {
 		_, err := f.Store.BackfillFTS(nil)
 		requirepkg.Error(t, err, "BackfillFTS must ABORT on a non-size SQLSTATE")
 		var pgErr *pgconn.PgError
-		requirepkg.True(t, errors.As(err, &pgErr), "a PgError must propagate")
+		requirepkg.ErrorAs(t, err, &pgErr, "a PgError must propagate")
 		assertpkg.Equal(t, "08006", pgErr.Code, "the original SQLSTATE must propagate")
 	})
 }

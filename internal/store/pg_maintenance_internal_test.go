@@ -144,7 +144,7 @@ func TestExclusiveLockTablesCoverCascade(t *testing.T) {
 // on. SQLite returns "" so runMaintenance issues no reset.
 func TestMaintenanceTimeoutResetSQL(t *testing.T) {
 	assert.Equal(t, "SET LOCAL statement_timeout = 0", (&PostgreSQLDialect{}).MaintenanceTimeoutResetSQL())
-	assert.Equal(t, "", (&SQLiteDialect{}).MaintenanceTimeoutResetSQL())
+	assert.Empty(t, (&SQLiteDialect{}).MaintenanceTimeoutResetSQL())
 }
 
 // is57014 reports whether err is the PostgreSQL query_canceled SQLSTATE raised
