@@ -100,10 +100,13 @@ func (d *PostgreSQLDialect) InsertOrIgnoreSuffix() string {
 // (mostly-ASCII, repetitive) bodies, but does not make it impossible.
 //
 // A residual SQLSTATE 54000 is handled GRACEFULLY rather than wedging FTS:
-//   - Sync path (FTSUpsert): the body is additionally byte-truncated in Go to
-//     maxFTSBodyBytes BEFORE binding (see below), and any UpsertFTS error is
-//     warn-only at the call site — the message still persists with search_fts
-//     left NULL.
+//   - Sync path (FTSUpsert): ALL FIVE tsvector inputs (subject, body, from, to,
+//     cc) are additionally byte-truncated in Go to maxFTSBodyBytes BEFORE
+//     binding (see below) — the SQL LEFT char cap cannot bound multibyte input,
+//     so byte-truncating every field (not just the body) is what keeps a
+//     multibyte subject/recipient list from tripping the limit. Any UpsertFTS
+//     error is warn-only at the call site — the message still persists with
+//     search_fts left NULL.
 //   - Backfill path (FTSBackfillBatchSQL): the body lives in the DB, so only
 //     the LEFT char cap applies; backfillFTSRowByRow skips the offending row
 //     (with a logged warning) and continues, so one pathological row never
@@ -112,8 +115,9 @@ func (d *PostgreSQLDialect) InsertOrIgnoreSuffix() string {
 // SQLite's FTS5 has no such limit, so this cap is PostgreSQL-only.
 const maxFTSBodyChars = 600000
 
-// maxFTSBodyBytes is the BYTE bound applied to the body on the sync path
-// (FTSUpsert) as defense-in-depth, in addition to the SQL LEFT char cap. It is
+// maxFTSBodyBytes is the BYTE bound applied to EACH tsvector input field
+// (subject, body, from, to, cc) on the sync path (FTSUpsert) as defense-in-
+// depth, in addition to the SQL LEFT char cap. It is
 // well under PostgreSQL's 1MB (1048575-byte) tsvector limit: for the worst-case
 // shape — a body of all-distinct multibyte tokens, where the packed tsvector
 // (lexeme bytes + per-position overhead) is roughly the same order as the input
@@ -145,14 +149,22 @@ func truncateBytesRuneSafe(s string, maxBytes int) string {
 // PostgreSQL stores the FTS index inline on `messages.search_fts`, so there
 // is no separate virtual table — the operation is an UPDATE, not an INSERT.
 //
-// The body is bounded twice: byte-truncated to maxFTSBodyBytes in Go here
-// (rune-safe, robust against multibyte input that the SQL char cap cannot
-// bound) and additionally LEFT-capped to maxFTSBodyChars in SQL. A residual
-// SQLSTATE 54000 is still possible only for pathologically dense input; callers
-// treat the returned error as warn-only on the sync path (search_fts stays
-// NULL), so a bad body can never wedge FTS.
+// ALL FIVE tsvector inputs (subject, body, from, to, cc) are bounded twice on
+// this sync path: byte-truncated to maxFTSBodyBytes in Go here (rune-safe,
+// robust against multibyte input that the SQL char cap cannot bound) and
+// additionally LEFT-capped to maxFTSBodyChars in SQL. The SQL LEFT char cap
+// cannot bound multibyte input, so a multibyte subject/recipient list could
+// otherwise still trip SQLSTATE 54000 and leave search_fts NULL — the Go
+// byte-truncation closes that gap for every field, not just the body. A
+// residual 54000 is still possible only for pathologically dense input;
+// callers treat the returned error as warn-only on the sync path (search_fts
+// stays NULL), so a bad input can never wedge FTS.
 func (d *PostgreSQLDialect) FTSUpsert(q querier, doc FTSDoc) error {
+	subject := truncateBytesRuneSafe(doc.Subject, maxFTSBodyBytes)
 	body := truncateBytesRuneSafe(doc.Body, maxFTSBodyBytes)
+	fromAddr := truncateBytesRuneSafe(doc.FromAddr, maxFTSBodyBytes)
+	toAddrs := truncateBytesRuneSafe(doc.ToAddrs, maxFTSBodyBytes)
+	ccAddrs := truncateBytesRuneSafe(doc.CcAddrs, maxFTSBodyBytes)
 	cap := strconv.Itoa(maxFTSBodyChars)
 	_, err := q.Exec(
 		`UPDATE messages SET search_fts =
@@ -162,8 +174,8 @@ func (d *PostgreSQLDialect) FTSUpsert(q querier, doc FTSDoc) error {
 			to_tsvector('simple', LEFT(COALESCE($5, ''), `+cap+`)) ||
 			to_tsvector('simple', LEFT(COALESCE($6, ''), `+cap+`))
 		WHERE id = $1`,
-		doc.MessageID, doc.Subject, body,
-		doc.FromAddr, doc.ToAddrs, doc.CcAddrs,
+		doc.MessageID, subject, body,
+		fromAddr, toAddrs, ccAddrs,
 	)
 	return err
 }
