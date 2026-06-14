@@ -93,7 +93,7 @@ func (s *Store) ListMessages(offset, limit int) ([]APIMessage, int64, error) {
 		LEFT JOIN message_recipients mr ON mr.message_id = m.id AND mr.recipient_type = 'from'
 		LEFT JOIN participants p ON p.id = COALESCE(m.sender_id, mr.participant_id)
 		WHERE %s
-		ORDER BY COALESCE(m.sent_at, m.received_at, m.internal_date) DESC
+		ORDER BY COALESCE(m.sent_at, m.received_at, m.internal_date) DESC, m.id DESC
 		LIMIT ? OFFSET ?
 	`, participantDisplaySQL, LiveMessagesWhere("m", true))
 
@@ -502,7 +502,7 @@ func (s *Store) searchMessagesQueryImpl(
 	}
 
 	// Results query.
-	orderBy := "COALESCE(m.sent_at, m.received_at, m.internal_date) DESC"
+	orderBy := "COALESCE(m.sent_at, m.received_at, m.internal_date) DESC, m.id DESC"
 	if ftsEnabled {
 		orderBy = ftsOrder + ", " + orderBy
 	}
@@ -611,7 +611,7 @@ func (s *Store) searchMessagesLike(query string, offset, limit int) ([]APIMessag
 		LEFT JOIN participants p ON p.id = COALESCE(m.sender_id, mr.participant_id)
 		WHERE %s
 		AND (LOWER(m.subject) LIKE ? ESCAPE '\' OR LOWER(m.snippet) LIKE ? ESCAPE '\')
-		ORDER BY COALESCE(m.sent_at, m.received_at, m.internal_date) DESC
+		ORDER BY COALESCE(m.sent_at, m.received_at, m.internal_date) DESC, m.id DESC
 		LIMIT ? OFFSET ?
 	`, participantDisplaySQL, LiveMessagesWhere("m", true))
 
