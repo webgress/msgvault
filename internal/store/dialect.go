@@ -105,8 +105,14 @@ type Dialect interface {
 	// Used to recover from malformed FTS shadow-table state that in-place
 	// rebuild operations (e.g., SQLite's rebuild pragma) cannot clear.
 	// SQLite: DROP TABLE IF EXISTS messages_fts + re-execute schema_sqlite.sql.
-	// PostgreSQL: TODO (REINDEX / recompute tsvector column).
-	FTSRebuildSchema(db *sql.DB) error
+	// PostgreSQL: DROP INDEX + full-table search_fts = NULL + recreate GIN.
+	//
+	// Takes a querier (not *sql.DB) so RebuildFTS can run it on the
+	// maintenance transaction whose statement_timeout has been disabled — the
+	// PG path includes a full-table tsvector clear (same cost as FTSClearSQL)
+	// plus a GIN rebuild over a populated table, both of which can exceed the
+	// pool-wide 30s timeout on a large archive (finding S1).
+	FTSRebuildSchema(q querier) error
 
 	// EnsureFTSIndex idempotently creates any FTS index that must be created
 	// AFTER LegacyColumnMigrations have added the FTS column. SQLite is a

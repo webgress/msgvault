@@ -187,16 +187,20 @@ func (d *SQLiteDialect) SchemaFTS() string {
 // DROP pathway discards FTS5 shadow tables in their entirety, which is the
 // only reliable fix when those shadow tables are malformed — the `rebuild`
 // pragma reads from them and `delete-all` is rejected on contentful tables.
-func (d *SQLiteDialect) FTSRebuildSchema(db *sql.DB) error {
-	ctx := context.Background()
-	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS messages_fts"); err != nil {
+//
+// Runs on the querier so RebuildFTS can route it through the maintenance
+// transaction (finding S1). SQLite DDL is transactional, so DROP/CREATE of
+// the virtual table run fine inside the tx runMaintenance opens; SQLite has
+// no statement_timeout, so the hatch is a plain transaction here.
+func (d *SQLiteDialect) FTSRebuildSchema(q querier) error {
+	if _, err := q.Exec("DROP TABLE IF EXISTS messages_fts"); err != nil {
 		return fmt.Errorf("drop messages_fts: %w", err)
 	}
 	schema, err := schemaFS.ReadFile("schema_sqlite.sql")
 	if err != nil {
 		return fmt.Errorf("read schema_sqlite.sql: %w", err)
 	}
-	if _, err := db.ExecContext(ctx, string(schema)); err != nil {
+	if _, err := q.Exec(string(schema)); err != nil {
 		if d.IsNoSuchModuleError(err) {
 			return errors.New("cannot rebuild FTS: this msgvault binary was built without " +
 				"FTS5 support (rebuild with `-tags fts5`)",
