@@ -225,28 +225,17 @@ func (PostgreSQLQueryDialect) BuildFTSTerm(terms []string) (expr string, arg str
 	return "m.search_fts @@ to_tsquery('simple', ?)", strings.Join(tsTerms, " & ")
 }
 
-// SanitizeFTSQuery builds a tsquery arg from a single user string: splits on
-// whitespace, strips tsquery metacharacters, and joins with " & " with ":*"
-// prefix matching. Returns "" if empty.
+// SanitizeFTSQuery builds a tsquery arg from a single user string using the
+// allowlist tokenizer sqldialect.EscapeTSQueryTerm: the input is split on every
+// rune that isn't a Unicode letter or digit, and each resulting lexeme is
+// suffixed with ":*" for prefix matching and joined with " & ". This mirrors
+// BuildFTSTerm exactly so both PG FTS paths emit the same lexeme set, and
+// guarantees no tsquery metacharacter (`<`, `=`, `&`, etc.) ever reaches
+// to_tsquery. Returns "" if the input collapses to nothing usable.
 func (PostgreSQLQueryDialect) SanitizeFTSQuery(query string) string {
-	var b strings.Builder
-	for _, r := range query {
-		switch r {
-		case '&', '|', '!', '(', ')', ':', '*', '\\', '\'':
-			continue
-		case '@', '.', '-', '/', ',', ';', '"':
-			b.WriteRune(' ')
-		default:
-			b.WriteRune(r)
-		}
-	}
-	tokens := strings.Fields(b.String())
-	if len(tokens) == 0 {
-		return ""
-	}
-	parts := make([]string, 0, len(tokens))
-	for _, t := range tokens {
-		parts = append(parts, t+":*")
+	var parts []string
+	for _, lex := range sqldialect.EscapeTSQueryTerm(query) {
+		parts = append(parts, lex+":*")
 	}
 	return strings.Join(parts, " & ")
 }
