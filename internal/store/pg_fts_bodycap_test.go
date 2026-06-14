@@ -200,6 +200,49 @@ func TestPG_FTSUpsert_MultibyteOversizedBody(t *testing.T) {
 		"search_fts must be non-NULL after byte-truncated multibyte upsert")
 }
 
+// TestPG_FTSUpsert_OversizedSubjectAndRecipients (finding C2) verifies that the
+// LEFT cap now applies to EVERY tsvector input field, not just the body. A
+// message whose SUBJECT and recipient (to) lists each exceed the tsvector cap
+// must still UpsertFTS-succeed (no hard SQLSTATE 54000 to the caller) and end up
+// indexed (search_fts non-NULL). Before the C2 fix subject/from/to/cc were fed
+// to to_tsvector uncapped, so an oversized subject alone could trip 54000.
+func TestPG_FTSUpsert_OversizedSubjectAndRecipients(t *testing.T) {
+	skipUnlessPostgres(t)
+	f := storetest.New(t)
+	requirepkg.True(t, f.Store.FTS5Available(), "FTS must be available on PG")
+
+	bigSubject := oversizedBody() // distinct tokens, >1MB pre-cap
+	bigTo := oversizedBody()      // oversized recipient list as well
+
+	t.Run("oversized subject only", func(t *testing.T) {
+		msgID := f.CreateMessage("oversized-subject")
+		err := f.Store.UpsertFTS(msgID, bigSubject, "normal body apricot",
+			"alice@example.com", "bob@example.com", "")
+		requirepkg.NoError(t, err,
+			"UpsertFTS with an oversized subject must succeed (subject is now LEFT-capped)")
+
+		var isNull bool
+		requirepkg.NoError(t, f.Store.DB().QueryRow(
+			"SELECT search_fts IS NULL FROM messages WHERE id = $1", msgID).Scan(&isNull),
+			"probe search_fts")
+		assertpkg.False(t, isNull, "search_fts must be non-NULL after capped subject upsert")
+	})
+
+	t.Run("oversized subject and recipient list", func(t *testing.T) {
+		msgID := f.CreateMessage("oversized-subject-and-to")
+		err := f.Store.UpsertFTS(msgID, bigSubject, "normal body banana",
+			"alice@example.com", bigTo, "")
+		requirepkg.NoError(t, err,
+			"UpsertFTS with oversized subject + recipient list must succeed (all fields LEFT-capped)")
+
+		var isNull bool
+		requirepkg.NoError(t, f.Store.DB().QueryRow(
+			"SELECT search_fts IS NULL FROM messages WHERE id = $1", msgID).Scan(&isNull),
+			"probe search_fts")
+		assertpkg.False(t, isNull, "search_fts must be non-NULL after capped subject+recipients upsert")
+	})
+}
+
 // TestPG_BackfillFTS_MultibyteOversizedBodyDoesNotWedge (finding B1) seeds a
 // batch containing one message whose DB body is a pathological multibyte
 // document (distinct 2-byte tokens, >1MB tsvector pre-cap). The backfill SQL
