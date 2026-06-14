@@ -691,6 +691,10 @@ func (e *SQLiteEngine) ListMessages(ctx context.Context, filter MessageFilter) (
 	} else {
 		orderBy += " ASC"
 	}
+	// Stable tiebreaker on the PK so pagination is deterministic when the
+	// primary sort field ties (e.g. identical sent_at). m.id is non-null
+	// and unique, mirroring GetGmailIDsByFilter's ORDER BY ... , m.id DESC.
+	orderBy += ", m.id DESC"
 
 	limit := filter.Pagination.Limit
 	if limit == 0 {
@@ -1528,7 +1532,7 @@ func (e *SQLiteEngine) executeSearchQuery(ctx context.Context, conditions []stri
 		LEFT JOIN conversations conv ON conv.id = m.conversation_id
 		%s
 		WHERE %s
-		ORDER BY m.sent_at DESC
+		ORDER BY m.sent_at DESC, m.id DESC
 		LIMIT ? OFFSET ?
 	`, ftsJoin, whereClause)
 
