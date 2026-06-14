@@ -298,9 +298,8 @@ CREATE TABLE IF NOT EXISTS source_import_items (
 CREATE TABLE IF NOT EXISTS collections (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
-    description TEXT,
-    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    description TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS collection_sources (
@@ -308,6 +307,9 @@ CREATE TABLE IF NOT EXISTS collection_sources (
     source_id BIGINT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
     PRIMARY KEY (collection_id, source_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_collection_sources_source_id
+    ON collection_sources(source_id);
 
 -- Confirmed per-account "me" identities used by sent-message detection
 -- in dedup. Identity is account-scoped: an address confirmed for one
