@@ -388,6 +388,14 @@ func (s *Store) IsPostgreSQL() bool {
 // ingestion. The context controls both lock acquisition and the lifetime of
 // the underlying connection; cancelling it aborts a pending BEGIN EXCLUSIVE
 // and rolls back any held transaction.
+//
+// fn must NOT write through the store. The EXCLUSIVE lock is held on a
+// dedicated connection (conn below), while every store write goes to the
+// pool — a *different* connection. On PostgreSQL the EXCLUSIVE lock conflicts
+// with the ROW EXCLUSIVE lock any INSERT/UPDATE/DELETE acquires, so a write
+// issued from fn would block on the pool waiting for a lock this same call is
+// holding, deadlocking until statement_timeout cancels it. fn is for reads
+// (ACCESS SHARE, which EXCLUSIVE permits) plus filesystem work only.
 func (s *Store) WithExclusiveLock(ctx context.Context, fn func() error) error {
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
@@ -454,6 +462,55 @@ func (s *Store) withTx(fn func(tx *loggedTx) error) error {
 	} else {
 		slog.Debug("sql tx commit", "duration_ms", ms)
 	}
+	return nil
+}
+
+// runMaintenance runs fn inside a single transaction with the per-statement
+// execution timeout disabled (finding S1). It is the one chokepoint for
+// maintenance operations whose cost scales with archive size — cascade source
+// deletes, FTS clear/backfill rewrites, GIN index builds, the attachment-dedup
+// unique-index migration — which would otherwise be cancelled by the pool-wide
+// 30s statement_timeout (postgresConnConfig) with SQLSTATE 57014 on a large
+// archive.
+//
+// On PostgreSQL the first statement issued on the transaction is
+// `SET LOCAL statement_timeout = 0`; SET LOCAL auto-resets at COMMIT/ROLLBACK,
+// so the disabled timeout is scoped to this transaction and can never leak to
+// another pooled connection. On SQLite MaintenanceTimeoutResetSQL is "" so no
+// reset statement runs, and fn simply executes inside an ordinary transaction —
+// SQLite has no statement_timeout, so behavior is unchanged. The reset and all
+// of fn's statements run on the SAME tx (one connection), which is required for
+// SET LOCAL to take effect.
+//
+// fn receives a *loggedTx, so its Exec/Query calls are Rebind-translated
+// (? → $N on PG) just like withTx. The reset statement itself has no
+// placeholders, so Rebind is a no-op on it.
+func (s *Store) runMaintenance(ctx context.Context, fn func(ctx context.Context, tx *loggedTx) error) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin maintenance tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	if reset := s.dialect.MaintenanceTimeoutResetSQL(); reset != "" {
+		if _, err := tx.ExecContext(ctx, reset); err != nil {
+			return fmt.Errorf("disable maintenance statement timeout: %w", err)
+		}
+	}
+
+	if err := fn(ctx, tx); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit maintenance tx: %w", err)
+	}
+	committed = true
 	return nil
 }
 
@@ -618,15 +675,27 @@ func (s *Store) InitSchema() error {
 	// attachment rows from the old SELECT-then-INSERT UpsertAttachment.
 	// Dedupe before creating the partial unique index that enforces
 	// idempotency going forward. Both steps are idempotent.
-	if err := s.dedupeAttachmentsBeforeUniqueIndex(); err != nil {
-		return fmt.Errorf("dedupe attachments: %w", err)
-	}
-	if _, err := s.db.Exec(`
-		CREATE UNIQUE INDEX IF NOT EXISTS idx_attachments_msg_content_hash
-		    ON attachments(message_id, content_hash)
-		    WHERE content_hash IS NOT NULL AND content_hash != ''
-	`); err != nil {
-		return fmt.Errorf("create idx_attachments_msg_content_hash: %w", err)
+	//
+	// Both run under runMaintenance: on a large archive the dedupe DELETE
+	// and the unique-index build over the full attachments table exceed the
+	// pool-wide 30s statement_timeout, so the maintenance escape hatch
+	// disables it for this transaction (finding S1). They share one tx so
+	// the index is built against the just-deduped table. No-op timeout reset
+	// on SQLite.
+	if err := s.runMaintenance(context.Background(), func(ctx context.Context, tx *loggedTx) error {
+		if err := s.dedupeAttachmentsBeforeUniqueIndex(ctx, tx); err != nil {
+			return fmt.Errorf("dedupe attachments: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			CREATE UNIQUE INDEX IF NOT EXISTS idx_attachments_msg_content_hash
+			    ON attachments(message_id, content_hash)
+			    WHERE content_hash IS NOT NULL AND content_hash != ''
+		`); err != nil {
+			return fmt.Errorf("create idx_attachments_msg_content_hash: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	// Legacy databases may have idx_participants_phone as a non-unique
@@ -657,7 +726,14 @@ func (s *Store) InitSchema() error {
 	// Create FTS indexes that depend on columns just added by the legacy
 	// migrations (PostgreSQL's GIN index on messages.search_fts). No-op on
 	// SQLite. Must run after the migration loop above. [cr2-10]
-	if err := s.dialect.EnsureFTSIndex(s.db.DB); err != nil {
+	//
+	// Run under runMaintenance: the GIN build over a populated messages
+	// table can exceed the pool-wide 30s statement_timeout on a large
+	// archive, so the maintenance hatch disables it for this tx (finding
+	// S1). No-op timeout reset on SQLite.
+	if err := s.runMaintenance(context.Background(), func(ctx context.Context, tx *loggedTx) error {
+		return s.dialect.EnsureFTSIndex(tx)
+	}); err != nil {
 		return fmt.Errorf("ensure FTS index: %w", err)
 	}
 
@@ -694,8 +770,8 @@ func (s *Store) InitSchema() error {
 // unique index idx_attachments_msg_content_hash can be created. Pre-fix
 // UpsertAttachment used a SELECT-then-INSERT pattern that could create
 // duplicates under concurrency; this cleans them up once. Idempotent.
-func (s *Store) dedupeAttachmentsBeforeUniqueIndex() error {
-	_, err := s.db.Exec(`
+func (s *Store) dedupeAttachmentsBeforeUniqueIndex(ctx context.Context, tx *loggedTx) error {
+	_, err := tx.ExecContext(ctx, `
 		DELETE FROM attachments
 		WHERE content_hash IS NOT NULL AND content_hash != ''
 		  AND id NOT IN (
