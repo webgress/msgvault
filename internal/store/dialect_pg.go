@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib" // Register pgx driver for database/sql
@@ -87,25 +88,71 @@ func (d *PostgreSQLDialect) InsertOrIgnoreSuffix() string {
 
 // maxFTSBodyChars bounds the message-body text fed to to_tsvector. PostgreSQL
 // imposes a hard 1MB (1048575 bytes) limit on a single tsvector value and
-// errors ("string is too long for tsvector") when a document exceeds it, which
-// would otherwise leave the row's search_fts NULL forever and wedge backfill.
+// errors with SQLSTATE 54000 ("string is too long for tsvector") when a
+// document exceeds it.
 //
-// The body is only one of several fields concatenated into the final tsvector
-// (subject + participants are appended), and a tsvector grows with the number
-// of distinct lexemes and their positions, not raw length. We cap at 600000
-// characters rather than the 1000000-char headline: bodies are arbitrary UTF-8
-// where a single character can be up to 4 bytes, and a pathological document of
-// many short distinct tokens packs near one lexeme per few bytes, so the
-// margin keeps the resulting tsvector comfortably under 1MB even in the worst
-// case. SQLite's FTS5 has no such limit, so this cap is PostgreSQL-only.
+// IMPORTANT — this is a HEURISTIC, not a guarantee. PostgreSQL's tsvector limit
+// is on the packed lexeme+position bytes, NOT on the character count of the
+// input. A character cap therefore CANNOT bound the resulting tsvector size for
+// adversarial or multibyte input: a body of ~600000 distinct 2-byte multibyte
+// tokens packs ~1.2MB of lexeme bytes and still trips SQLSTATE 54000 (verified
+// empirically). The 600000-char cap makes the error unlikely for typical
+// (mostly-ASCII, repetitive) bodies, but does not make it impossible.
+//
+// A residual SQLSTATE 54000 is handled GRACEFULLY rather than wedging FTS:
+//   - Sync path (FTSUpsert): the body is additionally byte-truncated in Go to
+//     maxFTSBodyBytes BEFORE binding (see below), and any UpsertFTS error is
+//     warn-only at the call site — the message still persists with search_fts
+//     left NULL.
+//   - Backfill path (FTSBackfillBatchSQL): the body lives in the DB, so only
+//     the LEFT char cap applies; backfillFTSRowByRow skips the offending row
+//     (with a logged warning) and continues, so one pathological row never
+//     aborts BackfillFTS or wedges later batches.
+//
+// SQLite's FTS5 has no such limit, so this cap is PostgreSQL-only.
 const maxFTSBodyChars = 600000
+
+// maxFTSBodyBytes is the BYTE bound applied to the body on the sync path
+// (FTSUpsert) as defense-in-depth, in addition to the SQL LEFT char cap. It is
+// well under PostgreSQL's 1MB (1048575-byte) tsvector limit: for the worst-case
+// shape — a body of all-distinct multibyte tokens, where the packed tsvector
+// (lexeme bytes + per-position overhead) is roughly the same order as the input
+// byte length — bounding the input to 700000 bytes keeps the resulting tsvector
+// under the limit with comfortable margin. (The empirical overflow was ~600000
+// distinct 2-byte chars producing a 1.2MB tsvector; 700000 input bytes of that
+// same density stays below 1MB.) Truncation is rune-safe (never splits a
+// multibyte rune). A UTF-8-safe byte truncation is not cleanly available in SQL
+// (no convert_to/convert_from boundary hack is attempted), so the backfill SQL
+// path keeps the char cap and relies on the row-by-row skip for any residual.
+const maxFTSBodyBytes = 700000
+
+// truncateBytesRuneSafe returns s truncated to at most maxBytes bytes without
+// splitting a multibyte UTF-8 rune. If s already fits it is returned unchanged.
+func truncateBytesRuneSafe(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	// Walk back from maxBytes to the start of the rune that straddles the
+	// boundary so we never emit a partial rune.
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
 
 // FTSUpsert updates the tsvector column on messages for a single message.
 // PostgreSQL stores the FTS index inline on `messages.search_fts`, so there
 // is no separate virtual table — the operation is an UPDATE, not an INSERT.
-// The body ($3) is truncated to maxFTSBodyChars to stay under PostgreSQL's 1MB
-// tsvector limit.
+//
+// The body is bounded twice: byte-truncated to maxFTSBodyBytes in Go here
+// (rune-safe, robust against multibyte input that the SQL char cap cannot
+// bound) and additionally LEFT-capped to maxFTSBodyChars in SQL. A residual
+// SQLSTATE 54000 is still possible only for pathologically dense input; callers
+// treat the returned error as warn-only on the sync path (search_fts stays
+// NULL), so a bad body can never wedge FTS.
 func (d *PostgreSQLDialect) FTSUpsert(q querier, doc FTSDoc) error {
+	body := truncateBytesRuneSafe(doc.Body, maxFTSBodyBytes)
 	_, err := q.Exec(
 		`UPDATE messages SET search_fts =
 			setweight(to_tsvector('simple', COALESCE($2, '')), 'A') ||
@@ -114,7 +161,7 @@ func (d *PostgreSQLDialect) FTSUpsert(q querier, doc FTSDoc) error {
 			to_tsvector('simple', COALESCE($5, '')) ||
 			to_tsvector('simple', COALESCE($6, ''))
 		WHERE id = $1`,
-		doc.MessageID, doc.Subject, doc.Body,
+		doc.MessageID, doc.Subject, body,
 		doc.FromAddr, doc.ToAddrs, doc.CcAddrs,
 	)
 	return err
