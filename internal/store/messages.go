@@ -1082,12 +1082,20 @@ func (s *Store) backfillFTSRange(minID, maxID int64, progress func(done, total i
 		batchEnd := cursor + batchSize
 		n, err := s.backfillFTSBatch(cursor, batchEnd)
 		if err != nil {
-			// A single pathological row (e.g. a body that overflows
-			// PostgreSQL's tsvector limit) must not wedge the whole
-			// archive. Retry the batch one id at a time, skipping only
-			// the offending row(s) so every other message — including
-			// those after the bad row — still gets indexed.
-			n = s.backfillFTSRowByRow(cursor, batchEnd)
+			// Only the specific PG tsvector-overflow error (a single
+			// pathological row whose body exceeds PostgreSQL's tsvector
+			// limit) is recoverable by retrying the batch row by row and
+			// skipping the offending row(s). EVERY OTHER error (dead
+			// connection, a non-size SQLSTATE, etc.) is systemic — it would
+			// hit every row and silently clear-then-skip the whole archive —
+			// so it must ABORT and propagate, not be masked as success.
+			if !s.dialect.IsFTSValueTooLargeError(err) {
+				return indexed, err
+			}
+			n, err = s.backfillFTSRowByRow(cursor, batchEnd)
+			if err != nil {
+				return indexed, err
+			}
 		}
 		indexed += n
 		cursor = batchEnd
@@ -1101,15 +1109,19 @@ func (s *Store) backfillFTSRange(minID, maxID int64, progress func(done, total i
 }
 
 // backfillFTSRowByRow re-runs the batch backfill one message id at a time over
-// [fromID, toID), skipping (with a logged warning naming the id) any row whose
-// indexing fails. It is the row-level fallback for a batch that errored as a
-// whole, so a single bad row can never abort the surrounding backfill. Returns
-// the number of rows successfully indexed.
-func (s *Store) backfillFTSRowByRow(fromID, toID int64) int64 {
+// [fromID, toID), called only after a whole-batch failure that was classified
+// as the recoverable PG tsvector-overflow error. A row is skipped (with a
+// logged warning naming the id) ONLY when its per-row failure is itself the
+// tsvector-overflow error; any OTHER per-row error aborts and is returned so a
+// systemic failure cannot be swallowed. Returns the number of rows indexed.
+func (s *Store) backfillFTSRowByRow(fromID, toID int64) (int64, error) {
 	var indexed int64
 	for id := fromID; id < toID; id++ {
 		n, err := s.backfillFTSBatch(id, id+1)
 		if err != nil {
+			if !s.dialect.IsFTSValueTooLargeError(err) {
+				return indexed, err
+			}
 			slog.Warn("skipping message in FTS backfill",
 				slog.Int64("message_id", id),
 				slog.Any("error", err))
@@ -1117,7 +1129,7 @@ func (s *Store) backfillFTSRowByRow(fromID, toID int64) int64 {
 		}
 		indexed += n
 	}
-	return indexed
+	return indexed, nil
 }
 
 // backfillFTSBatchErrHook is a test-only seam: when non-nil it is consulted

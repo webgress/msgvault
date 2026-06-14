@@ -159,18 +159,27 @@ func (d *SQLiteDialect) FTSAvailable(db *sql.DB) bool {
 }
 
 // FTSNeedsBackfill reports whether the FTS5 table needs population.
-// Uses MAX(id) comparisons (instant B-tree lookups) instead of COUNT(*).
+// Probes for the existence of ANY message lacking an FTS entry, matching the
+// PostgreSQL EXISTS(search_fts IS NULL) semantics. The previous MAX(rowid)
+// vs MAX(id) heuristic missed a hole left at a LOW id while later ids were
+// indexed — reachable because UpsertFTS failures during sync are
+// warn-and-continue (sync.go) while the message row still commits, so id N can
+// be unindexed while N+1.. are indexed. messages_fts.rowid == messages.id and
+// there are no triggers, so the NOT EXISTS join is rowid-served and cheap on
+// FTS5 (no full body scan).
 func (d *SQLiteDialect) FTSNeedsBackfill(db *sql.DB) bool {
-	ctx := context.Background()
-	var msgMax int64
-	if err := db.QueryRowContext(ctx, "SELECT COALESCE(MAX(id), 0) FROM messages").Scan(&msgMax); err != nil || msgMax == 0 {
+	var exists bool
+	if err := db.QueryRowContext(context.Background(),
+		`SELECT EXISTS (
+			SELECT 1 FROM messages m
+			 WHERE NOT EXISTS (
+			     SELECT 1 FROM messages_fts f WHERE f.rowid = m.id
+			 )
+		)`,
+	).Scan(&exists); err != nil {
 		return false
 	}
-	var ftsMax int64
-	if err := db.QueryRowContext(ctx, "SELECT COALESCE(MAX(rowid), 0) FROM messages_fts").Scan(&ftsMax); err != nil {
-		return false
-	}
-	return ftsMax < msgMax-msgMax/10
+	return exists
 }
 
 // FTSClearSQL returns the SQL to clear all FTS5 data.
@@ -343,3 +352,8 @@ func (d *SQLiteDialect) IsBusyError(err error) bool {
 	}
 	return false
 }
+
+// IsFTSValueTooLargeError always returns false for SQLite: FTS5 has no
+// per-value size limit analogous to PostgreSQL's tsvector "string is too long"
+// (SQLSTATE 54000), so the backfill never has a row to skip on SQLite.
+func (d *SQLiteDialect) IsFTSValueTooLargeError(err error) bool { return false }
