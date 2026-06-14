@@ -72,8 +72,9 @@ func runHybridSearch(cmd *cobra.Command, queryStr, mode string, explain bool, sc
 		}
 		mainDB = st.DB()
 		pgb, err := pgvector.Open(ctx, pgvector.Options{
-			DB:        mainDB,
-			Dimension: cfg.Vector.Embeddings.Dimension,
+			DB:            mainDB,
+			Dimension:     cfg.Vector.Embeddings.Dimension,
+			SkipExtension: cfg.Vector.SkipExtensionCreate,
 		})
 		if err != nil {
 			_ = st.Close()

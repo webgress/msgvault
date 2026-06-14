@@ -64,6 +64,11 @@ func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string, r
 			DB:          mainDB,
 			Dimension:   cfg.Vector.Embeddings.Dimension,
 			SkipMigrate: readOnly,
+			// On a managed/locked-down PG the `vector` extension is
+			// pre-installed by an admin and CREATE EXTENSION would fail
+			// for the msgvault role; SkipExtensionCreate lets schema +
+			// index DDL still run. Ignored when SkipMigrate (readOnly).
+			SkipExtension: cfg.Vector.SkipExtensionCreate,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("open pgvector backend: %w", err)

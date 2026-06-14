@@ -44,6 +44,16 @@ type Options struct {
 	// MCP server), where CREATE EXTENSION and DDL statements are
 	// rejected by PostgreSQL with SQLSTATE 25006.
 	SkipMigrate bool
+	// SkipExtension suppresses only the `CREATE EXTENSION IF NOT EXISTS
+	// vector` step during migration while still creating the schema
+	// tables and indexes. Set this when the vector extension is
+	// managed/installed externally (e.g. a DBA pre-installs it on a
+	// locked-down or managed PostgreSQL where CREATE EXTENSION requires
+	// superuser). Unlike SkipMigrate (which suppresses ALL DDL for the
+	// read-only path), SkipExtension still runs schema + index creation
+	// so a non-superuser holding DDL rights can bring the embedding
+	// tables up. Ignored when SkipMigrate is true.
+	SkipExtension bool
 }
 
 // Backend implements vector.Backend against a PostgreSQL database
@@ -62,7 +72,7 @@ func Open(ctx context.Context, opts Options) (*Backend, error) {
 		return nil, errors.New("pgvector.Open: Options.DB is required")
 	}
 	if !opts.SkipMigrate {
-		if err := Migrate(ctx, opts.DB, opts.Dimension); err != nil {
+		if err := Migrate(ctx, opts.DB, opts.Dimension, opts.SkipExtension); err != nil {
 			return nil, fmt.Errorf("pgvector migrate: %w", err)
 		}
 	}
@@ -249,6 +259,16 @@ func (b *Backend) seedPending(ctx context.Context, gen vector.GenerationID, now 
 		return fmt.Errorf("begin seed tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// Disable the pool-wide 30s statement_timeout for this tx: the shared
+	// store pool sets statement_timeout=30s via pgx RuntimeParams
+	// (postgresConnConfig), and this single INSERT ... SELECT over the whole
+	// messages table can exceed that on a 1M+ message archive (finding S1's
+	// family, V7). SET LOCAL is tx-scoped and auto-resets on commit/rollback,
+	// so the timeout cannot leak onto other connections. [V7]
+	if _, err := tx.ExecContext(ctx, "SET LOCAL statement_timeout = 0"); err != nil {
+		return fmt.Errorf("disable statement_timeout for seed: %w", err)
+	}
 
 	stmt := fmt.Sprintf(`
 		INSERT INTO pending_embeddings (generation_id, message_id, enqueued_at)
@@ -831,76 +851,116 @@ func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec 
 		})
 	}
 
-	ids, err := b.filteredMessageIDs(ctx, filter)
-	if err != nil {
-		return nil, err
-	}
-	if len(ids) == 0 {
-		return nil, nil
-	}
-	// Filtered path: HNSW cannot be applied when filtering by an arbitrary
-	// message-ID set, so we use the same inner-subquery shape for
-	// consistency but accept a sequential scan within the filtered set.
+	// Filtered path: HNSW cannot be applied when intersecting with a
+	// structured filter, so we use the same inner-subquery shape as the
+	// empty-filter path but accept a sequential scan within the filtered
+	// set. Rather than materializing every matching message id in Go and
+	// shipping it back as one bigint[] param (which serialized hundreds of
+	// thousands of ids per query on a broad filter), the filter stays in
+	// SQL as an inline correlated EXISTS against messages — the same shape
+	// the empty-filter fast path uses for liveness (backend.go ~816-818),
+	// extended with the structured-filter clauses. [V2]
+	//
 	// The inner ORDER BY <=> LIMIT still short-circuits on chunk count.
 	// The widening loop mirrors the empty-filter (and sqlitevec) pattern
-	// so a multi-chunk filtered universe still reaches k distinct
-	// messages.
+	// so a multi-chunk filtered universe still reaches k distinct messages.
 	//
 	// The inner LIMIT counts CHUNKS, so the loop ceiling must be a CHUNK
-	// count, not a message count. Using min(len(ids), chunkCeiling) — a
-	// MESSAGE count — would under-shoot on multi-chunk filtered corpora:
-	// the inner LIMIT would saturate at the message count before the
-	// GROUP BY surfaced k distinct messages, short-returning (the exact
-	// failure sqlitevec's comment warns against). Bound the loop by the
-	// CHUNK count of the filtered set instead, and use the DISTINCT
-	// filtered-message count (messages with a chunk in this generation)
-	// only as an early exit so a selective filter does not drive the loop
-	// to the full generation.
-	filteredChunks, filteredMessages, err := b.filteredChunkAndMessageCount(ctx, gen, ids)
+	// count, not a message count: a MESSAGE count would under-shoot on
+	// multi-chunk filtered corpora — the inner LIMIT would saturate at the
+	// message count before the GROUP BY surfaced k distinct messages,
+	// short-returning (the exact failure sqlitevec's comment warns
+	// against). Bound the loop by the CHUNK count of the filtered set, and
+	// use the DISTINCT filtered-message count (messages with a chunk in
+	// this generation) only as an early exit so a selective filter does not
+	// drive the loop to the full generation. Both counts are derived from
+	// the SAME EXISTS predicate the search SQL applies, so the loop bounds
+	// stay exactly aligned with what the inner scan can surface.
+	//
+	// Recompute the loop ceilings (chunk count + distinct-message count)
+	// over the SAME EXISTS predicate, so the loop bounds stay exactly
+	// aligned with what the inner scan can surface. Both the count query
+	// and the search query rebuild the EXISTS clause with their own bind
+	// closure, so each statement's $N placeholders resolve against its own
+	// ordinals.
+	filteredChunks, filteredMessages, err := b.filteredChunkAndMessageCount(ctx, gen, filter)
 	if err != nil {
 		return nil, err
 	}
 	if filteredChunks == 0 {
 		return nil, nil
 	}
+
+	// args carries the stable prefix shared across widening runs: $1 =
+	// query vector, $2 = generation, $3 = dimension, $4.. = the structured
+	// filter's bound values. The widening loop appends the two trailing
+	// args (inner LIMIT, outer LIMIT) per run.
+	baseArgs := []any{queryVecLit, int64(gen), int64(dim)}
+	bind := func(v any) string {
+		baseArgs = append(baseArgs, v)
+		return fmt.Sprintf("$%d", len(baseArgs))
+	}
+	existsClause := filterExistsClause("e", filter, bind)
+	innerArg := fmt.Sprintf("$%d", len(baseArgs)+1)
+	outerArg := fmt.Sprintf("$%d", len(baseArgs)+2)
 	stmt := fmt.Sprintf(`
 		SELECT ann.message_id,
 		       MIN(ann.distance) AS distance
 		  FROM (
 		        SELECT e.message_id,
-		               (e.embedding::vector(%d)) <=> $1::vector AS distance
+		               (e.embedding::vector(%[1]d)) <=> $1::vector AS distance
 		          FROM embeddings e
 		         WHERE e.generation_id = $2
 		           AND e.dimension = $3
-		           AND e.message_id = ANY($4::bigint[])
-		         ORDER BY e.embedding::vector(%d) <=> $1::vector
-		         LIMIT $5
+		           AND %[2]s
+		         ORDER BY e.embedding::vector(%[1]d) <=> $1::vector
+		         LIMIT %[3]s
 		       ) ann
 		 GROUP BY ann.message_id
 		 ORDER BY distance, ann.message_id
-		 LIMIT $6`, dim, dim)
-	idArr := int64Array(ids)
+		 LIMIT %[4]s`, dim, existsClause, innerArg, outerArg)
 	return searchWiden(k, filteredChunks, filteredMessages, func(innerLimit int) ([]vector.Hit, error) {
-		return b.scanHits(ctx, stmt, queryVecLit, int64(gen), int64(dim), idArr, innerLimit, k)
+		runArgs := append(append([]any(nil), baseArgs...), innerLimit, k)
+		return b.scanHits(ctx, stmt, runArgs...)
 	})
 }
 
+// filterExistsClause returns a correlated EXISTS predicate that constrains
+// an embeddings row (joined via embedAlias.message_id) to a live message
+// matching the structured filter. It mirrors the empty-filter fast path's
+// inline liveness EXISTS (backend.go ~816-818) but adds the structured
+// filter clauses, keeping the whole filter in SQL instead of round-tripping
+// matching ids through Go. Filter values are bound via the supplied bind
+// closure; the live + filter clauses all reference the inner alias `m`. [V2]
+func filterExistsClause(embedAlias string, f vector.Filter, bind func(any) string) string {
+	clauses := append([]string{store.LiveMessagesWhere("m", true)}, buildPGFilterClauses(f, bind)...)
+	return fmt.Sprintf(
+		"EXISTS (SELECT 1 FROM messages m WHERE m.id = %s.message_id AND %s)",
+		embedAlias, strings.Join(clauses, " AND "))
+}
+
 // filteredChunkAndMessageCount returns, for the given generation and
-// filtered message-ID set, (a) the number of embedding CHUNKS belonging
-// to those messages and (b) the number of DISTINCT messages among them
-// that actually have a chunk in the generation. The chunk count is the
+// structured filter, (a) the number of embedding CHUNKS whose message
+// satisfies the live + filter predicate and (b) the number of DISTINCT such
+// messages that have a chunk in the generation. The chunk count is the
 // inner-LIMIT ceiling for the filtered widening loop (the LIMIT counts
 // chunks); the distinct-message count is the early exit. Both come from a
-// single scan over the gen+message index.
-func (b *Backend) filteredChunkAndMessageCount(ctx context.Context, gen vector.GenerationID, ids []int64) (chunks, messages int, err error) {
-	if len(ids) == 0 {
-		return 0, 0, nil
+// single scan and use the EXACT EXISTS predicate the search SQL applies, so
+// the loop bounds match what the inner scan can surface. The clause is
+// rebuilt with this statement's own bind closure ($1 = generation, $2.. =
+// filter values). [V2]
+func (b *Backend) filteredChunkAndMessageCount(ctx context.Context, gen vector.GenerationID, f vector.Filter) (chunks, messages int, err error) {
+	args := []any{int64(gen)}
+	bind := func(v any) string {
+		args = append(args, v)
+		return fmt.Sprintf("$%d", len(args))
 	}
-	if err := b.db.QueryRowContext(ctx,
-		`SELECT COUNT(*), COUNT(DISTINCT message_id)
-		   FROM embeddings
-		  WHERE generation_id = $1 AND message_id = ANY($2::bigint[])`,
-		int64(gen), int64Array(ids)).Scan(&chunks, &messages); err != nil {
+	existsClause := filterExistsClause("e", f, bind)
+	q := fmt.Sprintf(
+		`SELECT COUNT(*), COUNT(DISTINCT e.message_id)
+		   FROM embeddings e
+		  WHERE e.generation_id = $1 AND %s`, existsClause)
+	if err := b.db.QueryRowContext(ctx, q, args...).Scan(&chunks, &messages); err != nil {
 		return 0, 0, fmt.Errorf("lookup filtered chunk count: %w", err)
 	}
 	return chunks, messages, nil
@@ -990,43 +1050,6 @@ func (b *Backend) scanHits(ctx context.Context, query string, args ...any) ([]ve
 		return nil, fmt.Errorf("iterate hits: %w", err)
 	}
 	return hits, nil
-}
-
-// filteredMessageIDs resolves a structured filter against the main
-// schema, returning matching message IDs. Mirrors the sqlitevec
-// resolveFilter shape but uses ANY($1::bigint[]) in place of
-// json_each. Date bounds bind time.Time directly because messages.sent_at
-// is TIMESTAMPTZ in schema_pg.sql.
-func (b *Backend) filteredMessageIDs(ctx context.Context, f vector.Filter) ([]int64, error) {
-	var args []any
-	// bind appends v as a query argument and returns the matching $N
-	// placeholder. Using a counter-based helper keeps the conditional
-	// WHERE assembly tidy without juggling positional indexes by hand.
-	bind := func(v any) string {
-		args = append(args, v)
-		return fmt.Sprintf("$%d", len(args))
-	}
-
-	clauses := append([]string{store.LiveMessagesWhere("m", true)}, buildPGFilterClauses(f, bind)...)
-	query := `SELECT m.id FROM messages m WHERE ` + strings.Join(clauses, " AND ")
-	rows, err := b.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("filter query: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	var out []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("scan filter id: %w", err)
-		}
-		out = append(out, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate filter ids: %w", err)
-	}
-	return out, nil
 }
 
 // Delete removes the given messages from the specified generation in

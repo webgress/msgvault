@@ -61,7 +61,7 @@ func openPGEnqueueDB(t *testing.T) *sql.DB {
 		_, _ = cleanup.Exec("DROP SCHEMA " + schemaName + " CASCADE")
 	})
 
-	require.NoError(t, pgvector.Migrate(context.Background(), db, 0), "pgvector.Migrate")
+	require.NoError(t, pgvector.Migrate(context.Background(), db, 0, false), "pgvector.Migrate")
 	return db
 }
 

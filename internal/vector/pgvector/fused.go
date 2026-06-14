@@ -99,26 +99,49 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
 			return fmt.Sprintf("$%d", len(args))
 		}
 
-		filterSQL := applyFilterClauses(req.Filter, bind)
 		liveSQL := store.LiveMessagesWhere("m", true)
+		emptyFilter := req.Filter.IsEmpty()
 
-		ctes := []string{fmt.Sprintf(
-			"filtered AS (SELECT m.id FROM messages m WHERE %s%s)", liveSQL, filterSQL)}
+		// When the structured filter is empty the candidate universe is the
+		// whole live-message set, so materializing a `filtered AS (SELECT
+		// m.id FROM messages m WHERE <live>)` CTE (referenced by both signal
+		// CTEs) would force PG to build the entire 1M-row live universe per
+		// hybrid query. Mirror the non-fused Search empty-filter fast path
+		// (backend.go ~816-818): drop the `filtered` CTE and inline the
+		// liveness predicate into each signal — fts_pool already scans
+		// `messages m` so it just appends `AND <live>`; the ann_pool inner
+		// subquery uses a correlated EXISTS instead of a JOIN. For a
+		// non-empty filter the materialized CTE is reasonable: it computes
+		// the filtered set once and reuses it across both signals. [V1]
+		var ctes []string
+		if !emptyFilter {
+			filterSQL := applyFilterClauses(req.Filter, bind)
+			ctes = append(ctes, fmt.Sprintf(
+				"filtered AS (SELECT m.id FROM messages m WHERE %s%s)", liveSQL, filterSQL))
+		}
 
 		if useFTS {
 			ftsArg := bind(req.FTSQuery)
 			kp1Arg := bind(kPlus1)
 			kArg := bind(req.KPerSignal)
+			// Empty filter: scan messages directly with an inline liveness
+			// predicate. Non-empty filter: intersect with the materialized
+			// `filtered` set via JOIN.
+			ftsFrom := "      JOIN filtered f ON f.id = m.id\n"
+			ftsLive := ""
+			if emptyFilter {
+				ftsFrom = ""
+				ftsLive = "       AND " + liveSQL + "\n"
+			}
 			ctes = append(ctes,
 				fmt.Sprintf(`fts_pool AS (
     SELECT m.id AS message_id,
            ts_rank_cd(m.search_fts, websearch_to_tsquery('simple', %s), 32) AS bm25
       FROM messages m
-      JOIN filtered f ON f.id = m.id
-     WHERE m.search_fts @@ websearch_to_tsquery('simple', %s)
-     ORDER BY bm25 DESC
+%s     WHERE m.search_fts @@ websearch_to_tsquery('simple', %s)
+%s     ORDER BY bm25 DESC
      LIMIT %s
-)`, ftsArg, ftsArg, kp1Arg),
+)`, ftsArg, ftsFrom, ftsArg, ftsLive, kp1Arg),
 				fmt.Sprintf(`fts_ranked AS (
     SELECT message_id, bm25,
            ROW_NUMBER() OVER (ORDER BY bm25 DESC, message_id ASC) AS rnk
@@ -136,18 +159,28 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
 			kArg := bind(req.KPerSignal)
 			// Use an inner SELECT with ORDER BY <=> LIMIT so pgvector can
 			// apply the HNSW index before the outer GROUP BY collapses
-			// multi-chunk messages. The filtered CTE constrains the
-			// candidate set; the inner subquery fetches innerChunks rows in
-			// ANN order (intended to be HNSW-eligible — but note the JOIN to
-			// the materialized `filtered` CTE may, depending on PG/pgvector
-			// version and planner costing, force a sequential ANN scan
-			// within the filtered set; same tradeoff as backend.go's
-			// filtered path, and not yet verified with EXPLAIN ANALYZE).
-			// The outer GROUP BY then picks the best-scoring chunk per
-			// message via MIN(distance) and limits to KPerSignal+1 distinct
-			// messages, so the outer LIMIT is applied after dedup. The
-			// widening loop in FusedSearch grows innerChunks when this dedup
-			// collapses the pool below KPerSignal+1.
+			// multi-chunk messages. The candidate set is constrained either
+			// by an inline correlated EXISTS against the live-message set
+			// (empty filter — mirrors backend.go ~816-818, lets the HNSW
+			// index drive the inner ORDER BY without first materializing the
+			// whole universe) or by a JOIN to the materialized `filtered`
+			// CTE (non-empty filter; note that JOIN may, depending on
+			// PG/pgvector version and planner costing, force a sequential
+			// ANN scan within the filtered set — same tradeoff as
+			// backend.go's filtered path, not yet verified with EXPLAIN
+			// ANALYZE). The outer GROUP BY then picks the best-scoring chunk
+			// per message via MIN(distance) and limits to KPerSignal+1
+			// distinct messages, so the outer LIMIT is applied after dedup.
+			// The widening loop in FusedSearch grows innerChunks when this
+			// dedup collapses the pool below KPerSignal+1.
+			annConstraint := "              JOIN filtered f ON f.id = e.message_id\n"
+			annLive := ""
+			if emptyFilter {
+				annConstraint = ""
+				annLive = fmt.Sprintf(
+					"               AND EXISTS (SELECT 1 FROM messages m WHERE m.id = e.message_id AND %s)\n",
+					liveSQL)
+			}
 			ctes = append(ctes,
 				fmt.Sprintf(`ann_pool AS (
     SELECT ann.message_id,
@@ -156,15 +189,14 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
             SELECT e.message_id,
                    (e.embedding::vector(%[1]d)) <=> %[2]s::vector AS distance
               FROM embeddings e
-              JOIN filtered f ON f.id = e.message_id
-             WHERE e.generation_id = %[3]s AND e.dimension = %[1]d
-             ORDER BY e.embedding::vector(%[1]d) <=> %[2]s::vector
+%[6]s             WHERE e.generation_id = %[3]s AND e.dimension = %[1]d
+%[7]s             ORDER BY e.embedding::vector(%[1]d) <=> %[2]s::vector
              LIMIT %[4]s
            ) ann
      GROUP BY ann.message_id
      ORDER BY distance
      LIMIT %[5]s
-)`, dim, vecArg, genArg, innerArg, kp1Arg),
+)`, dim, vecArg, genArg, innerArg, kp1Arg, annConstraint, annLive),
 				fmt.Sprintf(`ann_ranked AS (
     SELECT message_id, distance,
            ROW_NUMBER() OVER (ORDER BY distance ASC, message_id ASC) AS rnk
