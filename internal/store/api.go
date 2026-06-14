@@ -464,13 +464,14 @@ func (s *Store) searchMessagesQueryImpl(
 
 	// after: / before:
 	// Bind time.Time directly rather than an RFC3339 ('T'-separated) string.
-	// A formatted string compared against a PG TIMESTAMPTZ column is parsed in
-	// the session TimeZone (not UTC), shifting the day boundary; and against
-	// SQLite's space-separated stored timestamps the 'T' (0x54) sorts after a
-	// space (0x20), also shifting the boundary. pgx encodes time.Time with an
-	// explicit offset (timezone-stable) and go-sqlite3 serializes it to a
-	// sortable layout matching how sent_at was stored, so both backends stay
-	// correct. Mirrors the query engine's binding. [cr2-9]
+	// The *time.Time bind is correct on BOTH backends — pgx encodes it as a
+	// TIMESTAMPTZ value (RFC3339 already carries the 'Z' offset, so the old
+	// string bind was fine on PG too) and go-sqlite3 serializes it to the
+	// sortable layout matching how sent_at was stored. The bug this fixes was
+	// SQLite-only: comparing an RFC3339 string against SQLite's space-separated
+	// stored timestamps put the 'T' (0x54) after the space (0x20), shifting the
+	// day boundary. Binding time.Time also keeps this store API consistent with
+	// the query engine, which binds time.Time the same way. [cr2-9]
 	if q.AfterDate != nil {
 		conditions = append(conditions,
 			"COALESCE(m.sent_at, m.received_at, m.internal_date) >= ?")
