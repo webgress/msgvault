@@ -57,6 +57,15 @@ func (t *sqlTracer) snapshot() []string {
 	return out
 }
 
+// reset clears the captured SQL stream so a test can scope subsequent
+// assertions to statements issued AFTER the reset point (e.g. ignore the
+// seed/migrate traffic and only observe a retire/activate tx). Test-only.
+func (t *sqlTracer) reset() {
+	t.mu.Lock()
+	t.got = t.got[:0]
+	t.mu.Unlock()
+}
+
 // recordingExecer wraps a real *sql.DB and captures every SQL string that
 // Migrate executes through the migrateExecer interface — the pool-level
 // ExecContext (where CREATE EXTENSION runs) and the BeginTx invocation

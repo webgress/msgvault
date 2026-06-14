@@ -306,6 +306,17 @@ func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationI
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// Disable the pool-wide 30s statement_timeout for this tx: the auto-retire
+	// path below DELETEs the demoted generation's embeddings + pending rows,
+	// which are corpus-size on a large archive and can exceed the shared store
+	// pool's statement_timeout=30s, cancelling the activation at 30s and rolling
+	// it back (finding C1, S1 family). SET LOCAL is tx-scoped and auto-resets on
+	// commit/rollback, so the timeout cannot leak onto other connections. Must be
+	// the first statement in the tx to cover every subsequent DELETE.
+	if _, err := tx.ExecContext(ctx, "SET LOCAL statement_timeout = 0"); err != nil {
+		return fmt.Errorf("disable statement_timeout for activate: %w", err)
+	}
+
 	// Demote the current active generation and capture its id in a single
 	// statement via RETURNING, so the id whose embeddings we delete below is
 	// provably the row this UPDATE retired (no separate non-locking SELECT that
@@ -424,6 +435,17 @@ func (b *Backend) RetireGeneration(ctx context.Context, gen vector.GenerationID,
 		return fmt.Errorf("begin retire tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// Disable the pool-wide 30s statement_timeout for this tx: the DELETEs below
+	// remove the retired generation's embeddings + pending rows, which are
+	// corpus-size on a large archive and can exceed the shared store pool's
+	// statement_timeout=30s, cancelling the retire at 30s and rolling it back
+	// (finding C1, S1 family). SET LOCAL is tx-scoped and auto-resets on
+	// commit/rollback, so the timeout cannot leak onto other connections. Must be
+	// the first statement in the tx to cover every subsequent DELETE.
+	if _, err := tx.ExecContext(ctx, "SET LOCAL statement_timeout = 0"); err != nil {
+		return fmt.Errorf("disable statement_timeout for retire: %w", err)
+	}
 
 	// The active-gen guard is the WHERE clause itself: when force is false we
 	// only retire a generation that is NOT active, so a concurrent activation
