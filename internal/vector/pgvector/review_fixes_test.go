@@ -5,13 +5,150 @@ package pgvector
 import (
 	"context"
 	"database/sql"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/vector"
 )
+
+// sqlTracer is a pgx QueryTracer that records the SQL text of every query
+// the driver executes — including statements issued INSIDE a transaction
+// (SET LOCAL, schema apply, DROP INDEX). database/sql's *sql.Tx is a
+// concrete type the migrateExecer wrapper can't intercept, so a driver-level
+// tracer is the only reliable way to observe tx-internal statements. The B2
+// assertion (SET LOCAL statement_timeout=0 is issued, DDL wrapped in the tx)
+// depends on this. Test-only.
+type sqlTracer struct {
+	mu  sync.Mutex
+	got []string
+}
+
+func (t *sqlTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	t.mu.Lock()
+	t.got = append(t.got, data.SQL)
+	t.mu.Unlock()
+	return ctx
+}
+
+func (t *sqlTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+func (t *sqlTracer) contains(sub string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, s := range t.got {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *sqlTracer) snapshot() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]string, len(t.got))
+	copy(out, t.got)
+	return out
+}
+
+// recordingExecer wraps a real *sql.DB and captures every SQL string that
+// Migrate executes through the migrateExecer interface — the pool-level
+// ExecContext (where CREATE EXTENSION runs) and the BeginTx invocation
+// (recorded as a marker so the B2 test can assert the DDL is wrapped). It
+// delegates to the real DB so the schema is actually applied. Statements run
+// INSIDE the returned *sql.Tx are observed via the pgx tracer instead (see
+// sqlTracer); the optional tracer field links the two so callers can query a
+// single combined view. Test-only.
+type recordingExecer struct {
+	db     *sql.DB
+	tracer *sqlTracer
+	mu     sync.Mutex
+	got    []string
+}
+
+func newRecordingExecer(db *sql.DB, tracer *sqlTracer) *recordingExecer {
+	return &recordingExecer{db: db, tracer: tracer}
+}
+
+func (r *recordingExecer) record(query string) {
+	r.mu.Lock()
+	r.got = append(r.got, query)
+	r.mu.Unlock()
+}
+
+func (r *recordingExecer) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	r.record(query)
+	return r.db.ExecContext(ctx, query, args...)
+}
+
+// BeginTx records that the maintenance transaction was opened, then returns
+// the real *sql.Tx. Statements run on that tx are captured by the pgx tracer.
+func (r *recordingExecer) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
+	tx, err := r.db.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	r.record(beginTxMarker)
+	return tx, nil
+}
+
+const beginTxMarker = "<<BEGIN TX>>"
+
+// execerContains reports whether the execer-level captures contain sub.
+func (r *recordingExecer) execerContains(sub string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, s := range r.got {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *recordingExecer) beginTxInvoked() bool { return r.execerContains(beginTxMarker) }
+
+// openTracedPGTestDB opens a SECOND handle to the same per-test schema as db,
+// configured with a pgx QueryTracer so every executed statement (including
+// tx-internal ones) is captured. It mirrors openPGTestDB's search_path so the
+// `vector` type and the per-test embeddings table resolve identically. The
+// returned tracer accumulates the SQL stream; the *sql.DB is closed via
+// t.Cleanup.
+func openTracedPGTestDB(t *testing.T, schema string) (*sql.DB, *sqlTracer) {
+	t.Helper()
+	url := testDBURL(t)
+
+	cfg, err := pgx.ParseConfig(url)
+	require.NoError(t, err, "parse pgx config")
+	tracer := &sqlTracer{}
+	cfg.Tracer = tracer
+	// Resolve the per-test schema first, then public (pgvector's extension).
+	cfg.RuntimeParams["search_path"] = schema + ",public"
+
+	connStr := stdlib.RegisterConnConfig(cfg)
+	db, err := sql.Open("pgx", connStr)
+	require.NoError(t, err, "open traced db")
+	t.Cleanup(func() {
+		_ = db.Close()
+		stdlib.UnregisterConnConfig(connStr)
+	})
+	return db, tracer
+}
+
+// currentSchema returns the connection's first search_path schema, used to
+// point the traced handle at the same per-test schema as the primary handle.
+func currentSchema(t *testing.T, db *sql.DB) string {
+	t.Helper()
+	var sp string
+	require.NoError(t, db.QueryRow("SELECT current_schema()").Scan(&sp), "current_schema")
+	return sp
+}
 
 // indexNames returns the names of every index on the embeddings table in
 // the connection's own (per-test) schema. Used by the V3 and V5 tests to
@@ -76,16 +213,39 @@ func TestMigrate_DropsPreExistingGenMsgIndex(t *testing.T) {
 		"re-migrate must drop the legacy idx_embeddings_gen_msg")
 }
 
-// TestMigrate_SkipExtension (V5) asserts that with skipExtension=true the
-// CREATE EXTENSION step is skipped while the schema tables and indexes are
-// still created. CI runs as superuser with the vector extension already
-// installed in the shared public schema (openPGTestDB puts it on the
-// search_path), so the schema apply succeeds; the assertion is that the
-// embedding objects exist after a skip-extension migrate.
+// TestMigrate_SkipExtension (V5 / finding B3) asserts that the skipExtension
+// flag is HONORED — not merely that the schema objects exist (which would also
+// be true for an impl that ignored the flag and ran the harmless
+// `CREATE EXTENSION IF NOT EXISTS vector` no-op). It records the SQL stream
+// through the migrateExecer seam + a pgx tracer and asserts:
+//   - skipExtension=true  -> NO "CREATE EXTENSION" statement is issued.
+//   - skipExtension=false -> a "CREATE EXTENSION" statement IS issued.
+//
+// It also pins finding B2: the schema apply + DROP INDEX run inside a
+// transaction that issued `SET LOCAL statement_timeout = 0` (the S1
+// maintenance hatch), so the DDL cannot be cancelled by the pool-wide 30s
+// timeout. The CREATE EXTENSION stays OUTSIDE the tx (run on the pool).
 func TestMigrate_SkipExtension(t *testing.T) {
 	db := openPGTestDB(t)
 	ctx := context.Background()
-	require.NoError(t, Migrate(ctx, db, 768, true), "Migrate(skipExtension=true)")
+	schema := currentSchema(t, db)
+
+	// ---- skipExtension = true: CREATE EXTENSION must NOT appear ----
+	tracedDB, tracer := openTracedPGTestDB(t, schema)
+	rec := newRecordingExecer(tracedDB, tracer)
+	require.NoError(t, Migrate(ctx, rec, 768, true), "Migrate(skipExtension=true)")
+
+	assert.False(t, rec.execerContains("CREATE EXTENSION"),
+		"skipExtension=true must NOT issue CREATE EXTENSION on the pool; got %v", rec.got)
+	assert.False(t, tracer.contains("CREATE EXTENSION"),
+		"skipExtension=true must NOT issue CREATE EXTENSION at all; got %v", tracer.snapshot())
+
+	// B2: DDL is wrapped in a tx and the statement_timeout hatch fired.
+	assert.True(t, rec.beginTxInvoked(),
+		"Migrate must open a maintenance tx for the schema apply + DROP INDEX")
+	assert.True(t, tracer.contains("SET LOCAL statement_timeout = 0"),
+		"Migrate tx must disable the pool-wide statement_timeout (S1 hatch); got %v", tracer.snapshot())
+	assertHatchedDDL(t, tracer)
 
 	// Schema tables exist.
 	for _, table := range []string{"index_generations", "embeddings", "pending_embeddings", "embed_runs"} {
@@ -102,6 +262,68 @@ func TestMigrate_SkipExtension(t *testing.T) {
 	assert.False(t, idx["idx_embeddings_gen_msg"], "redundant index must be absent; got %v", idx)
 	// HNSW index for the eager dimension exists.
 	assert.Truef(t, idx[VectorIndexName(768)], "eager HNSW index %s must exist; got %v", VectorIndexName(768), idx)
+
+	// ---- skipExtension = false: CREATE EXTENSION MUST appear ----
+	db2 := openPGTestDB(t)
+	schema2 := currentSchema(t, db2)
+	tracedDB2, tracer2 := openTracedPGTestDB(t, schema2)
+	rec2 := newRecordingExecer(tracedDB2, tracer2)
+	require.NoError(t, Migrate(ctx, rec2, 0, false), "Migrate(skipExtension=false)")
+
+	assert.True(t, rec2.execerContains("CREATE EXTENSION"),
+		"skipExtension=false must issue CREATE EXTENSION on the pool; got %v", rec2.got)
+	// CREATE EXTENSION runs on the pool (execer), BEFORE the tx — it must NOT
+	// be inside the tx stream that carries the SET LOCAL hatch.
+	assertCreateExtensionOutsideTx(t, tracer2)
+}
+
+// assertHatchedDDL asserts the schema apply and DROP INDEX appear in the
+// traced stream AFTER the SET LOCAL statement_timeout=0 statement, i.e. they
+// run inside the hatched maintenance transaction.
+func assertHatchedDDL(t *testing.T, tracer *sqlTracer) {
+	t.Helper()
+	stream := tracer.snapshot()
+	setLocalIdx, schemaIdx, dropIdx := -1, -1, -1
+	for i, s := range stream {
+		switch {
+		case strings.Contains(s, "SET LOCAL statement_timeout = 0"):
+			if setLocalIdx == -1 {
+				setLocalIdx = i
+			}
+		case strings.Contains(s, "CREATE TABLE IF NOT EXISTS index_generations"):
+			schemaIdx = i
+		case strings.Contains(s, "DROP INDEX IF EXISTS idx_embeddings_gen_msg"):
+			dropIdx = i
+		}
+	}
+	require.NotEqual(t, -1, setLocalIdx, "SET LOCAL statement_timeout=0 must be issued; got %v", stream)
+	require.NotEqual(t, -1, schemaIdx, "schema apply must be issued; got %v", stream)
+	require.NotEqual(t, -1, dropIdx, "DROP INDEX must be issued; got %v", stream)
+	assert.Greater(t, schemaIdx, setLocalIdx, "schema apply must run after SET LOCAL (inside the hatched tx)")
+	assert.Greater(t, dropIdx, setLocalIdx, "DROP INDEX must run after SET LOCAL (inside the hatched tx)")
+}
+
+// assertCreateExtensionOutsideTx asserts CREATE EXTENSION is issued BEFORE the
+// SET LOCAL statement_timeout=0 that opens the maintenance tx, i.e. it runs on
+// the pool outside the tx (finding B2 keeps the fast, superuser-gated
+// CREATE EXTENSION off the hatched tx).
+func assertCreateExtensionOutsideTx(t *testing.T, tracer *sqlTracer) {
+	t.Helper()
+	stream := tracer.snapshot()
+	createIdx, setLocalIdx := -1, -1
+	for i, s := range stream {
+		switch {
+		case strings.Contains(s, "CREATE EXTENSION"):
+			createIdx = i
+		case strings.Contains(s, "SET LOCAL statement_timeout = 0"):
+			if setLocalIdx == -1 {
+				setLocalIdx = i
+			}
+		}
+	}
+	require.NotEqual(t, -1, createIdx, "CREATE EXTENSION must be issued; got %v", stream)
+	require.NotEqual(t, -1, setLocalIdx, "SET LOCAL must be issued; got %v", stream)
+	assert.Less(t, createIdx, setLocalIdx, "CREATE EXTENSION must run before the maintenance tx opens")
 }
 
 // TestOpen_SkipExtensionWiring (V5) pins the Options.SkipExtension wiring:

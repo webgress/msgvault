@@ -12,6 +12,16 @@ import (
 //go:embed schema.sql
 var schemaSQL string
 
+// migrateExecer is the minimal subset of *sql.DB that Migrate needs:
+// CREATE EXTENSION runs directly on the pool, and the schema apply +
+// redundant-index drop run inside a transaction (BeginTx) so they can
+// disable the pool-wide statement_timeout. *sql.DB satisfies this; tests
+// pass a recording wrapper to assert which statements were issued.
+type migrateExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
+}
+
 // Migrate enables the pgvector extension and applies the embedding
 // schema. Safe to run on every startup: every statement uses IF NOT
 // EXISTS or its equivalent.
@@ -28,13 +38,39 @@ var schemaSQL string
 // will be created lazily for the first generation that exercises a new
 // dimension. If defaultDim > 0, Migrate eagerly creates the index for
 // that dimension so the first ANN query doesn't pay the index build.
-func Migrate(ctx context.Context, db *sql.DB, defaultDim int, skipExtension bool) error {
+func Migrate(ctx context.Context, db migrateExecer, defaultDim int, skipExtension bool) error {
+	// CREATE EXTENSION runs OUTSIDE the maintenance tx: it is fast and is
+	// gated by skipExtension (a non-superuser would be rejected before any
+	// DDL we care about). Keeping it on the pool keeps the gate observable.
 	if !skipExtension {
 		if _, err := db.ExecContext(ctx, `CREATE EXTENSION IF NOT EXISTS vector`); err != nil {
 			return fmt.Errorf("create extension vector: %w", err)
 		}
 	}
-	if _, err := db.ExecContext(ctx, schemaSQL); err != nil {
+
+	// Wrap the schema apply AND the redundant-index drop in a single
+	// transaction that disables the pool-wide 30s statement_timeout
+	// (finding S1, mirroring EnsureVectorIndex/seedPending). Two reasons:
+	//   - DROP INDEX takes an ACCESS EXCLUSIVE lock; on a busy serve daemon
+	//     the lock-wait alone can exceed 30s.
+	//   - On a legacy populated DB, schema.sql's `CREATE INDEX IF NOT EXISTS`
+	//     for idx_embeddings_msg / idx_embeddings_dim builds over the full
+	//     embeddings table and can exceed 30s.
+	// schema.sql is fully transaction-safe — it contains no CREATE INDEX
+	// CONCURRENTLY, VACUUM, or other statement that cannot run in a tx — so
+	// wrapping it is valid. SET LOCAL is tx-scoped and auto-resets on
+	// commit/rollback, so the disabled timeout cannot leak onto other pooled
+	// connections.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin pgvector migrate tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, "SET LOCAL statement_timeout = 0"); err != nil {
+		return fmt.Errorf("disable statement_timeout for pgvector migrate: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, schemaSQL); err != nil {
 		return fmt.Errorf("apply pgvector schema: %w", err)
 	}
 	// Shed the redundant idx_embeddings_gen_msg index on existing DBs: it is
@@ -43,10 +79,16 @@ func Migrate(ctx context.Context, db *sql.DB, defaultDim int, skipExtension bool
 	// amplification on the hottest table. New DBs never create it (the
 	// CREATE was removed from schema.sql); this DROP cleans up DBs migrated
 	// before that change. [V3]
-	if _, err := db.ExecContext(ctx, `DROP INDEX IF EXISTS idx_embeddings_gen_msg`); err != nil {
+	if _, err := tx.ExecContext(ctx, `DROP INDEX IF EXISTS idx_embeddings_gen_msg`); err != nil {
 		return fmt.Errorf("drop redundant idx_embeddings_gen_msg: %w", err)
 	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit pgvector migrate tx: %w", err)
+	}
+
 	if defaultDim > 0 {
+		// EnsureVectorIndex opens its own statement_timeout-disabling tx
+		// (HNSW builds are slow), so it runs after the migrate tx commits.
 		if err := EnsureVectorIndex(ctx, db, defaultDim); err != nil {
 			return err
 		}
@@ -59,7 +101,7 @@ func Migrate(ctx context.Context, db *sql.DB, defaultDim int, skipExtension bool
 // with different dimensions coexist in the same embeddings table — the
 // expression cast `(embedding::vector(dim))` only fires for rows that
 // already match, so a 4-dim row never trips a 768-dim index. Idempotent.
-func EnsureVectorIndex(ctx context.Context, db *sql.DB, dim int) error {
+func EnsureVectorIndex(ctx context.Context, db migrateExecer, dim int) error {
 	if dim <= 0 {
 		return fmt.Errorf("invalid dimension %d", dim)
 	}
