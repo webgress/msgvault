@@ -90,7 +90,11 @@ func (s *Store) ListMessages(offset, limit int) ([]APIMessage, int64, error) {
 			m.has_attachments,
 			m.size_estimate
 		FROM messages m
-		LEFT JOIN message_recipients mr ON mr.message_id = m.id AND mr.recipient_type = 'from'
+		LEFT JOIN message_recipients mr ON mr.id = (
+			SELECT mr2.id FROM message_recipients mr2
+			WHERE mr2.message_id = m.id AND mr2.recipient_type = 'from'
+			ORDER BY mr2.id LIMIT 1
+		)
 		LEFT JOIN participants p ON p.id = COALESCE(m.sender_id, mr.participant_id)
 		WHERE %s
 		ORDER BY COALESCE(m.sent_at, m.received_at, m.internal_date) DESC, m.id DESC
@@ -142,7 +146,11 @@ func (s *Store) GetMessage(id int64) (*APIMessage, error) {
 			m.size_estimate,
 			m.deleted_from_source_at
 		FROM messages m
-		LEFT JOIN message_recipients mr ON mr.message_id = m.id AND mr.recipient_type = 'from'
+		LEFT JOIN message_recipients mr ON mr.id = (
+			SELECT mr2.id FROM message_recipients mr2
+			WHERE mr2.message_id = m.id AND mr2.recipient_type = 'from'
+			ORDER BY mr2.id LIMIT 1
+		)
 		LEFT JOIN participants p ON p.id = COALESCE(m.sender_id, mr.participant_id)
 		WHERE m.id = ?
 	`, participantDisplaySQL)
@@ -251,7 +259,11 @@ func (s *Store) GetMessagesSummariesByIDs(ids []int64) ([]APIMessage, error) {
 			m.has_attachments,
 			m.size_estimate
 		FROM messages m
-		LEFT JOIN message_recipients mr ON mr.message_id = m.id AND mr.recipient_type = 'from'
+		LEFT JOIN message_recipients mr ON mr.id = (
+			SELECT mr2.id FROM message_recipients mr2
+			WHERE mr2.message_id = m.id AND mr2.recipient_type = 'from'
+			ORDER BY mr2.id LIMIT 1
+		)
 		LEFT JOIN participants p ON p.id = COALESCE(m.sender_id, mr.participant_id)
 		WHERE m.id IN (%s) AND %s
 	`, participantDisplaySQL, strings.Join(placeholders, ","), LiveMessagesWhere("m", true))
@@ -519,8 +531,11 @@ func (s *Store) searchMessagesQueryImpl(
 			m.size_estimate
 		FROM messages m
 		%s
-		LEFT JOIN message_recipients mr
-			ON mr.message_id = m.id AND mr.recipient_type = 'from'
+		LEFT JOIN message_recipients mr ON mr.id = (
+			SELECT mr2.id FROM message_recipients mr2
+			WHERE mr2.message_id = m.id AND mr2.recipient_type = 'from'
+			ORDER BY mr2.id LIMIT 1
+		)
 		LEFT JOIN participants p ON p.id = COALESCE(m.sender_id, mr.participant_id)
 		WHERE %s
 		ORDER BY %s
@@ -607,7 +622,11 @@ func (s *Store) searchMessagesLike(query string, offset, limit int) ([]APIMessag
 			m.has_attachments,
 			m.size_estimate
 		FROM messages m
-		LEFT JOIN message_recipients mr ON mr.message_id = m.id AND mr.recipient_type = 'from'
+		LEFT JOIN message_recipients mr ON mr.id = (
+			SELECT mr2.id FROM message_recipients mr2
+			WHERE mr2.message_id = m.id AND mr2.recipient_type = 'from'
+			ORDER BY mr2.id LIMIT 1
+		)
 		LEFT JOIN participants p ON p.id = COALESCE(m.sender_id, mr.participant_id)
 		WHERE %s
 		AND (LOWER(m.subject) LIKE ? ESCAPE '\' OR LOWER(m.snippet) LIKE ? ESCAPE '\')
