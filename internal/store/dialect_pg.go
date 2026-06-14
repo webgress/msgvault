@@ -356,6 +356,14 @@ func (d *PostgreSQLDialect) IsBusyError(err error) bool {
 	return isPgError(err, "55P03") || isPgError(err, "40P01") || isPgError(err, "57014")
 }
 
+// IsFTSValueTooLargeError reports whether err is PostgreSQL's
+// program_limit_exceeded (SQLSTATE 54000), which to_tsvector raises as
+// "string is too long for tsvector". This is the single FTS error the backfill
+// may skip-and-continue on; all other errors abort.
+func (d *PostgreSQLDialect) IsFTSValueTooLargeError(err error) bool {
+	return isPgError(err, "54000")
+}
+
 // exclusiveLockTables is the table list BeginExclusive locks IN EXCLUSIVE
 // MODE. It mirrors every INSERT/UPDATE/DELETE the sync/import pipeline emits
 // (verified against internal/store/messages.go, internal/store/sync.go,

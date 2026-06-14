@@ -193,6 +193,15 @@ type Dialect interface {
 	// commands that need exclusive access.
 	IsBusyError(err error) bool
 
+	// IsFTSValueTooLargeError returns true if err indicates an FTS value
+	// exceeded a hard backend limit (PostgreSQL: SQLSTATE 54000
+	// program_limit_exceeded, "string is too long for tsvector"). This is the
+	// ONLY error for which the FTS backfill is allowed to skip the offending
+	// row and continue; every other error must abort so a systemic failure
+	// (dead connection, etc.) is not silently masked. SQLite's FTS5 has no
+	// such limit, so the SQLite impl always returns false.
+	IsFTSValueTooLargeError(err error) bool
+
 	// BoolTrueExpr returns a SQL boolean expression that evaluates to true
 	// when col holds a "true" value. SQLite stores booleans as 0/1 INTEGER
 	// (emit "col = 1"); PostgreSQL has a real BOOLEAN type and rejects
