@@ -74,8 +74,29 @@ func EnsureVectorIndex(ctx context.Context, db *sql.DB, dim int) error {
 		   WHERE dimension = %d`,
 		dim, dim, dim,
 	)
-	if _, err := db.ExecContext(ctx, stmt); err != nil {
+
+	// Wrap the CREATE INDEX in a transaction that disables the pool-wide 30s
+	// statement_timeout: EnsureVectorIndex is also called lazily from
+	// CreateGeneration over a possibly-populated embeddings table, and HNSW
+	// builds are slow enough to trip the shared store pool's 30s timeout on a
+	// large archive (finding S1). SET LOCAL is tx-scoped and auto-resets on
+	// commit/rollback, so the disabled timeout cannot leak onto other pooled
+	// connections. This statement is a plain CREATE INDEX (NOT CONCURRENTLY),
+	// so running it inside a transaction is valid.
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin hnsw index tx for dim %d: %w", dim, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, "SET LOCAL statement_timeout = 0"); err != nil {
+		return fmt.Errorf("disable statement_timeout for hnsw index: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, stmt); err != nil {
 		return fmt.Errorf("create hnsw index for dim %d: %w", dim, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit hnsw index for dim %d: %w", dim, err)
 	}
 	return nil
 }
