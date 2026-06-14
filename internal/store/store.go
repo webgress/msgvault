@@ -642,8 +642,10 @@ func (s *Store) InitSchema() error {
 	}
 
 	// Migrations: add columns for databases created before these features.
-	// The dialect determines the list (SQLite: full ALTER TABLE list;
-	// PostgreSQL: empty — schema_pg.sql is always complete).
+	// The dialect determines the list. Both backends return ADD COLUMN
+	// migrations for DBs created before later columns were introduced:
+	// SQLite emits ALTER TABLE ADD COLUMN, PostgreSQL emits the equivalent
+	// ALTER TABLE ADD COLUMN IF NOT EXISTS list (including search_fts).
 	for _, m := range s.dialect.LegacyColumnMigrations() {
 		if _, err := s.db.Exec(m.SQL); err != nil {
 			if !s.dialect.IsDuplicateColumnError(err) {
