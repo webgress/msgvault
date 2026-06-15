@@ -241,3 +241,146 @@ func TestParity_HybridOrderingMatchesSqlitevec(t *testing.T) {
 		})
 	}
 }
+
+// nonUnitDoc is one message in the non-unit-norm parity fixture. vec is
+// the message's raw (deliberately non-unit) embedding.
+type nonUnitDoc struct {
+	id   int64
+	body string
+	vec  []float32
+}
+
+// nonUnitCorpus is engineered so L2 (Euclidean) and cosine rank the two
+// candidates in OPPOSITE order, giving the parity assertion teeth that the
+// orthonormal unitVec() corpus cannot. Query is (1,0,0,0):
+//
+//   - msgA = (5,0,0,0): same direction as the query, large norm. Cosine
+//     distance ~0 (rank 1 under cosine) but L2 distance large (~4).
+//   - msgB = (1,0.2,0,0): near-unit norm, slightly off-axis. Small L2
+//     distance (~0.2, rank 1 under L2) but larger cosine distance than A.
+//
+// Cosine ranks [A, B]; L2 ranks [B, A]. pgvector ranks by cosine (<=>);
+// sqlitevec now does too (distance_metric=cosine on vec0). Before the
+// vec0 cosine fix, sqlitevec's L2 default would have returned [B, A] and
+// this assertion would FAIL — that is the gap this test guards.
+var nonUnitCorpus = []nonUnitDoc{
+	{1, "alpha widgets", []float32{5, 0, 0, 0}},
+	{2, "bravo gadgets", []float32{1, 0.2, 0, 0}},
+}
+
+// TestParity_NonUnitNormVectorOrdering asserts that for non-unit-norm
+// embeddings — where L2 and cosine rank differently — sqlitevec and
+// pgvector return the SAME pure-ANN ordering (A before B, the cosine
+// order). This is the gold-standard proof that both backends rank ANN by
+// cosine. Gated on MSGVAULT_TEST_DB: newFusedFixture (via openPGTestDB)
+// skips when it is unset, so the sqlitevec-only build stays green.
+func TestParity_NonUnitNormVectorOrdering(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	// pgvector side first: if MSGVAULT_TEST_DB is absent the fixture skips,
+	// short-circuiting the whole test before any sqlitevec setup.
+	pf := newFusedFixture(t)
+	base := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
+	pgVecs := make(map[int64][]float32, len(nonUnitCorpus))
+	for _, d := range nonUnitCorpus {
+		pf.seedMsg(t, d.id, d.body, d.body, 10, base, false)
+		pgVecs[d.id] = d.vec
+	}
+	pf.embedAll(t, pgVecs)
+
+	// sqlitevec side, same corpus and non-unit vectors.
+	sb, sctx, sGen := buildSqlitevecParityNonUnit(t)
+
+	const wantFirst, wantSecond = int64(1), int64(2) // A before B (cosine)
+	req := func(gen vector.GenerationID) vector.FusedRequest {
+		return vector.FusedRequest{
+			QueryVec:   []float32{1, 0, 0, 0},
+			Generation: gen,
+			KPerSignal: 10,
+			Limit:      10,
+			RRFK:       60,
+		}
+	}
+
+	sHits, _, err := sb.FusedSearch(sctx, req(sGen))
+	require.NoError(err, "sqlitevec FusedSearch")
+	pHits, _, err := pf.b.FusedSearch(pf.ctx, req(pf.gen))
+	require.NoError(err, "pgvector FusedSearch")
+
+	sIDs := idSeq(sHits)
+	pIDs := idSeq(pHits)
+	require.Equal([]int64{wantFirst, wantSecond}, sIDs,
+		"sqlitevec must rank A before B (cosine); L2 would give B,A")
+	assert.Equal(sIDs, pIDs,
+		"non-unit ANN ordering must match across backends (both cosine)")
+}
+
+// buildSqlitevecParityNonUnit mirrors buildSqlitevecParity but seeds the
+// non-unit-norm corpus with parityDim-sized vectors so the cross-backend
+// non-unit ordering assertion has a matching sqlitevec side.
+func buildSqlitevecParityNonUnit(t *testing.T) (*sqlitevec.Backend, context.Context, vector.GenerationID) {
+	t.Helper()
+	ctx := context.Background()
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "main.db")
+	require.NoError(t, sqlitevec.RegisterExtension(), "RegisterExtension")
+	main, err := sql.Open(sqlitevec.DriverName(), mainPath)
+	require.NoError(t, err, "open main")
+	t.Cleanup(func() { _ = main.Close() })
+
+	schema := `
+CREATE TABLE messages (
+    id INTEGER PRIMARY KEY,
+    subject TEXT,
+    source_id INTEGER,
+    sender_id INTEGER,
+    has_attachments INTEGER DEFAULT 0,
+    size_estimate INTEGER,
+    sent_at DATETIME,
+    deleted_at DATETIME,
+    deleted_from_source_at DATETIME
+);
+CREATE VIRTUAL TABLE messages_fts USING fts5(subject, body, content='', contentless_delete=1);
+CREATE TABLE message_labels (
+    message_id INTEGER NOT NULL,
+    label_id INTEGER NOT NULL,
+    PRIMARY KEY (message_id, label_id)
+);
+CREATE TABLE message_recipients (
+    id INTEGER PRIMARY KEY,
+    message_id INTEGER NOT NULL,
+    recipient_type TEXT NOT NULL,
+    participant_id INTEGER NOT NULL
+);`
+	_, err = main.Exec(schema)
+	require.NoError(t, err, "schema")
+
+	for _, d := range nonUnitCorpus {
+		_, err := main.Exec(`INSERT INTO messages (id, subject) VALUES (?, ?)`, d.id, d.body)
+		require.NoErrorf(t, err, "insert msg %d", d.id)
+		_, err = main.Exec(
+			`INSERT INTO messages_fts (rowid, subject, body) VALUES (?, ?, ?)`,
+			d.id, d.body, d.body)
+		require.NoErrorf(t, err, "insert fts %d", d.id)
+	}
+
+	b, err := sqlitevec.Open(ctx, sqlitevec.Options{
+		Path:      filepath.Join(dir, "vectors.db"),
+		MainPath:  mainPath,
+		Dimension: parityDim,
+		MainDB:    main,
+	})
+	require.NoError(t, err, "sqlitevec.Open")
+	t.Cleanup(func() { _ = b.Close() })
+
+	gid, err := b.CreateGeneration(ctx, "m", parityDim, "")
+	require.NoError(t, err, "CreateGeneration")
+	chunks := make([]vector.Chunk, 0, len(nonUnitCorpus))
+	for _, d := range nonUnitCorpus {
+		chunks = append(chunks, vector.Chunk{MessageID: d.id, Vector: d.vec})
+	}
+	require.NoError(t, b.Upsert(ctx, gid, chunks), "Upsert")
+	require.NoError(t, b.ActivateGeneration(ctx, gid, true), "Activate")
+	return b, ctx, gid
+}

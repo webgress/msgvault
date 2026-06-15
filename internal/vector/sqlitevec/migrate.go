@@ -50,7 +50,207 @@ func Migrate(ctx context.Context, db *sql.DB, defaultDim int) error {
 	if err := migrateVecTablesToChunked(ctx, db); err != nil {
 		return fmt.Errorf("migrate vec tables to chunked layout: %w", err)
 	}
+	// Schema version 2: vec0 tables created before this release used the
+	// default L2 (Euclidean) distance metric, whereas pgvector ranks ANN
+	// by cosine. Rebuild any existing L2 tables as cosine so both backends
+	// rank identically. Runs before EnsureVectorTable so that on a fresh
+	// DB (no vec0 tables yet) there is nothing to rebuild and the table
+	// EnsureVectorTable creates below is already cosine.
+	if err := migrateVecTablesToCosine(ctx, db); err != nil {
+		return fmt.Errorf("migrate vec tables to cosine metric: %w", err)
+	}
 	return EnsureVectorTable(ctx, db, defaultDim)
+}
+
+// currentSchemaVersion is the schema version this build expects after a
+// successful Migrate. Bumped 1 -> 2 when vec0 tables switched from the
+// default L2 distance metric to cosine to match pgvector's ANN ranking.
+const currentSchemaVersion = 2
+
+// sqlExecer is the subset of *sql.DB / *sql.Tx used by setSchemaVersion
+// so it can run either standalone or inside a rebuild transaction.
+type sqlExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// readSchemaVersion returns the stored vectors.db schema version. The
+// schema_version table always holds exactly one row (seeded to 1 by
+// schema.sql via INSERT OR IGNORE); 0 is returned only if the row is
+// somehow missing, which the version-gated migrations treat as "older
+// than every known version" and so safe to (re)run.
+func readSchemaVersion(ctx context.Context, db *sql.DB) (int, error) {
+	var v sql.NullInt64
+	if err := db.QueryRowContext(ctx,
+		`SELECT MAX(version) FROM schema_version`).Scan(&v); err != nil {
+		return 0, fmt.Errorf("read schema_version: %w", err)
+	}
+	if !v.Valid {
+		return 0, nil
+	}
+	return int(v.Int64), nil
+}
+
+// setSchemaVersion advances the stored schema version to the given value.
+// schema.sql seeds the table with version 1 (INSERT OR IGNORE), so we
+// replace that single row rather than appending — keeping schema_version
+// a one-row table whose value is the current version.
+func setSchemaVersion(ctx context.Context, db sqlExecer, version int) error {
+	if _, err := db.ExecContext(ctx, `DELETE FROM schema_version`); err != nil {
+		return fmt.Errorf("clear schema_version: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO schema_version (version) VALUES (?)`, version); err != nil {
+		return fmt.Errorf("set schema_version=%d: %w", version, err)
+	}
+	return nil
+}
+
+// migrateVecTablesToCosine rebuilds every existing vec0 table that still
+// uses the default L2 distance metric so it ranks ANN by cosine, matching
+// pgvector (vector_cosine_ops / <=>). For non-unit-norm embeddings L2 and
+// cosine return different orderings, so the two backends diverged until
+// this migration runs.
+//
+// Version-gated: when the stored schema_version is already >= 2 the DB was
+// either created fresh under the cosine CREATE statements or already
+// migrated, so this is a no-op and no table is rebuilt. Otherwise every
+// vectors_vec_d* table is rebuilt (drop + recreate-as-cosine + reinsert,
+// each transactional) and the version is advanced to 2.
+//
+// Idempotent: after a successful run schema_version == 2 short-circuits
+// subsequent calls. A crash mid-rebuild leaves schema_version unchanged
+// (the bump is the last step), so a retry observes version < 2 and re-runs;
+// rebuilding an already-cosine table is harmless (it just rewrites it).
+func migrateVecTablesToCosine(ctx context.Context, db *sql.DB) error {
+	version, err := readSchemaVersion(ctx, db)
+	if err != nil {
+		return err
+	}
+	if version >= currentSchemaVersion {
+		return nil
+	}
+
+	// Same filter as migrateVecTablesToChunked: only the user-facing vec0
+	// virtual tables, never their sqlite-vec shadow tables.
+	rows, err := db.QueryContext(ctx, `
+		SELECT name FROM sqlite_master
+		WHERE type = 'table'
+		  AND name LIKE 'vectors_vec_d%'
+		  AND sql LIKE '%USING vec0%'`)
+	if err != nil {
+		return fmt.Errorf("list vec tables: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return fmt.Errorf("scan vec table name: %w", err)
+		}
+		names = append(names, n)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate vec tables: %w", err)
+	}
+
+	for _, name := range names {
+		var dim int
+		if _, err := fmt.Sscanf(name, "vectors_vec_d%d", &dim); err != nil || dim <= 0 {
+			return fmt.Errorf("decode dim from %q: %w", name, err)
+		}
+		if err := rebuildVecTableForCosine(ctx, db, name, dim); err != nil {
+			return fmt.Errorf("rebuild %s for cosine: %w", name, err)
+		}
+	}
+
+	if err := setSchemaVersion(ctx, db, currentSchemaVersion); err != nil {
+		return err
+	}
+	return nil
+}
+
+// rebuildVecTableForCosine drops the vec0 table named `name` (already in
+// the chunked layout: generation_id PARTITION KEY, embedding_id PRIMARY
+// KEY) and recreates it with the cosine distance metric, preserving every
+// row verbatim. Unlike rebuildVecTableForChunking, the column layout is
+// unchanged — only the distance metric on the CREATE differs — so rows
+// carry over 1:1 with their existing (generation_id, embedding_id) and no
+// embeddings-table lookup is needed.
+//
+// The materialize-out / drop / recreate / reinsert sequence mirrors
+// rebuildVecTableForChunking, including reading rows outside the
+// transaction (the virtual-table iterator must not be held open across the
+// DROP) and running the DDL + reinsert in one transaction so a crash rolls
+// back to the pre-rebuild state.
+func rebuildVecTableForCosine(ctx context.Context, db *sql.DB, name string, dim int) error {
+	type vecRow struct {
+		gen  int64
+		eid  int64
+		blob []byte
+	}
+	var existing []vecRow
+	readExisting := func() error {
+		rows, err := db.QueryContext(ctx,
+			`SELECT generation_id, embedding_id, embedding FROM `+name)
+		if err != nil {
+			return fmt.Errorf("read rows: %w", err)
+		}
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			var r vecRow
+			if err := rows.Scan(&r.gen, &r.eid, &r.blob); err != nil {
+				return fmt.Errorf("scan row: %w", err)
+			}
+			existing = append(existing, r)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("iterate rows: %w", err)
+		}
+		return nil
+	}
+	if err := readExisting(); err != nil {
+		return err
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin rebuild tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	if _, err := tx.ExecContext(ctx, `DROP TABLE `+name); err != nil {
+		return fmt.Errorf("drop %s: %w", name, err)
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`CREATE VIRTUAL TABLE %s USING vec0(
+		generation_id INTEGER PARTITION KEY,
+		embedding_id  INTEGER PRIMARY KEY,
+		embedding     FLOAT[%d] distance_metric=cosine
+	)`, name, dim)); err != nil {
+		return fmt.Errorf("create cosine %s: %w", name, err)
+	}
+	if len(existing) > 0 {
+		stmt, err := tx.PrepareContext(ctx,
+			fmt.Sprintf(`INSERT INTO %s (generation_id, embedding_id, embedding) VALUES (?, ?, ?)`, name))
+		if err != nil {
+			return fmt.Errorf("prepare reinsert: %w", err)
+		}
+		defer func() { _ = stmt.Close() }()
+		for _, r := range existing {
+			if _, err := stmt.ExecContext(ctx, r.gen, r.eid, r.blob); err != nil {
+				return fmt.Errorf("reinsert row gen=%d eid=%d: %w", r.gen, r.eid, err)
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit rebuild tx: %w", err)
+	}
+	committed = true
+	return nil
 }
 
 // migrateEmbeddingsToChunked detects the pre-chunking schema (no
@@ -348,7 +548,7 @@ func rebuildVecTableForChunking(ctx context.Context, db *sql.DB, name string, di
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`CREATE VIRTUAL TABLE %s USING vec0(
 		generation_id INTEGER PARTITION KEY,
 		embedding_id  INTEGER PRIMARY KEY,
-		embedding     FLOAT[%d]
+		embedding     FLOAT[%d] distance_metric=cosine
 	)`, name, dim)); err != nil {
 		return fmt.Errorf("create new %s: %w", name, err)
 	}
@@ -431,7 +631,7 @@ func EnsureVectorTable(ctx context.Context, db *sql.DB, dim int) error {
 	q := fmt.Sprintf(`CREATE VIRTUAL TABLE IF NOT EXISTS vectors_vec_d%d USING vec0(
 		generation_id INTEGER PARTITION KEY,
 		embedding_id  INTEGER PRIMARY KEY,
-		embedding     FLOAT[%d]
+		embedding     FLOAT[%d] distance_metric=cosine
 	)`, dim, dim)
 	if _, err := db.ExecContext(ctx, q); err != nil {
 		return fmt.Errorf("create vectors_vec_d%d: %w", dim, err)

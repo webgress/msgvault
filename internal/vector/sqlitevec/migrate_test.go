@@ -5,6 +5,7 @@ package sqlitevec
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -307,6 +308,203 @@ func TestMigrate_LegacyToChunked_MultiGenerationCollision(t *testing.T) {
 		  JOIN embeddings e ON e.embedding_id = v.embedding_id
 		 WHERE v.generation_id = 1 AND e.message_id = 10`).Scan(&n), "join")
 	assert.Equal(1, n, "join rows")
+}
+
+// schemaVersion reads the single-row schema_version value.
+func schemaVersion(t *testing.T, db *sql.DB) int {
+	t.Helper()
+	var v int
+	requirepkg.NoError(t,
+		db.QueryRow(`SELECT MAX(version) FROM schema_version`).Scan(&v),
+		"read schema_version")
+	return v
+}
+
+// vec0RankOrder runs a KNN MATCH (k=2, the size of the A/B parity
+// corpus) against the given vec0 table for the query vector (over the
+// single test generation id=1) and returns the embedding_ids in distance
+// order. Used to prove the configured distance metric (cosine after
+// migration) ranks non-unit vectors by direction rather than Euclidean
+// nearness.
+func vec0RankOrder(t *testing.T, db *sql.DB, table string, q []float32) []int64 {
+	t.Helper()
+	rows, err := db.Query(fmt.Sprintf(`
+		SELECT embedding_id FROM %s
+		 WHERE generation_id = 1 AND embedding MATCH ? AND k = 2
+		 ORDER BY distance ASC`, table), float32SliceBlob(q))
+	requirepkg.NoError(t, err, "knn query")
+	defer func() { _ = rows.Close() }()
+	var out []int64
+	for rows.Next() {
+		var eid int64
+		requirepkg.NoError(t, rows.Scan(&eid), "scan eid")
+		out = append(out, eid)
+	}
+	requirepkg.NoError(t, rows.Err(), "iterate knn")
+	return out
+}
+
+// TestMigrate_L2ToCosine builds a chunked-layout vectors.db whose vec0
+// table was created the OLD way (bare FLOAT[N], i.e. L2) at
+// schema_version=1, seeds it with NON-UNIT vectors that L2 and cosine
+// rank differently, runs Migrate, and asserts:
+//
+//   - schema_version is advanced to 2;
+//   - every embedding_id/vector survives the rebuild;
+//   - the rebuilt table now ranks by cosine (direction), matching
+//     pgvector — the L2-vs-cosine teeth are documented inline;
+//   - a second Migrate is idempotent and does not rebuild again.
+func TestMigrate_L2ToCosine(t *testing.T) {
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "l2.db")
+	db := openTestDB(t, path)
+	t.Cleanup(func() { _ = db.Close() })
+
+	// Build the chunked-layout schema by hand with a *legacy L2* vec0
+	// table (bare FLOAT[3], no distance_metric) at schema_version=1 —
+	// what every install shipped before this change.
+	const dim = 3
+	legacyDDL := []string{
+		`CREATE TABLE schema_version (version INTEGER PRIMARY KEY)`,
+		`INSERT INTO schema_version VALUES (1)`,
+		`CREATE TABLE index_generations (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			model TEXT NOT NULL, dimension INTEGER NOT NULL,
+			fingerprint TEXT NOT NULL, started_at INTEGER NOT NULL,
+			seeded_at INTEGER, completed_at INTEGER, activated_at INTEGER,
+			state TEXT NOT NULL, message_count INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE embeddings (
+			embedding_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+			generation_id    INTEGER NOT NULL REFERENCES index_generations(id) ON DELETE CASCADE,
+			message_id       INTEGER NOT NULL,
+			chunk_index      INTEGER NOT NULL DEFAULT 0,
+			embedded_at      INTEGER NOT NULL,
+			source_char_len  INTEGER NOT NULL,
+			chunk_char_start INTEGER NOT NULL DEFAULT 0,
+			chunk_char_end   INTEGER NOT NULL DEFAULT 0,
+			truncated        INTEGER NOT NULL DEFAULT 0,
+			UNIQUE (generation_id, message_id, chunk_index)
+		)`,
+		`CREATE INDEX idx_embeddings_msg ON embeddings(message_id)`,
+		`CREATE INDEX idx_embeddings_gen_msg ON embeddings(generation_id, message_id)`,
+		fmt.Sprintf(`CREATE VIRTUAL TABLE vectors_vec_d%d USING vec0(
+			generation_id INTEGER PARTITION KEY,
+			embedding_id  INTEGER PRIMARY KEY,
+			embedding     FLOAT[%d]
+		)`, dim, dim),
+	}
+	for _, q := range legacyDDL {
+		_, err := db.ExecContext(ctx, q)
+		require.NoErrorf(err, "seed legacy DDL %q", q)
+	}
+	_, err := db.ExecContext(ctx,
+		`INSERT INTO index_generations (id, model, dimension, fingerprint, started_at, state, message_count)
+		 VALUES (1, 'm', 3, 'm:3', 100, 'active', 2)`)
+	require.NoError(err, "seed generation")
+
+	// q=(1,0,0). A = (5,0,0): same direction, large norm → cosine ~0 but
+	// L2 large. B = (1,0.2,0): off-axis, near-unit norm → small L2 but
+	// larger cosine distance than A. Cosine ranks A before B; L2 ranks B
+	// before A.
+	q := []float32{1, 0, 0}
+	vecA := []float32{5, 0, 0}
+	vecB := []float32{1, 0.2, 0}
+	const eidA, eidB = int64(100), int64(200)
+	_, err = db.ExecContext(ctx,
+		`INSERT INTO embeddings (embedding_id, generation_id, message_id, chunk_index, embedded_at, source_char_len)
+		 VALUES (?, 1, 10, 0, 100, 50), (?, 1, 20, 0, 100, 50)`, eidA, eidB)
+	require.NoError(err, "seed embeddings")
+	_, err = db.ExecContext(ctx,
+		fmt.Sprintf(`INSERT INTO vectors_vec_d%d (generation_id, embedding_id, embedding) VALUES (1, ?, ?)`, dim),
+		eidA, float32SliceBlob(vecA))
+	require.NoError(err, "seed vec A")
+	_, err = db.ExecContext(ctx,
+		fmt.Sprintf(`INSERT INTO vectors_vec_d%d (generation_id, embedding_id, embedding) VALUES (1, ?, ?)`, dim),
+		eidB, float32SliceBlob(vecB))
+	require.NoError(err, "seed vec B")
+
+	// Teeth: under the OLD L2 table, the closest by Euclidean distance is
+	// B, so L2 ranks [B, A]. This is the divergence from pgvector (cosine)
+	// the migration fixes — captured here so the post-migration assertion
+	// is demonstrably meaningful.
+	l2Order := vec0RankOrder(t, db, VectorTableName(dim), q)
+	require.Equal([]int64{eidB, eidA}, l2Order,
+		"pre-migration L2 ranks B before A (the bug this migration fixes)")
+
+	// Run the migration.
+	require.NoError(Migrate(ctx, db, dim), "Migrate")
+
+	// schema_version advanced to 2.
+	assert.Equal(2, schemaVersion(t, db), "schema_version after migrate")
+
+	// Data intact: same embedding_ids and vectors survive the rebuild.
+	var cnt int
+	require.NoError(db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT COUNT(*) FROM vectors_vec_d%d`, dim)).Scan(&cnt), "count vecs")
+	assert.Equal(2, cnt, "vec rows preserved")
+	for _, want := range []struct {
+		eid int64
+		vec []float32
+	}{{eidA, vecA}, {eidB, vecB}} {
+		var blob []byte
+		require.NoErrorf(db.QueryRowContext(ctx,
+			fmt.Sprintf(`SELECT embedding FROM vectors_vec_d%d WHERE embedding_id = ?`, dim), want.eid).
+			Scan(&blob), "read vec %d", want.eid)
+		assert.Equalf(float32SliceBlob(want.vec), blob, "vector for eid=%d preserved", want.eid)
+	}
+
+	// Ranking is now cosine: A (same direction, large norm) ranks before
+	// B (off-axis) — the OPPOSITE of the pre-migration L2 order above.
+	cosOrder := vec0RankOrder(t, db, VectorTableName(dim), q)
+	assert.Equal([]int64{eidA, eidB}, cosOrder,
+		"post-migration cosine ranks A before B (matches pgvector)")
+
+	// Idempotent: second Migrate is a no-op (version already 2, no
+	// rebuild) and leaves rows + ordering untouched.
+	require.NoError(Migrate(ctx, db, dim), "second Migrate")
+	assert.Equal(2, schemaVersion(t, db), "schema_version stays 2")
+	cosOrder2 := vec0RankOrder(t, db, VectorTableName(dim), q)
+	assert.Equal([]int64{eidA, eidB}, cosOrder2, "ordering stable after second migrate")
+}
+
+// TestMigrate_FreshIsCosineAtV2 asserts a freshly-created vectors.db
+// lands at schema_version=2 with a cosine vec0 table directly (no rebuild
+// needed) and that ranking is cosine from the start.
+func TestMigrate_FreshIsCosineAtV2(t *testing.T) {
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	ctx := context.Background()
+	const dim = 3
+	db := openTestDB(t, filepath.Join(t.TempDir(), "fresh.db"))
+	t.Cleanup(func() { _ = db.Close() })
+
+	require.NoError(Migrate(ctx, db, dim), "fresh Migrate")
+	assert.Equal(2, schemaVersion(t, db), "fresh DB at schema_version 2")
+
+	// Seed a generation + the same non-unit A/B pair and confirm cosine
+	// ranking out of the box (no migration rebuild was involved).
+	_, err := db.ExecContext(ctx,
+		`INSERT INTO index_generations (id, model, dimension, fingerprint, started_at, state, message_count)
+		 VALUES (1, 'm', 3, 'm:3', 100, 'active', 2)`)
+	require.NoError(err, "seed generation")
+	_, err = db.ExecContext(ctx,
+		`INSERT INTO embeddings (embedding_id, generation_id, message_id, chunk_index, embedded_at, source_char_len)
+		 VALUES (100, 1, 10, 0, 100, 50), (200, 1, 20, 0, 100, 50)`)
+	require.NoError(err, "seed embeddings")
+	_, err = db.ExecContext(ctx,
+		fmt.Sprintf(`INSERT INTO vectors_vec_d%d (generation_id, embedding_id, embedding) VALUES (1, 100, ?)`, dim),
+		float32SliceBlob([]float32{5, 0, 0}))
+	require.NoError(err, "seed vec A")
+	_, err = db.ExecContext(ctx,
+		fmt.Sprintf(`INSERT INTO vectors_vec_d%d (generation_id, embedding_id, embedding) VALUES (1, 200, ?)`, dim),
+		float32SliceBlob([]float32{1, 0.2, 0}))
+	require.NoError(err, "seed vec B")
+
+	order := vec0RankOrder(t, db, VectorTableName(dim), []float32{1, 0, 0})
+	assert.Equal([]int64{100, 200}, order, "fresh DB ranks by cosine (A before B)")
 }
 
 func TestMigrate_CreatesDimensionSpecificVecTable(t *testing.T) {
