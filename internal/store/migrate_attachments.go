@@ -102,7 +102,7 @@ func CopyAttachments(ctx context.Context, src *Store, srcDir, dstDir string) (*A
 			// content actually equals the source before skipping (a same-size
 			// but different file must NOT be silently accepted).
 			if dstInfo.Size() == srcInfo.Size() {
-				match, err := sameFileContent(srcPath, dstPath)
+				match, err := sameFileContent(ctx, srcPath, dstPath)
 				if err != nil {
 					return res, fmt.Errorf("verify attachment %q: %w", rel, err)
 				}
@@ -126,7 +126,9 @@ func CopyAttachments(ctx context.Context, src *Store, srcDir, dstDir string) (*A
 
 // safeRelPath reports whether rel is a safe relative path that, when joined
 // onto srcDir and dstDir, stays inside both directories. It rejects absolute
-// paths and any path that cleans to ".." or escapes via "../".
+// paths and any path that cleans to ".." or escapes via "../". It is also
+// symlink-aware: a symlink planted inside either directory that redirects the
+// joined path outside the (resolved) base is rejected, not just lexical "..".
 func safeRelPath(rel, srcDir, dstDir string) bool {
 	if filepath.IsAbs(rel) {
 		return false
@@ -138,38 +140,82 @@ func safeRelPath(rel, srcDir, dstDir string) bool {
 	return withinDir(srcDir, rel) && withinDir(dstDir, rel)
 }
 
-// withinDir reports whether filepath.Join(dir, rel) resolves to a path inside
-// dir (or dir itself's subtree), guarding against traversal.
+// withinDir reports whether filepath.Join(dir, rel) stays inside dir's subtree.
+// It applies BOTH a lexical check (clean path under base) AND a symlink-aware
+// check: it resolves the real path of base and of the deepest existing ancestor
+// of the join target, and requires the resolved target to remain under the
+// resolved base. This catches a symlink inside dir that redirects the path out
+// of the tree — something the lexical "../" check alone cannot see.
 func withinDir(dir, rel string) bool {
 	base := filepath.Clean(dir) + string(filepath.Separator)
 	joined := filepath.Clean(filepath.Join(dir, rel))
-	return strings.HasPrefix(joined+string(filepath.Separator), base)
+	if !strings.HasPrefix(joined+string(filepath.Separator), base) {
+		return false
+	}
+	// Symlink-aware containment. Resolve the base dir's real path; if base
+	// cannot be resolved (e.g. it does not exist yet), fall back to the lexical
+	// result already established above.
+	realBase, err := filepath.EvalSymlinks(filepath.Clean(dir))
+	if err != nil {
+		return true
+	}
+	realTarget, err := resolveExistingPrefix(joined)
+	if err != nil {
+		return false
+	}
+	realBase += string(filepath.Separator)
+	return strings.HasPrefix(realTarget+string(filepath.Separator), realBase)
+}
+
+// resolveExistingPrefix returns the symlink-resolved real path of p, tolerating
+// a p whose final components do not exist yet (a destination blob path). It
+// EvalSymlinks the deepest ANCESTOR that exists and rejoins the not-yet-created
+// tail, so a symlink anywhere along the existing prefix is followed (and thus
+// caught by the caller's containment test) while a missing leaf is not an error.
+func resolveExistingPrefix(p string) (string, error) {
+	p = filepath.Clean(p)
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		return resolved, nil
+	}
+	dir := filepath.Dir(p)
+	if dir == p {
+		// Reached the filesystem root without an existing ancestor.
+		return p, nil
+	}
+	resolvedDir, err := resolveExistingPrefix(dir)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(resolvedDir, filepath.Base(p)), nil
 }
 
 // sameFileContent reports whether the two files have identical content by
 // comparing their SHA-256 digests. Used to confirm a same-size destination blob
-// truly matches the source before skipping the copy.
-func sameFileContent(aPath, bPath string) (bool, error) {
-	aHash, err := fileSHA256(aPath)
+// truly matches the source before skipping the copy. The hash reads honor ctx
+// so a large idempotency check aborts promptly on cancellation.
+func sameFileContent(ctx context.Context, aPath, bPath string) (bool, error) {
+	aHash, err := fileSHA256(ctx, aPath)
 	if err != nil {
 		return false, err
 	}
-	bHash, err := fileSHA256(bPath)
+	bHash, err := fileSHA256(ctx, bPath)
 	if err != nil {
 		return false, err
 	}
 	return aHash == bHash, nil
 }
 
-// fileSHA256 returns the lowercase hex SHA-256 of the file at path.
-func fileSHA256(path string) (string, error) {
+// fileSHA256 returns the lowercase hex SHA-256 of the file at path. The read is
+// cancellable via ctx (wrapped through ctxReader) so a large file's hash aborts
+// promptly when the context is cancelled.
+func fileSHA256(ctx context.Context, path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer func() { _ = f.Close() }()
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	if _, err := io.Copy(h, &ctxReader{ctx: ctx, r: f}); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil

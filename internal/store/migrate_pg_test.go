@@ -43,7 +43,7 @@ func TestMigrateSQLiteToPostgresRoundTrip(t *testing.T) {
 	// JSON survived the JSONB cast.
 	assert.Contains(scanString(t, pg, "SELECT sync_config::text FROM sources WHERE id = ?", want.sourceID), "all")
 
-	vrPG, err := store.VerifyMigration(ctx, sqliteSrc, pg)
+	vrPG, err := store.VerifyMigration(ctx, sqliteSrc, pg, true)
 	require.NoError(err, "verify sqlite->pg")
 	assert.Truef(vrPG.OK(), "pg verify problems: %v", vrPG.Problems)
 
@@ -66,7 +66,7 @@ func TestMigrateSQLiteToPostgresRoundTrip(t *testing.T) {
 
 	// Counts/ids round-trip back to SQLite. Note: pg now has the extra carol
 	// source we inserted above, so compare pg<->sqliteDst (the actual copy).
-	vrBack, err := store.VerifyMigration(ctx, pg, sqliteDst)
+	vrBack, err := store.VerifyMigration(ctx, pg, sqliteDst, true)
 	require.NoError(err, "verify pg->sqlite")
 	assert.Truef(vrBack.OK(), "back verify problems: %v", vrBack.Problems)
 
@@ -116,7 +116,7 @@ func TestMigratePGEmptyTableSequenceStartsAtOne(t *testing.T) {
 
 	// And a verify of the empty-table sequence must be OK (effective next > max,
 	// trivially true for an empty table).
-	vr, err := store.VerifyMigration(ctx, sqliteSrc, pg)
+	vr, err := store.VerifyMigration(ctx, sqliteSrc, pg, false)
 	require.NoError(err, "VerifyMigration")
 	// The reaction we just inserted makes pg's reactions count differ from the
 	// source, which is an expected row-count problem — but there must be NO
@@ -146,7 +146,7 @@ func TestMigratePGNonEmptySequenceVerify(t *testing.T) {
 	rebuildFTSForTest(t, pg)
 
 	// Healthy migration verifies clean.
-	vr, err := store.VerifyMigration(ctx, sqliteSrc, pg)
+	vr, err := store.VerifyMigration(ctx, sqliteSrc, pg, true)
 	require.NoError(err, "VerifyMigration")
 	assert.Truef(vr.OK(), "verify problems: %v", vr.Problems)
 
@@ -156,7 +156,7 @@ func TestMigratePGNonEmptySequenceVerify(t *testing.T) {
 		"SELECT setval(pg_get_serial_sequence('messages','id'), 1, false)")
 	require.NoError(err, "rewind messages sequence")
 
-	vr2, err := store.VerifyMigration(ctx, sqliteSrc, pg)
+	vr2, err := store.VerifyMigration(ctx, sqliteSrc, pg, true)
 	require.NoError(err, "VerifyMigration after rewind")
 	assert.False(vr2.OK(), "verify must fail with sequence behind max")
 	found := false
@@ -166,6 +166,110 @@ func TestMigratePGNonEmptySequenceVerify(t *testing.T) {
 		}
 	}
 	assert.Truef(found, "expected a messages sequence problem, got: %v", vr2.Problems)
+}
+
+// TestVerifyCrossBackendContentHashCatchesNonIDCorruption (F1) proves the
+// per-table content hash achieves cross-backend canonical equality AND catches a
+// corrupted NON-id column across backends: migrate SQLite->PG (verify clean),
+// then corrupt message_recipients.display_name on PG only (count + id-set
+// unchanged) and assert the cross-backend verify FAILS with a content-hash
+// problem. A naive md5(t::text) in SQL would false-fail every clean row here
+// (bool t/f vs 1/0, timestamp/JSON spelling); a clean baseline that flips only
+// on real corruption is the teeth.
+func TestVerifyCrossBackendContentHashCatchesNonIDCorruption(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := context.Background()
+
+	pg := testutil.NewPostgresTestStore(t) // skips if no PG env
+	sqliteSrc := testutil.NewSQLiteTestStore(t)
+
+	buildSourceVault(t, sqliteSrc)
+	clearDefaultCollection(t, pg)
+
+	_, err := store.MigrateVault(ctx, sqliteSrc, pg, store.MigrateOptions{Batch: 50})
+	require.NoError(err, "migrate sqlite->pg")
+	rebuildFTSForTest(t, pg)
+
+	// Baseline: a clean cross-backend verify passes — this is what proves the
+	// canonicalization (the hash matches despite SQLite vs PG type spellings).
+	vrClean, err := store.VerifyMigration(ctx, sqliteSrc, pg, true)
+	require.NoError(err, "verify clean")
+	require.Truef(vrClean.OK(), "clean cross-backend verify must pass: %v", vrClean.Problems)
+
+	// Corrupt a NON-id column on PG only. Count and id-set are untouched.
+	res, err := pg.DB().ExecContext(ctx,
+		"UPDATE message_recipients SET display_name = 'CORRUPTED' "+
+			"WHERE id = (SELECT MIN(id) FROM message_recipients)")
+	require.NoError(err, "corrupt display_name on pg")
+	n, _ := res.RowsAffected()
+	require.Equal(int64(1), n, "exactly one row corrupted")
+
+	vr, err := store.VerifyMigration(ctx, sqliteSrc, pg, true)
+	require.NoError(err, "verify after corruption")
+	assert.False(vr.OK(), "cross-backend verify must fail on corrupted non-id column")
+	found := false
+	for _, p := range vr.Problems {
+		if strings.Contains(p, "message_recipients") && strings.Contains(p, "content hash") {
+			found = true
+		}
+	}
+	assert.Truef(found, "expected a message_recipients content-hash problem, got: %v", vr.Problems)
+
+	// The id-set hash on message_recipients must still match — proving the
+	// failure is the content hash, not the id set.
+	for _, tv := range vr.Tables {
+		if tv.Table == "message_recipients" {
+			assert.True(tv.IDHashOK, "id-set hash still matches (corruption is non-id)")
+			assert.False(tv.ContentHashOK, "content hash flags the cross-backend corruption")
+		}
+	}
+}
+
+// TestVerifyCrossBackendIdlessJunctionCorruption (F1) proves the content hash
+// catches a corrupted IDLESS junction row across backends: migrate SQLite->PG,
+// re-point the single message_labels row to a different valid label on PG only
+// (row count unchanged), and assert the cross-backend verify FAILS. Idless
+// tables previously had only a row-count check.
+func TestVerifyCrossBackendIdlessJunctionCorruption(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := context.Background()
+
+	pg := testutil.NewPostgresTestStore(t)
+	sqliteSrc := testutil.NewSQLiteTestStore(t)
+
+	pop := buildSourceVault(t, sqliteSrc)
+	// A second label so the PG junction row can be re-pointed to a valid target.
+	label2, err := sqliteSrc.EnsureLabel(pop.sourceID, "SENT", "SENT", "system")
+	require.NoError(err, "EnsureLabel SENT")
+	clearDefaultCollection(t, pg)
+
+	_, err = store.MigrateVault(ctx, sqliteSrc, pg, store.MigrateOptions{Batch: 50})
+	require.NoError(err, "migrate sqlite->pg")
+	rebuildFTSForTest(t, pg)
+
+	vrClean, err := store.VerifyMigration(ctx, sqliteSrc, pg, true)
+	require.NoError(err, "verify clean")
+	require.Truef(vrClean.OK(), "clean cross-backend verify must pass: %v", vrClean.Problems)
+
+	// Re-point the message_labels row to label2 on PG only (count stays 1).
+	res, err := pg.DB().ExecContext(ctx,
+		"UPDATE message_labels SET label_id = $1 WHERE message_id = $2", label2, pop.rootMsgID)
+	require.NoError(err, "re-point junction row on pg")
+	n, _ := res.RowsAffected()
+	require.Equal(int64(1), n, "one junction row re-pointed")
+
+	vr, err := store.VerifyMigration(ctx, sqliteSrc, pg, true)
+	require.NoError(err, "verify after junction corruption")
+	assert.False(vr.OK(), "cross-backend verify must fail on corrupted idless junction")
+	found := false
+	for _, p := range vr.Problems {
+		if strings.Contains(p, "message_labels") && strings.Contains(p, "content hash") {
+			found = true
+		}
+	}
+	assert.Truef(found, "expected a message_labels content-hash problem, got: %v", vr.Problems)
 }
 
 // TestPGOrphanChecksCoverAllFKEdges (M4) asserts the dynamic, catalog-driven FK

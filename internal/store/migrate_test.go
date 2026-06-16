@@ -232,7 +232,7 @@ func TestMigrateSQLiteToSQLite(t *testing.T) {
 	assert.NotEmpty(dstRaw, "raw blob copied")
 	assert.Equal(srcRaw, dstRaw, "raw blob bytes preserved verbatim")
 
-	vr, err := store.VerifyMigration(ctx, src, dst)
+	vr, err := store.VerifyMigration(ctx, src, dst, true)
 	require.NoError(err, "VerifyMigration")
 	assert.Truef(vr.OK(), "verify problems: %v", vr.Problems)
 }
@@ -260,7 +260,7 @@ func TestMigrateResumeIdempotent(t *testing.T) {
 	assert.Equal(firstMsgs, secondMsgs, "message count stable across resume re-run")
 	rebuildFTSForTest(t, dst)
 
-	vr, err := store.VerifyMigration(ctx, src, dst)
+	vr, err := store.VerifyMigration(ctx, src, dst, true)
 	require.NoError(err, "VerifyMigration")
 	assert.Truef(vr.OK(), "verify problems: %v", vr.Problems)
 }
@@ -284,7 +284,7 @@ func TestVerifyCatchesMismatch(t *testing.T) {
 	_, err = dst.EnsureParticipant("carol@example.com", "Carol", "example.com")
 	require.NoError(err, "inject participant")
 
-	vr, err := store.VerifyMigration(ctx, src, dst)
+	vr, err := store.VerifyMigration(ctx, src, dst, false)
 	require.NoError(err, "VerifyMigration")
 	assert.False(vr.OK(), "verify should fail on injected mismatch")
 	assert.NotEmpty(vr.Problems, "expected a recorded problem")
@@ -389,6 +389,45 @@ func TestCopyAttachmentsRejectsUnsafePaths(t *testing.T) {
 	// The traversal target outside dstDir must not exist.
 	_, statErr := os.Stat(filepath.Join(dstParent, "escape.pdf"))
 	assert.True(os.IsNotExist(statErr), "traversal target must not be written")
+}
+
+// TestCopyAttachmentsRejectsSymlinkEscape (F4) asserts symlink-aware
+// containment: a symlink planted INSIDE the destination dir that redirects a
+// content-addressed subdir out of the tree must be rejected, not followed. The
+// path is lexically clean ("ab/abc123def456" has no ".."), so only the
+// symlink-resolving check can catch the escape.
+func TestCopyAttachmentsRejectsSymlinkEscape(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := context.Background()
+
+	src := newSQLiteStore(t)
+	buildSourceVault(t, src) // references "ab/abc123def456"
+
+	srcDir := t.TempDir()
+	dstParent := t.TempDir()
+	dstDir := filepath.Join(dstParent, "dest")
+	require.NoError(os.MkdirAll(dstDir, 0o755), "make dstDir")
+
+	// outside is a sibling of dstDir (NOT under it). Plant a symlink at
+	// dstDir/ab -> outside, so dstDir/ab/abc123def456 resolves to
+	// outside/abc123def456 — outside the destination tree.
+	outside := filepath.Join(dstParent, "outside")
+	require.NoError(os.MkdirAll(outside, 0o755), "make outside dir")
+	require.NoError(os.Symlink(outside, filepath.Join(dstDir, "ab")), "plant escaping symlink")
+
+	// Provide the source blob so a missing-file skip does not pre-empt the path
+	// check (the fixture references ab/abc123def456 but never writes it).
+	testutil.WriteFile(t, srcDir, "ab/abc123def456", []byte("PDFDATA"))
+
+	res, err := store.CopyAttachments(ctx, src, srcDir, dstDir)
+	require.NoError(err, "CopyAttachments")
+	assert.Positive(res.Rejected, "symlink-escaping path counted as rejected")
+	assert.Equal(int64(0), res.Copied, "nothing copied through the escaping symlink")
+
+	// The escape target outside the dest tree must NOT have been written.
+	_, statErr := os.Stat(filepath.Join(outside, "abc123def456"))
+	assert.True(os.IsNotExist(statErr), "blob must not be written outside the dest tree")
 }
 
 // TestCopyAttachmentsCountsMissing (M2) asserts a blob referenced in the DB but
@@ -511,13 +550,146 @@ func TestVerifyCatchesContentDivergence(t *testing.T) {
 	require.Equal(srcMin, dstMin, "min unchanged")
 	require.Equal(srcMax, dstMax, "max unchanged")
 
-	vr, err := store.VerifyMigration(ctx, src, dst)
+	vr, err := store.VerifyMigration(ctx, src, dst, false)
 	require.NoError(err, "VerifyMigration")
 	assert.False(vr.OK(), "verify must fail on diverged id-set")
 	found := slices.ContainsFunc(vr.Problems, func(p string) bool {
 		return strings.Contains(p, "message_recipients") && strings.Contains(p, "content hash")
 	})
 	assert.Truef(found, "expected a message_recipients content-hash problem, got: %v", vr.Problems)
+}
+
+// TestVerifyCatchesNonIDColumnCorruption (F1) mutates a NON-id column on a
+// keyed table — message_recipients.display_name — leaving row count AND the
+// full id-set identical. The id-set hash and id-range checks all pass; only the
+// new per-table CONTENT hash (which spans every column, not just the id set)
+// catches the corruption.
+func TestVerifyCatchesNonIDColumnCorruption(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := context.Background()
+
+	src := newSQLiteStore(t)
+	dst := newSQLiteStore(t)
+	buildSourceVault(t, src)
+	clearDefaultCollection(t, dst)
+
+	_, err := store.MigrateVault(ctx, src, dst, store.MigrateOptions{Batch: 100})
+	require.NoError(err, "MigrateVault")
+
+	// Corrupt a non-id column on the destination only. Counts and the entire
+	// id-set are untouched, so every pre-existing check passes.
+	res, err := dst.DB().Exec(
+		"UPDATE message_recipients SET display_name = 'CORRUPTED' WHERE id = (SELECT MIN(id) FROM message_recipients)")
+	require.NoError(err, "corrupt display_name")
+	n, _ := res.RowsAffected()
+	require.Equal(int64(1), n, "exactly one recipient corrupted")
+
+	// Sanity: counts and id-set still match (so only the content hash can fail).
+	var sc, sMin, sMax, dc, dMin, dMax int64
+	require.NoError(src.DB().QueryRow("SELECT COUNT(*),COALESCE(MIN(id),0),COALESCE(MAX(id),0) FROM message_recipients").Scan(&sc, &sMin, &sMax))
+	require.NoError(dst.DB().QueryRow("SELECT COUNT(*),COALESCE(MIN(id),0),COALESCE(MAX(id),0) FROM message_recipients").Scan(&dc, &dMin, &dMax))
+	require.Equal(sc, dc, "count unchanged")
+	require.Equal(sMin, dMin, "min id unchanged")
+	require.Equal(sMax, dMax, "max id unchanged")
+
+	vr, err := store.VerifyMigration(ctx, src, dst, false)
+	require.NoError(err, "VerifyMigration")
+	assert.False(vr.OK(), "verify must fail on corrupted non-id column")
+	found := slices.ContainsFunc(vr.Problems, func(p string) bool {
+		return strings.Contains(p, "message_recipients") && strings.Contains(p, "content hash")
+	})
+	assert.Truef(found, "expected a message_recipients content-hash problem, got: %v", vr.Problems)
+
+	// And the id-set hash on the SAME table must still match — proving the
+	// failure came from the content hash, not the id set.
+	for _, tv := range vr.Tables {
+		if tv.Table == "message_recipients" {
+			assert.True(tv.IDHashOK, "id-set hash must still match (corruption is non-id)")
+			assert.False(tv.ContentHashOK, "content hash must flag the corruption")
+		}
+	}
+}
+
+// TestVerifyCatchesIdlessJunctionCorruption (F1) corrupts an IDLESS table —
+// message_labels, a pure (message_id, label_id) junction with no id column and
+// thus no id-set check at all. The old verify gave idless tables only a
+// row-count check, so a re-pointed junction row would pass. The per-table
+// content hash must catch it.
+func TestVerifyCatchesIdlessJunctionCorruption(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := context.Background()
+
+	src := newSQLiteStore(t)
+	dst := newSQLiteStore(t)
+	pop := buildSourceVault(t, src)
+	clearDefaultCollection(t, dst)
+
+	// Add a SECOND label on the source so the destination junction row can be
+	// re-pointed to a different (still valid) label while the row COUNT stays 1.
+	label2, err := src.EnsureLabel(pop.sourceID, "SENT", "SENT", "system")
+	require.NoError(err, "EnsureLabel SENT")
+
+	_, err = store.MigrateVault(ctx, src, dst, store.MigrateOptions{Batch: 100})
+	require.NoError(err, "MigrateVault")
+
+	// Re-point the single message_labels row to label2 on the DESTINATION only.
+	// Row count stays 1; only the (message_id, label_id) value changes — exactly
+	// what an idless-table content hash must detect.
+	res, err := dst.DB().Exec("UPDATE message_labels SET label_id = ? WHERE message_id = ?",
+		label2, pop.rootMsgID)
+	require.NoError(err, "re-point junction row")
+	n, _ := res.RowsAffected()
+	require.Equal(int64(1), n, "one junction row re-pointed")
+
+	require.Equal(scanInt(t, src, "SELECT COUNT(*) FROM message_labels"),
+		scanInt(t, dst, "SELECT COUNT(*) FROM message_labels"),
+		"junction row count unchanged (only count check would pass)")
+
+	vr, err := store.VerifyMigration(ctx, src, dst, false)
+	require.NoError(err, "VerifyMigration")
+	assert.False(vr.OK(), "verify must fail on corrupted idless junction row")
+	found := slices.ContainsFunc(vr.Problems, func(p string) bool {
+		return strings.Contains(p, "message_labels") && strings.Contains(p, "content hash")
+	})
+	assert.Truef(found, "expected a message_labels content-hash problem, got: %v", vr.Problems)
+}
+
+// TestVerifyExpectFTSFlagsUnavailable (F3) asserts that when the caller expected
+// FTS to be rebuilt (expectFTS=true) but the destination index is not ready,
+// verify records a problem instead of silently passing. With expectFTS=false
+// the same not-ready state is NOT a problem.
+func TestVerifyExpectFTSFlagsUnavailable(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := context.Background()
+
+	src := newSQLiteStore(t)
+	dst := newSQLiteStore(t)
+	buildSourceVault(t, src)
+	clearDefaultCollection(t, dst)
+
+	_, err := store.MigrateVault(ctx, src, dst, store.MigrateOptions{Batch: 100})
+	require.NoError(err, "MigrateVault")
+	// Deliberately do NOT rebuild FTS on the destination, so the index needs a
+	// backfill (or is unavailable). The data copy itself is clean.
+
+	// expectFTS=false: FTS readiness is not asserted, so no FTS problem.
+	vrNoFTS, err := store.VerifyMigration(ctx, src, dst, false)
+	require.NoError(err, "VerifyMigration expectFTS=false")
+	for _, p := range vrNoFTS.Problems {
+		assert.NotContains(p, "FTS", "no FTS problem when rebuild was not expected: %s", p)
+	}
+
+	// expectFTS=true: an unready FTS index is a problem.
+	vrFTS, err := store.VerifyMigration(ctx, src, dst, true)
+	require.NoError(err, "VerifyMigration expectFTS=true")
+	assert.False(vrFTS.OK(), "verify must fail when FTS expected but not ready")
+	found := slices.ContainsFunc(vrFTS.Problems, func(p string) bool {
+		return strings.Contains(p, "FTS")
+	})
+	assert.Truef(found, "expected an FTS problem, got: %v", vrFTS.Problems)
 }
 
 // --- small scan helpers (kept local; not assertion wrappers) ---
