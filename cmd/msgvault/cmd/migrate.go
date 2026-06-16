@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -71,7 +73,7 @@ func init() {
 	f.BoolVar(&migrateDryRun, "dry-run", false, "report source row counts without writing")
 	f.BoolVar(&migrateVerify, "verify", false, "verify the migration after copying (row counts, ids, FK integrity, FTS)")
 	f.BoolVar(&migrateResume, "resume", false, "conflict-skip rows that already exist on the destination")
-	f.IntVar(&migrateBatch, "batch", 5000, "rows per multi-row INSERT batch")
+	f.IntVar(&migrateBatch, "batch", store.DefaultMigrateBatch, "rows per multi-row INSERT batch")
 	f.BoolVar(&migrateRebuildFTS, "rebuild-fts", true, "rebuild the full-text search index on the destination")
 	f.BoolVar(&migrateNoRebuildFTS, "no-rebuild-fts", false, "do not rebuild the full-text search index on the destination")
 	f.BoolVar(&migrateTruncateDest, "truncate-dest", false, "delete existing destination data before copying")
@@ -153,8 +155,14 @@ func runMigrate(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	if from.dsn == to.dsn {
-		return usageErr(cmd, fmt.Errorf("--from and --to resolve to the same database (%s)", from.dsn))
+	// Refuse if source and destination resolve to the SAME database. Compare
+	// canonically (not raw DSN strings) so aliased identities — a relative vs
+	// absolute SQLite path to one file, or two PG DSNs differing only in
+	// host/port/query spelling — can never slip past this guard and let
+	// --truncate-dest erase the source.
+	if same, why := sameDatabase(from.dsn, to.dsn); same {
+		return usageErr(cmd, fmt.Errorf(
+			"--from and --to resolve to the same database (%s)", why))
 	}
 
 	// cobra's Execute replaces a nil command context with context.Background;
@@ -180,25 +188,32 @@ func runMigrate(cmd *cobra.Command, _ []string) error {
 		return errors.New("source database has zero accounts (sources table is empty) — nothing to migrate")
 	}
 
-	dst, err := store.Open(to.dsn)
-	if err != nil {
-		return fmt.Errorf("open destination %s: %w", to.dsn, err)
-	}
-	defer func() { _ = dst.Close() }()
-
-	if err := dst.InitSchema(); err != nil {
-		return fmt.Errorf("initialize destination schema: %w", err)
-	}
-
-	if !migrateDryRun {
-		if err := prepareDest(ctx, cmd, dst); err != nil {
-			return err
+	// Dry run: read source counts and print the plan WITHOUT opening,
+	// initializing, or mutating the destination in any way.
+	if migrateDryRun {
+		fmt.Fprintf(os.Stderr, "Dry run: %s -> %s (no destination changes)\n",
+			backendLabel(from.dsn), backendLabel(to.dsn))
+		result, err := store.MigrateVault(ctx, src, nil, store.MigrateOptions{
+			Batch:    migrateBatch,
+			DryRun:   true,
+			Progress: migrateProgress(),
+		})
+		if err != nil {
+			if src.IsBusyError(err) {
+				return errors.New("database is busy — stop 'msgvault serve' and any other clients, then retry")
+			}
+			return fmt.Errorf("migrate (dry run): %w", err)
 		}
+		printMigrateSummary(result)
+		return nil
 	}
 
-	// Resolve attachment dirs up front so a misconfiguration fails before any
-	// data is written (never silently drop blobs).
-	if copyAttachments && !migrateDryRun {
+	// Validate ALL preconditions BEFORE any destination mutation (before
+	// InitSchema and prepareDest) so a misconfiguration — e.g. an unresolvable
+	// attachments dir — can never leave a truncated/initialized destination
+	// behind. Attachment-dir resolution is a precondition only when blobs are
+	// being copied.
+	if copyAttachments {
 		if from.attachDir == "" {
 			return errors.New("cannot resolve SOURCE attachments directory: pass --from-home, " +
 				"point --from at the configured vault, or use --no-attachments to skip blobs")
@@ -209,12 +224,26 @@ func runMigrate(cmd *cobra.Command, _ []string) error {
 		}
 	}
 
+	dst, err := store.Open(to.dsn)
+	if err != nil {
+		return fmt.Errorf("open destination %s: %w", to.dsn, err)
+	}
+	defer func() { _ = dst.Close() }()
+
+	if err := dst.InitSchema(); err != nil {
+		return fmt.Errorf("initialize destination schema: %w", err)
+	}
+
+	if err := prepareDest(ctx, cmd, dst); err != nil {
+		return err
+	}
+
 	fmt.Fprintf(os.Stderr, "Migrating %s -> %s\n", backendLabel(from.dsn), backendLabel(to.dsn))
 
 	result, err := store.MigrateVault(ctx, src, dst, store.MigrateOptions{
 		Batch:    migrateBatch,
 		Resume:   migrateResume,
-		DryRun:   migrateDryRun,
+		DryRun:   false,
 		Progress: migrateProgress(),
 	})
 	if err != nil {
@@ -225,10 +254,6 @@ func runMigrate(cmd *cobra.Command, _ []string) error {
 	}
 
 	printMigrateSummary(result)
-
-	if migrateDryRun {
-		return nil
-	}
 
 	// Rebuild FTS on the destination (FTS is backend-specific, never copied).
 	if rebuildFTS {
@@ -249,6 +274,16 @@ func runMigrate(cmd *cobra.Command, _ []string) error {
 		}
 		fmt.Fprintf(os.Stderr, "  attachments: %d copied, %d skipped (%d bytes)\n",
 			ar.Copied, ar.Skipped, ar.Bytes)
+		if ar.Missing > 0 {
+			fmt.Fprintf(os.Stderr,
+				"  WARNING: %d referenced attachment blob(s) missing from source%s\n",
+				ar.Missing, sampleSuffix(ar.MissingSample, ar.Missing))
+		}
+		if ar.Rejected > 0 {
+			fmt.Fprintf(os.Stderr,
+				"  WARNING: %d attachment path(s) rejected as unsafe%s\n",
+				ar.Rejected, sampleSuffix(ar.RejectedSample, ar.Rejected))
+		}
 	}
 
 	// Vectors: never copied across backends. Surface the re-embed instruction.
@@ -316,6 +351,125 @@ func backendLabel(dsn string) string {
 		return "PostgreSQL"
 	}
 	return "SQLite(" + dsn + ")"
+}
+
+// sameDatabase reports whether two DSNs canonically resolve to the same
+// database, returning a human description for the error message. It is the
+// load-bearing guard against --truncate-dest erasing the source via an aliased
+// identity (relative vs absolute SQLite path; differently-spelled PG DSNs).
+//
+//   - Both SQLite: strip any file: scheme + query string, then
+//     filepath.Abs + filepath.EvalSymlinks; equal resolved paths mean the same
+//     file. As a belt-and-suspenders, when both files exist, os.SameFile on
+//     their FileInfos catches hardlinks / case-insensitive FS aliases the
+//     string compare would miss.
+//   - Both PostgreSQL: parse both URLs, normalize scheme to postgres, lowercase
+//     host, default the port to 5432, and compare (host, port, dbname) while
+//     ignoring other query params (sslmode, search_path, etc.).
+//   - Mixed backends are never the same database.
+func sameDatabase(a, b string) (bool, string) {
+	aPG, bPG := store.IsPostgresURL(a), store.IsPostgresURL(b)
+	if aPG != bPG {
+		return false, ""
+	}
+	if aPG {
+		return samePostgres(a, b)
+	}
+	return sameSQLite(a, b)
+}
+
+// sameSQLite canonicalizes two SQLite DSNs to absolute, symlink-resolved paths
+// and compares them, also using os.SameFile when both files exist.
+func sameSQLite(a, b string) (bool, string) {
+	pa := canonicalSQLitePath(a)
+	pb := canonicalSQLitePath(b)
+	if pa == pb {
+		return true, pa
+	}
+	// Belt-and-suspenders: identical inode even if the resolved strings differ
+	// (e.g. case-insensitive filesystem, hardlink).
+	if ia, err := os.Stat(pa); err == nil {
+		if ib, err := os.Stat(pb); err == nil && os.SameFile(ia, ib) {
+			return true, pa
+		}
+	}
+	return false, ""
+}
+
+// canonicalSQLitePath reduces a SQLite DSN to a canonical filesystem path:
+// drop a leading file: scheme, drop any ?query string, make absolute, then
+// resolve symlinks where possible. Best-effort: on any error it falls back to
+// the most-resolved form it has so far (never returns "").
+func canonicalSQLitePath(dsn string) string {
+	p := dsn
+	// Strip a file: / file:// scheme (with or without authority).
+	for _, prefix := range []string{"file://", "file:"} {
+		if rest, ok := strings.CutPrefix(p, prefix); ok {
+			p = rest
+			break
+		}
+	}
+	// Strip a DSN query string ("?_journal_mode=WAL&...").
+	if i := strings.IndexByte(p, '?'); i >= 0 {
+		p = p[:i]
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		p = resolved
+	}
+	return p
+}
+
+// samePostgres compares two PostgreSQL DSNs on (host, port, dbname) after
+// normalizing scheme, host case, and the default port. Other query parameters
+// (sslmode, search_path, application_name, …) are ignored. Unparseable DSNs
+// fall back to an exact string compare so a genuinely-identical DSN is still
+// caught.
+func samePostgres(a, b string) (bool, string) {
+	ka, oka := pgIdentity(a)
+	kb, okb := pgIdentity(b)
+	if !oka || !okb {
+		if a == b {
+			return true, a
+		}
+		return false, ""
+	}
+	if ka == kb {
+		return true, ka
+	}
+	return false, ""
+}
+
+// pgIdentity returns a canonical "host:port/dbname" identity for a PG DSN and
+// whether it parsed. Scheme is normalized to postgres, host lowercased, port
+// defaulted to 5432, and the leading slash dropped from the db name.
+func pgIdentity(dsn string) (string, bool) {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return "", false
+	}
+	host := strings.ToLower(u.Hostname())
+	port := u.Port()
+	if port == "" {
+		port = "5432"
+	}
+	db := strings.TrimPrefix(u.Path, "/")
+	return host + ":" + port + "/" + db, true
+}
+
+// sampleSuffix renders a parenthetical list of example paths for a warning
+// line, indicating truncation when fewer samples than total are shown.
+func sampleSuffix(sample []string, total int64) string {
+	if len(sample) == 0 {
+		return ""
+	}
+	s := " (e.g. " + strings.Join(sample, ", ")
+	if int64(len(sample)) < total {
+		s += ", …"
+	}
+	return s + ")"
 }
 
 // migrateProgress returns a per-table progress callback that prints a single
