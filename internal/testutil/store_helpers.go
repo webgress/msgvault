@@ -44,6 +44,35 @@ func NewTestStore(t *testing.T) *store.Store {
 	return st
 }
 
+// NewPostgresTestStore creates an isolated PostgreSQL test store regardless of
+// the default backend, using a random schema dropped on cleanup. The calling
+// test is skipped when MSGVAULT_TEST_DB does not target PostgreSQL.
+//
+// Unlike NewTestStore (which picks the backend from MSGVAULT_TEST_DB), this
+// always yields a PostgreSQL store — for tests that must drive BOTH a SQLite and
+// a PostgreSQL store in the same run (e.g. cross-backend migration round-trips).
+func NewPostgresTestStore(t *testing.T) *store.Store {
+	t.Helper()
+	testDB := os.Getenv("MSGVAULT_TEST_DB")
+	if !strings.HasPrefix(testDB, "postgres://") && !strings.HasPrefix(testDB, "postgresql://") {
+		t.Skip("MSGVAULT_TEST_DB is not a PostgreSQL DSN; skipping PostgreSQL store")
+	}
+	return newPostgresTestStore(t, testDB)
+}
+
+// NewSQLiteTestStore creates an isolated on-disk SQLite test store with an
+// initialized schema, regardless of MSGVAULT_TEST_DB. Pairs with
+// NewPostgresTestStore for cross-backend tests.
+func NewSQLiteTestStore(t *testing.T) *store.Store {
+	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	st, err := store.OpenForTest(dbPath)
+	require.NoError(t, err, "open sqlite store")
+	t.Cleanup(func() { _ = st.Close() })
+	require.NoError(t, st.InitSchema(), "init schema")
+	return st
+}
+
 // SkipIfPostgres skips the calling test when MSGVAULT_TEST_DB targets
 // PostgreSQL. Use this for tests that exercise SQLite-only constructs
 // (FTS5 MATCH, PRAGMA, BEGIN EXCLUSIVE, SQLite trigger syntax) where

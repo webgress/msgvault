@@ -19,3 +19,11 @@ func SetBackfillFTSBatchErrHookForTest(fn func(fromID, toID int64) error) func()
 	backfillFTSBatchErrHook = fn
 	return func() { backfillFTSBatchErrHook = nil }
 }
+
+// MigrateTableOrderForTest returns a copy of the cross-backend copy order so
+// external tests can assert FK-graph coverage without exporting the slice.
+func MigrateTableOrderForTest() []string {
+	out := make([]string, len(migrateTableOrder))
+	copy(out, migrateTableOrder)
+	return out
+}
