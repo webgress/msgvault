@@ -93,6 +93,60 @@ func TestRunMigrateRejectsAliasedSQLitePath(t *testing.T) {
 	require.Contains(err.Error(), "same database")
 }
 
+// TestRunMigrateRejectsFileURIPercentEncodedAlias (F2) asserts that a plain
+// path with a space and a file: URI whose path percent-encodes that same space
+// resolve to the SAME SQLite file and are rejected. The SQLite driver opens
+// file: DSNs with SQLITE_OPEN_URI and URL-decodes the path, so "%20" addresses
+// a literal space — without decoding in the guard, --truncate-dest could erase
+// the source through the encoded alias. The guard runs BEFORE opening any file,
+// so this holds even when the file does not exist.
+func TestRunMigrateRejectsFileURIPercentEncodedAlias(t *testing.T) {
+	require := requirepkg.New(t)
+
+	dir := t.TempDir()
+	// A path containing a space; the file need NOT exist (the guard is purely
+	// string-based for this alias — os.SameFile cannot help when the encoded
+	// path fails os.Stat).
+	plain := filepath.Join(dir, "a b.db")
+	encoded := "file:" + filepath.Join(dir, "a%20b.db")
+
+	resetMigrateFlags()
+	migrateFrom = plain
+	migrateTo = encoded
+	migrateTruncateDest = true
+	err := runMigrate(&cobra.Command{}, nil)
+	require.Error(err, "file: URI percent-encoded alias must be rejected")
+	require.Contains(err.Error(), "same database")
+
+	// And the reverse direction (encoded source, plain dest) is symmetric.
+	resetMigrateFlags()
+	migrateFrom = encoded
+	migrateTo = plain
+	migrateTruncateDest = true
+	err = runMigrate(&cobra.Command{}, nil)
+	require.Error(err, "reverse percent-encoded alias must be rejected")
+	require.Contains(err.Error(), "same database")
+}
+
+// TestCanonicalSQLitePathDoesNotDecodePlainPath (F2) asserts a LITERAL plain
+// path containing "%20" (no file: scheme) is NOT URL-decoded — only the file:
+// branch decodes — so a real on-disk file literally named "a%20b.db" stays
+// distinct from one named "a b.db".
+func TestCanonicalSQLitePathDoesNotDecodePlainPath(t *testing.T) {
+	assert := assertpkg.New(t)
+	dir := t.TempDir()
+
+	literalPercent := canonicalSQLitePath(filepath.Join(dir, "a%20b.db"))
+	withSpace := canonicalSQLitePath(filepath.Join(dir, "a b.db"))
+	assert.NotEqual(withSpace, literalPercent,
+		"plain path with %%20 must stay literal (only file: URIs decode)")
+
+	// The file: form of the %20 path DOES decode to the space path.
+	fileURIDecoded := canonicalSQLitePath("file:" + filepath.Join(dir, "a%20b.db"))
+	assert.Equal(withSpace, fileURIDecoded,
+		"file: URI %%20 must decode to the literal space path")
+}
+
 // TestRunMigratePostgresAliasRejected (H1) asserts two PG DSNs that differ only
 // in spelling (scheme, host case, default port, extra query params) but point
 // at the same (host,port,dbname) are rejected.

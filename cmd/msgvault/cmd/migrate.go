@@ -257,6 +257,16 @@ func runMigrate(cmd *cobra.Command, _ []string) error {
 
 	// Rebuild FTS on the destination (FTS is backend-specific, never copied).
 	if rebuildFTS {
+		// RebuildFTS predates context plumbing and runs on context.Background
+		// internally (see internal/store/messages.go), so a cancellation that
+		// arrives mid-rebuild is NOT honored — a known limitation tracked as a
+		// follow-up (refactoring RebuildFTS's signature is out of scope for this
+		// feature branch). Guard the common case by aborting BEFORE we start if
+		// the context is already cancelled, so a user who Ctrl-C'd during the
+		// copy does not then sit through a full FTS rebuild.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		fmt.Fprintln(os.Stderr, "Rebuilding full-text search index on destination...")
 		if _, err := dst.RebuildFTS(ftsProgressBar()); err != nil {
 			fmt.Fprintln(os.Stderr)
@@ -294,7 +304,9 @@ func runMigrate(cmd *cobra.Command, _ []string) error {
 
 	if migrateVerify {
 		fmt.Fprintln(os.Stderr, "Verifying migration...")
-		vr, err := store.VerifyMigration(ctx, src, dst)
+		// expectFTS mirrors whether we rebuilt FTS above, so verify only asserts
+		// FTS readiness when a rebuild was actually requested.
+		vr, err := store.VerifyMigration(ctx, src, dst, rebuildFTS)
 		if err != nil {
 			return fmt.Errorf("verify: %w", err)
 		}
@@ -400,18 +412,35 @@ func sameSQLite(a, b string) (bool, string) {
 // drop a leading file: scheme, drop any ?query string, make absolute, then
 // resolve symlinks where possible. Best-effort: on any error it falls back to
 // the most-resolved form it has so far (never returns "").
+//
+// When the DSN carried a file: scheme the path is URL-decoded (the SQLite
+// driver opens with SQLITE_OPEN_URI, so "file:/tmp/a%20b.db" addresses
+// "/tmp/a b.db"); without decoding, that aliased identity would slip past the
+// same-database guard and let --truncate-dest erase the source. A literal plain
+// path containing "%20" (no scheme) is NOT decoded — it stays a literal path.
 func canonicalSQLitePath(dsn string) string {
 	p := dsn
+	hadFileScheme := false
 	// Strip a file: / file:// scheme (with or without authority).
 	for _, prefix := range []string{"file://", "file:"} {
 		if rest, ok := strings.CutPrefix(p, prefix); ok {
 			p = rest
+			hadFileScheme = true
 			break
 		}
 	}
 	// Strip a DSN query string ("?_journal_mode=WAL&...").
 	if i := strings.IndexByte(p, '?'); i >= 0 {
 		p = p[:i]
+	}
+	// Only a file: URI path is percent-encoded; decode it so the encoded and
+	// decoded spellings of the same file compare equal. Decode BEFORE Abs so a
+	// relative encoded path resolves correctly. On a decode error keep the raw
+	// (still encoded) form rather than dropping characters.
+	if hadFileScheme {
+		if decoded, err := url.PathUnescape(p); err == nil {
+			p = decoded
+		}
 	}
 	if abs, err := filepath.Abs(p); err == nil {
 		p = abs
