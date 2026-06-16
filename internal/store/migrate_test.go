@@ -810,6 +810,79 @@ func TestContentHashIndependentOfPhysicalColumnOrder(t *testing.T) {
 		"a real value change must still flip the content hash")
 }
 
+// TestContentHashTextKeyedTableOrderIndependent (M3) proves the per-table
+// content hash of a TEXT-keyed idless table (account_identities, keyed on the
+// TEXT column address) is INVARIANT to the SQL row order. Across backends, the
+// canonical ORDER BY sorts under each backend's own collation (SQLite BINARY vs
+// PostgreSQL en_US.UTF-8 etc.), so identical rows can stream back in different
+// orders. The fix folds a byte-wise Go-sorted order, so the digest must be the
+// same no matter what order the rows arrive in. The addresses here sort
+// DIFFERENTLY under BINARY (canonical) than under NOCASE / DESC, simulating that
+// cross-backend collation divergence within a single SQLite store.
+func TestContentHashTextKeyedTableOrderIndependent(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := context.Background()
+
+	st := newSQLiteStore(t)
+	s1, err := st.GetOrCreateSource("gmail", "owner@example.com")
+	require.NoError(err, "create source")
+
+	// Mixed-case addresses: BINARY puts uppercase before lowercase, so the
+	// canonical order differs from NOCASE and from DESC.
+	for _, addr := range []string{"Bob@example.com", "alice@example.com", "Carol@example.com", "dave@example.com"} {
+		_, err := st.DB().Exec(
+			"INSERT INTO account_identities (source_id, address, source_signal, confirmed_at) "+
+				"VALUES (?, ?, 'manual', '2024-01-01 00:00:00')", s1.ID, addr)
+		require.NoError(err, "seed account_identity "+addr)
+	}
+
+	// Sanity: the alternate orderings genuinely differ from the canonical one, so
+	// the invariance below is meaningful (not trivially equal streams).
+	canonOrder := addrOrder(t, st, "source_id, address")                 // canonical (BINARY)
+	descOrder := addrOrder(t, st, "source_id, address DESC")             // reversed
+	nocaseOrder := addrOrder(t, st, "source_id, address COLLATE NOCASE") // collation divergence
+	require.NotEqual(canonOrder, descOrder, "DESC must reorder rows vs canonical")
+	require.NotEqual(canonOrder, nocaseOrder, "NOCASE must reorder rows vs canonical (BINARY)")
+
+	// The content hash must be identical regardless of the SQL ORDER BY that
+	// produced the stream — this is exactly the cross-backend collation property.
+	canonical, err := store.TableContentHashForTest(ctx, st, "account_identities")
+	require.NoError(err, "canonical hash")
+	desc, err := store.TableContentHashOrderedForTest(ctx, st, "account_identities", "source_id, address DESC")
+	require.NoError(err, "DESC-ordered hash")
+	nocase, err := store.TableContentHashOrderedForTest(ctx, st, "account_identities", "source_id, address COLLATE NOCASE")
+	require.NoError(err, "NOCASE-ordered hash")
+	assert.Equal(canonical, desc, "content hash must be invariant to reversed row order")
+	assert.Equal(canonical, nocase, "content hash must be invariant to collation-driven row order")
+
+	// Teeth: a genuine value change still flips the hash (the sort must not
+	// collapse real differences).
+	_, err = st.DB().Exec(
+		"UPDATE account_identities SET source_signal = 'CHANGED' WHERE address = 'alice@example.com'")
+	require.NoError(err, "mutate a row")
+	changed, err := store.TableContentHashForTest(ctx, st, "account_identities")
+	require.NoError(err, "hash after change")
+	assert.NotEqual(canonical, changed, "a real value change must still flip the content hash")
+}
+
+// addrOrder returns the addresses of account_identities in the given ORDER BY
+// order, so a test can assert two orderings actually differ.
+func addrOrder(t *testing.T, st *store.Store, order string) []string {
+	t.Helper()
+	rows, err := st.DB().Query("SELECT address FROM account_identities ORDER BY " + order)
+	require.NoError(t, err, "query order "+order)
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var a string
+		require.NoError(t, rows.Scan(&a), "scan address")
+		out = append(out, a)
+	}
+	require.NoError(t, rows.Err(), "iterate addresses")
+	return out
+}
+
 // physicalColumns returns the participants table's columns in physical
 // (CREATE/ALTER) order via PRAGMA table_info, so a test can assert two stores
 // have a different physical layout for the same logical schema.

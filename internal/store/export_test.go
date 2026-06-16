@@ -38,6 +38,13 @@ func TableContentHashForTest(ctx context.Context, st *Store, table string) (stri
 	return tableContentHash(ctx, st, table)
 }
 
+// TableContentHashOrderedForTest exposes the order-parameterized content hash so
+// tests can prove the digest is invariant to the SQL row order for TEXT-keyed
+// tables (the property that makes it independent of backend ORDER BY collation).
+func TableContentHashOrderedForTest(ctx context.Context, st *Store, table, order string) (string, error) {
+	return tableContentHashOrdered(ctx, st, table, order)
+}
+
 // PGForeignKeyEdgesForTest returns "child.col->parent.col" strings for every
 // foreign key the dynamic PG orphan check enumerates, so tests can assert the
 // catalog-driven coverage spans all FK edges (not a hand-curated subset).

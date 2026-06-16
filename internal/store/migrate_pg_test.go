@@ -133,6 +133,59 @@ func TestMigratePGEmptyTableSequenceStartsAtOne(t *testing.T) {
 	}
 }
 
+// TestMigratePGEmptyTableSequenceVerifyTightened (L4) asserts the tightened
+// empty-table sequence check: after a clean migration the empty table's sequence
+// is left at the intended setval(seq,1,false) state and verifies OK, but if the
+// sequence is left "called at 1" (effective_next=2, which would silently skip
+// id=1) verify now FLAGS it instead of waving the empty table through. reactions
+// is empty in buildSourceVault.
+func TestMigratePGEmptyTableSequenceVerifyTightened(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := context.Background()
+
+	pg := testutil.NewPostgresTestStore(t) // skips if no PG env
+	sqliteSrc := testutil.NewSQLiteTestStore(t)
+
+	buildSourceVault(t, sqliteSrc)
+	clearDefaultCollection(t, pg)
+
+	require.Equal(int64(0), scanInt(t, sqliteSrc, "SELECT COUNT(*) FROM reactions"),
+		"fixture reactions empty")
+
+	_, err := store.MigrateVault(ctx, sqliteSrc, pg, store.MigrateOptions{Batch: 50})
+	require.NoError(err, "migrate sqlite->pg")
+	rebuildFTSForTest(t, pg)
+
+	// Clean migration: empty-table sequence is setval(seq,1,false); verify OK.
+	vr, err := store.VerifyMigration(ctx, sqliteSrc, pg, true)
+	require.NoError(err, "VerifyMigration")
+	assert.Truef(vr.OK(), "verify problems: %v", vr.Problems)
+	for _, p := range vr.Problems {
+		assert.NotContains(p, "reactions sequence",
+			"clean empty-table sequence must not be flagged")
+	}
+
+	// Corrupt ONLY the empty reactions sequence into "called at 1" (effective
+	// next = 2, skipping id=1). Counts and ids are unchanged, so the tightened
+	// sequence check is the only thing that can catch this.
+	_, err = pg.DB().ExecContext(ctx,
+		"SELECT setval(pg_get_serial_sequence('reactions','id'), 1, true)")
+	require.NoError(err, "leave reactions sequence called at 1")
+
+	vr2, err := store.VerifyMigration(ctx, sqliteSrc, pg, true)
+	require.NoError(err, "VerifyMigration after sequence corruption")
+	assert.False(vr2.OK(), "empty-table sequence left called-at-1 must be flagged")
+	found := false
+	for _, p := range vr2.Problems {
+		if strings.Contains(p, "reactions sequence behind max id") &&
+			strings.Contains(p, "expected 1") {
+			found = true
+		}
+	}
+	assert.Truef(found, "expected a reactions empty-table sequence problem, got: %v", vr2.Problems)
+}
+
 // TestMigratePGNonEmptySequenceVerify (M5) asserts the verify sequence check
 // uses effective-next (last_value + is_called) and passes after a normal
 // migration, and FAILS when the sequence is deliberately rewound below MAX(id).

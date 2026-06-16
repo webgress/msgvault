@@ -147,6 +147,86 @@ func TestCanonicalSQLitePathDoesNotDecodePlainPath(t *testing.T) {
 		"file: URI %%20 must decode to the literal space path")
 }
 
+// TestCanonicalSQLitePathFileURIAuthorityForms (H1) asserts the file: URI
+// authority forms all canonicalize to the SAME filesystem path as a plain path:
+// file:///abs (empty authority), file://localhost/abs (localhost authority), and
+// the same path with a ?query suffix. A raw-prefix strip would mis-read
+// "file://localhost/abs" as the relative path "localhost/abs"; proper URI
+// parsing is what makes the same-database guard catch a file://host alias.
+func TestCanonicalSQLitePathFileURIAuthorityForms(t *testing.T) {
+	assert := assertpkg.New(t)
+
+	dir := t.TempDir()
+	plain := filepath.Join(dir, "vault.db")
+	want := canonicalSQLitePath(plain)
+
+	forms := []string{
+		"file://" + plain,                       // file://<abs> (abs path as authority+path)
+		"file://localhost" + plain,              // file://localhost/<abs>
+		"file:" + plain,                         // file:/<abs>
+		"file://localhost" + plain + "?mode=ro", // ?query is dropped
+		"file://" + plain + "?_journal_mode=WAL",
+	}
+	for _, f := range forms {
+		assert.Equal(want, canonicalSQLitePath(f),
+			"%q must canonicalize to the same path as the plain path", f)
+	}
+}
+
+// TestRunMigrateRefusesFileURIAuthorityAlias (H1) is the load-bearing data-loss
+// test: a SQLite source given as a plain path and a destination given as a
+// file://localhost/<path> URI to the SAME file must be detected as the same
+// database, so --truncate-dest is REFUSED and the source is never erased. Both
+// the file://localhost/ and file:/// authority spellings are exercised, in both
+// directions, against an existing on-disk source.
+func TestRunMigrateRefusesFileURIAuthorityAlias(t *testing.T) {
+	require := requirepkg.New(t)
+	savedCfg := cfg
+	defer func() { cfg = savedCfg; resetMigrateFlags() }()
+
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "vault.db")
+	populateSQLiteVault(t, srcPath) // a real source we must not erase
+
+	// cfg points elsewhere so neither DSN resolves to the config vault.
+	cfg = &config.Config{HomeDir: t.TempDir(), Data: config.DataConfig{DataDir: t.TempDir()}}
+
+	aliases := []string{
+		"file://localhost" + srcPath,              // file://localhost/<abs>
+		"file://" + srcPath,                       // file://<abs>  (empty-ish authority)
+		"file://localhost" + srcPath + "?mode=ro", // with a query suffix
+	}
+	for _, alias := range aliases {
+		// alias as destination, plain path as source.
+		resetMigrateFlags()
+		migrateFrom = srcPath
+		migrateTo = alias
+		migrateTruncateDest = true
+		err := runMigrate(&cobra.Command{}, nil)
+		require.Error(err, "file URI alias dest %q must be refused", alias)
+		require.Contains(err.Error(), "same database",
+			"refusal must cite same-database for dest alias %q", alias)
+
+		// Symmetric: alias as source, plain path as destination.
+		resetMigrateFlags()
+		migrateFrom = alias
+		migrateTo = srcPath
+		migrateTruncateDest = true
+		err = runMigrate(&cobra.Command{}, nil)
+		require.Error(err, "file URI alias source %q must be refused", alias)
+		require.Contains(err.Error(), "same database",
+			"refusal must cite same-database for source alias %q", alias)
+	}
+
+	// The source must still hold its data — never truncated through the alias.
+	st, err := store.Open(srcPath)
+	require.NoError(err, "reopen source")
+	defer func() { _ = st.Close() }()
+	var n int64
+	require.NoError(st.DB().QueryRow("SELECT COUNT(*) FROM messages").Scan(&n), "count source")
+	require.Equal(int64(1), n, "source data must be intact (never erased via file URI alias)")
+}
+
 // TestRunMigratePostgresAliasRejected (H1) asserts two PG DSNs that differ only
 // in spelling (scheme, host case, default port, extra query params) but point
 // at the same (host,port,dbname) are rejected.
@@ -206,6 +286,69 @@ func TestRunMigrateEndToEnd(t *testing.T) {
 	var n int64
 	require.NoError(dst.DB().QueryRow("SELECT COUNT(*) FROM messages").Scan(&n), "count dest messages")
 	assert.Equal(int64(1), n, "destination message copied")
+}
+
+// TestRunMigrateInitsLegacySourceSchema (M2) asserts that a LEGACY source vault
+// missing a newly-added column is brought up to the current schema before the
+// copy, so the migration succeeds and verifies instead of failing mid-copy or
+// false-mismatching against the freshly-initialized destination. The source is
+// planted in a legacy shape by dropping a column the legacy migration path adds
+// (messages.delete_batch_id) and removing it from the schema-stale marker; after
+// runMigrate the destination must hold the message AND the re-added column.
+func TestRunMigrateInitsLegacySourceSchema(t *testing.T) {
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	savedCfg := cfg
+	defer func() { cfg = savedCfg; resetMigrateFlags() }()
+
+	srcDir := t.TempDir()
+	dstDir := t.TempDir()
+	srcPath := filepath.Join(srcDir, "src.db")
+	dstPath := filepath.Join(dstDir, "dst.db")
+	populateSQLiteVault(t, srcPath)
+
+	// Mutate the source into a legacy shape: drop a column the current schema
+	// has but an old DB would not, so without re-running InitSchema the copy
+	// would read a column set the destination does not match.
+	src, err := store.Open(srcPath)
+	require.NoError(err, "open source to age it")
+	_, err = src.DB().Exec("ALTER TABLE messages DROP COLUMN delete_batch_id")
+	require.NoError(err, "drop legacy column from source")
+	var hasCol int
+	require.NoError(src.DB().QueryRow(
+		"SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'delete_batch_id'").
+		Scan(&hasCol), "probe legacy column absent")
+	require.Equal(0, hasCol, "legacy column must be absent before migrate")
+	require.NoError(src.Close(), "close aged source")
+
+	cfg = &config.Config{HomeDir: t.TempDir(), Data: config.DataConfig{DataDir: t.TempDir()}}
+
+	resetMigrateFlags()
+	migrateFrom = srcPath
+	migrateTo = dstPath
+	migrateNoAttach = true
+	migrateAttachments = false
+	migrateVerify = true // verify would FALSE-FAIL if the source schema were stale
+
+	require.NoError(runMigrate(&cobra.Command{}, nil),
+		"legacy source must be migrated up and copied without error")
+
+	// Source was brought up to schema in place (the re-added column is present).
+	src2, err := store.Open(srcPath)
+	require.NoError(err, "reopen source")
+	defer func() { _ = src2.Close() }()
+	require.NoError(src2.DB().QueryRow(
+		"SELECT COUNT(*) FROM pragma_table_info('messages') WHERE name = 'delete_batch_id'").
+		Scan(&hasCol), "probe source column re-added")
+	assert.Equal(1, hasCol, "source schema must be migrated up (column re-added)")
+
+	// Destination received the message under the current schema.
+	dst, err := store.Open(dstPath)
+	require.NoError(err, "open dest")
+	defer func() { _ = dst.Close() }()
+	var n int64
+	require.NoError(dst.DB().QueryRow("SELECT COUNT(*) FROM messages").Scan(&n), "count dest")
+	assert.Equal(int64(1), n, "destination message copied from legacy source")
 }
 
 // populateSQLiteVault creates a SQLite vault at path with one account + one

@@ -241,11 +241,28 @@ var contentHashSkipColumns = map[string]map[string]bool{
 	"applied_migrations": {"applied_at": true},
 }
 
-// tableContentHash streams every row of table (ordered by its natural key so
-// the order is identical on both backends) and folds a canonical byte encoding
-// of each kept column into a rolling SHA-256. The projection drops the same
-// neverCopyColumns the copier drops (e.g. messages.search_fts), so the hash is
-// computed over exactly the columns that crossed backends.
+// textKeyedHashTables are the tables whose pkOrderColumn key includes a TEXT
+// column, so a SQL ORDER BY would sort rows using backend-specific collation
+// (SQLite BINARY vs PostgreSQL's database/column collation, e.g. en_US.UTF-8).
+// For these, the SQL order is NOT trustworthy for a cross-backend content hash:
+// identical rows can stream back in different orders and fold to different
+// digests, false-failing --verify. tableContentHash sorts their per-row
+// encodings byte-wise in Go (collation-independent) before folding.
+//
+// All other tables order on integer ids (id / message_id / composite integer
+// keys), which sort identically on both backends, so they keep streaming with no
+// in-memory buffering — important for the large message_raw / message_bodies
+// blobs.
+var textKeyedHashTables = map[string]bool{
+	"sync_checkpoints":   true, // (source_id, checkpoint_type) — checkpoint_type TEXT
+	"account_identities": true, // (source_id, address) — address TEXT
+	"applied_migrations": true, // (name) — name TEXT
+}
+
+// tableContentHash folds a canonical byte encoding of every kept column of every
+// row into a SHA-256. The projection drops the same neverCopyColumns the copier
+// drops (e.g. messages.search_fts), so the hash is computed over exactly the
+// columns that crossed backends.
 //
 // Cross-backend equality is the whole point: the source is one backend and the
 // destination the other, so a naive `md5(t::text)` in SQL would NOT match
@@ -253,11 +270,25 @@ var contentHashSkipColumns = map[string]map[string]bool{
 // SQLite renders 0/1 and verbatim JSON text; timestamp spellings differ too).
 // canonicalCol normalizes each value to a backend-independent form so a
 // logically-identical row produces identical canonical bytes everywhere.
+//
+// Row ORDER must also be backend-independent. Integer-keyed tables order on ids
+// that sort identically everywhere and stream in that order. TEXT-keyed tables
+// (textKeyedHashTables) would sort under backend-specific COLLATION, so their
+// per-row encodings are sorted byte-wise in Go before folding — making the digest
+// independent of whether ORDER BY used SQLite BINARY or a PostgreSQL collation.
 func tableContentHash(ctx context.Context, st *Store, table string) (string, error) {
 	order := pkOrderColumn[table]
 	if order == "" {
 		order = "1"
 	}
+	return tableContentHashOrdered(ctx, st, table, order)
+}
+
+// tableContentHashOrdered is the body of tableContentHash, parameterized by the
+// ORDER BY clause. tableContentHash passes the canonical pkOrderColumn order;
+// tests pass alternate orders to prove the digest is invariant to the SQL row
+// order for TEXT-keyed tables (the property that makes it collation-independent).
+func tableContentHashOrdered(ctx context.Context, st *Store, table, order string) (string, error) {
 	rows, err := st.DB().QueryContext(ctx, "SELECT * FROM "+table+" ORDER BY "+order)
 	if err != nil {
 		return "", fmt.Errorf("read %s: %w", table, err)
@@ -305,8 +336,14 @@ func tableContentHash(ctx context.Context, st *Store, table string) (string, err
 		ptrs[i] = &scan[i]
 	}
 
+	// TEXT-keyed tables fold their rows in a Go byte-wise sorted order so the
+	// digest does not depend on backend ORDER BY collation; all others stream in
+	// the (integer-id) SQL order without buffering.
+	sortInGo := textKeyedHashTables[table]
+
 	h := sha256.New()
 	var buf bytes.Buffer
+	var rowEncs []string // populated only when sortInGo
 	for rows.Next() {
 		if err := ctx.Err(); err != nil {
 			return "", err
@@ -334,10 +371,22 @@ func tableContentHash(ctx context.Context, st *Store, table string) (string, err
 			buf.WriteByte('|')
 		}
 		buf.WriteByte('\n')
-		h.Write(buf.Bytes())
+		if sortInGo {
+			rowEncs = append(rowEncs, buf.String())
+		} else {
+			h.Write(buf.Bytes())
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return "", fmt.Errorf("iterate %s: %w", table, err)
+	}
+	if sortInGo {
+		// Byte-wise sort makes the fold order canonical and identical on both
+		// backends regardless of the ORDER BY collation that produced the stream.
+		sort.Strings(rowEncs)
+		for _, e := range rowEncs {
+			h.Write([]byte(e))
+		}
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
@@ -583,13 +632,19 @@ func pgQuoteIdent(s string) string {
 }
 
 // pgSequenceAtLeastMax reports whether table's identity sequence is positioned
-// so the next insert yields an id strictly greater than the current MAX(id).
+// so the NEXT insert yields the id the migration intends.
 //
 // "Positioned" accounts for is_called: a sequence's effective next value is
 // last_value + (is_called ? 1 : 0). An UNCALLED sequence at last_value=N hands
-// out N next, so for an empty table we want last_value=1 is_called=false
-// (effective next = 1). For a non-empty table we want effective next > MAX(id).
-// An empty table is trivially OK.
+// out N next.
+//   - Non-empty table: the next id must be strictly greater than MAX(id) so a
+//     preserved id can never be re-issued (effective_next > MAX(id)).
+//   - Empty table: resetPGSequence intends setval(seq, 1, false), i.e. the first
+//     subsequent insert yields id=1 (effective_next == 1). The sequence state is
+//     still read and checked rather than waved through, so an empty table left
+//     "called at 1" (effective_next == 2, which would silently skip id=1) is
+//     reported instead of missed. This matches the fresh-schema default too: a
+//     GENERATED ALWAYS AS IDENTITY sequence starts uncalled at 1.
 func pgSequenceAtLeastMax(ctx context.Context, dst *Store, table string) (bool, string, error) {
 	var seq sql.NullString
 	if err := dst.DB().QueryRowContext(ctx,
@@ -603,9 +658,6 @@ func pgSequenceAtLeastMax(ctx context.Context, dst *Store, table string) (bool, 
 	if err := dst.DB().QueryRowContext(ctx,
 		"SELECT COALESCE(MAX(id),0) FROM "+table).Scan(&maxID); err != nil {
 		return false, "", fmt.Errorf("max id %s: %w", table, err)
-	}
-	if maxID == 0 {
-		return true, "empty table", nil
 	}
 	// Resolve a fully-qualified, quote-safe relation name for the sequence from
 	// the catalog (keyed by its regclass oid), so the name is never interpolated
@@ -627,6 +679,14 @@ func pgSequenceAtLeastMax(ctx context.Context, dst *Store, table string) (bool, 
 	effectiveNext := lastVal
 	if isCalled {
 		effectiveNext = lastVal + 1
+	}
+	if maxID == 0 {
+		// Empty table: the intended state is effective_next == 1 (setval(seq,1,false)).
+		if effectiveNext != 1 {
+			return false, fmt.Sprintf("empty table but effective_next=%d (last_value=%d is_called=%t), expected 1",
+				effectiveNext, lastVal, isCalled), nil
+		}
+		return true, "", nil
 	}
 	if effectiveNext <= maxID {
 		return false, fmt.Sprintf("effective_next=%d (last_value=%d is_called=%t) max_id=%d",

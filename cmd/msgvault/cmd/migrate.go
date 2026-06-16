@@ -179,6 +179,24 @@ func runMigrate(cmd *cobra.Command, _ []string) error {
 	}
 	defer func() { _ = src.Close() }()
 
+	// Bring the source up to the current schema before reading it, exactly as
+	// every other command that opens an existing vault does (serve, tui, import,
+	// …: store.Open followed by InitSchema). A legacy source missing
+	// newly-added tables or columns would otherwise fail mid-copy or produce a
+	// false verify mismatch against the freshly-initialized destination's
+	// defaults. InitSchema is the normal, idempotent open path users already get
+	// whenever they touch this vault, so applying it here is not a surprising
+	// mutation. (The destination is deliberately NOT init'd until after the
+	// populated-dest refusal gate — see below — because its one-shot migrations
+	// are destructive; the source has no such gate because it is the vault the
+	// user is reading from, not one we might refuse and leave half-migrated.)
+	if err := src.InitSchema(); err != nil {
+		if src.IsBusyError(err) {
+			return errors.New("database is busy — stop 'msgvault serve' and any other clients, then retry")
+		}
+		return fmt.Errorf("initialize source schema: %w", err)
+	}
+
 	// Guard: source must have at least one account.
 	var sourceCount int64
 	if err := src.DB().QueryRowContext(ctx, "SELECT COUNT(*) FROM sources").Scan(&sourceCount); err != nil {
@@ -434,44 +452,93 @@ func sameSQLite(a, b string) (bool, string) {
 }
 
 // canonicalSQLitePath reduces a SQLite DSN to a canonical filesystem path:
-// drop a leading file: scheme, drop any ?query string, make absolute, then
-// resolve symlinks where possible. Best-effort: on any error it falls back to
-// the most-resolved form it has so far (never returns "").
+// resolve any file: URI to its filesystem path, drop the query string, make
+// absolute, then resolve symlinks where possible. Best-effort: on any error it
+// falls back to the most-resolved form it has so far (never returns "").
 //
-// When the DSN carried a file: scheme the path is URL-decoded (the SQLite
-// driver opens with SQLITE_OPEN_URI, so "file:/tmp/a%20b.db" addresses
-// "/tmp/a b.db"); without decoding, that aliased identity would slip past the
-// same-database guard and let --truncate-dest erase the source. A literal plain
-// path containing "%20" (no scheme) is NOT decoded — it stays a literal path.
+// file: DSNs are parsed as proper URIs (the SQLite driver opens them with
+// SQLITE_OPEN_URI), so every spelling that addresses one file canonicalizes
+// equal:
+//   - file:relative           -> relative (opaque path, no authority)
+//   - file:/abs               -> /abs
+//   - file:///abs             -> /abs (empty authority)
+//   - file://localhost/abs    -> /abs (localhost authority == local machine)
+//
+// The path is percent-decoded (so "file:/tmp/a%20b.db" addresses "/tmp/a b.db")
+// and any ?query (e.g. "?mode=ro") is dropped. Without proper parsing, a
+// file://host/path alias to the source would slip past the same-database guard
+// and let --truncate-dest erase it. A literal plain path containing "%20" (no
+// file: scheme) is NOT decoded — it stays a literal path.
 func canonicalSQLitePath(dsn string) string {
 	p := dsn
-	hadFileScheme := false
-	// Strip a file: / file:// scheme (with or without authority).
-	for _, prefix := range []string{"file://", "file:"} {
-		if rest, ok := strings.CutPrefix(p, prefix); ok {
-			p = rest
-			hadFileScheme = true
-			break
-		}
-	}
-	// Strip a DSN query string ("?_journal_mode=WAL&...").
-	if i := strings.IndexByte(p, '?'); i >= 0 {
-		p = p[:i]
-	}
-	// Only a file: URI path is percent-encoded; decode it so the encoded and
-	// decoded spellings of the same file compare equal. Decode BEFORE Abs so a
-	// relative encoded path resolves correctly. On a decode error keep the raw
-	// (still encoded) form rather than dropping characters.
-	if hadFileScheme {
-		if decoded, err := url.PathUnescape(p); err == nil {
-			p = decoded
-		}
+	if isFileURIDSN(dsn) {
+		p = fileURIPath(dsn)
 	}
 	if abs, err := filepath.Abs(p); err == nil {
 		p = abs
 	}
 	if resolved, err := filepath.EvalSymlinks(p); err == nil {
 		p = resolved
+	}
+	return p
+}
+
+// isFileURIDSN reports whether a DSN uses the SQLite file: URI scheme. The
+// scheme is case-insensitive per RFC 3986, matching how SQLite recognizes it.
+func isFileURIDSN(dsn string) bool {
+	return len(dsn) >= 5 && strings.EqualFold(dsn[:5], "file:")
+}
+
+// fileURIPath extracts the filesystem path from a SQLite file: URI, handling the
+// authority ("localhost" or empty), opaque (relative) paths, percent-decoding,
+// and the ?query suffix. It never returns "": on any parse failure it degrades
+// to a best-effort manual strip so the caller still gets a usable path to
+// compare.
+func fileURIPath(dsn string) string {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		// Unparseable: fall back to a manual strip (scheme + optional authority +
+		// query) so the guard still has something to compare.
+		return fileURIPathManual(dsn)
+	}
+	// SQLite accepts an empty authority (file:///abs) or "localhost"
+	// (file://localhost/abs); both denote the local machine. A relative DSN
+	// (file:relative or file:./relative) parses as an opaque path in u.Opaque.
+	if u.Opaque != "" {
+		// file:relative — u.Opaque holds the (still percent-encoded) path.
+		if dec, derr := url.PathUnescape(u.Opaque); derr == nil {
+			return dec
+		}
+		return u.Opaque
+	}
+	// u.Path is already percent-decoded by url.Parse. The query (u.RawQuery) is
+	// intentionally ignored.
+	return u.Path
+}
+
+// fileURIPathManual is the parse-failure fallback for fileURIPath: strip the
+// file: scheme, an optional //authority, and any ?query, then percent-decode.
+func fileURIPathManual(dsn string) string {
+	p := dsn
+	for _, prefix := range []string{"file://", "file:"} {
+		if rest, ok := strings.CutPrefix(p, prefix); ok {
+			p = rest
+			// For the //authority form, drop a leading "localhost" or empty
+			// authority component up to the next slash so file://localhost/abs
+			// and file:///abs both reduce to /abs.
+			if prefix == "file://" {
+				if slash := strings.IndexByte(p, '/'); slash >= 0 {
+					p = p[slash:]
+				}
+			}
+			break
+		}
+	}
+	if i := strings.IndexByte(p, '?'); i >= 0 {
+		p = p[:i]
+	}
+	if dec, err := url.PathUnescape(p); err == nil {
+		p = dec
 	}
 	return p
 }
