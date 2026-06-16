@@ -230,6 +230,31 @@ func runMigrate(cmd *cobra.Command, _ []string) error {
 	}
 	defer func() { _ = dst.Close() }()
 
+	// Refuse a populated destination BEFORE InitSchema. InitSchema runs
+	// DESTRUCTIVE one-shot migrations on a non-empty DB (attachment dedupe
+	// DELETE, phone-unique dedupe/merge, default-collection seed), so a
+	// destination that will ultimately be refused must never reach it — checking
+	// only in prepareDest (post-init) would silently mutate the data we then
+	// refuse to overwrite. This probe tolerates a not-yet-created schema (a fresh
+	// DB has no tables == empty). prepareDest still handles the post-init
+	// baseline-clear / --truncate-dest path; the refusal logic is NOT duplicated
+	// there — this gate owns it, prepareDest's matching refusal only ever sees an
+	// already-gated (or freshly-initialized) destination.
+	if !migrateResume && !migrateTruncateDest {
+		nonEmpty, table, err := store.DestHasRealDataPreInit(ctx, dst)
+		if err != nil {
+			if dst.IsBusyError(err) {
+				return errors.New("database is busy — stop 'msgvault serve' and any other clients, then retry")
+			}
+			return fmt.Errorf("check destination state: %w", err)
+		}
+		if nonEmpty {
+			return usageErr(cmd, fmt.Errorf(
+				"destination already has data (table %q is non-empty); "+
+					"use --resume to conflict-skip or --truncate-dest to overwrite", table))
+		}
+	}
+
 	if err := dst.InitSchema(); err != nil {
 		return fmt.Errorf("initialize destination schema: %w", err)
 	}

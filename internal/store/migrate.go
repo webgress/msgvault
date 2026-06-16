@@ -278,6 +278,91 @@ func DestHasData(ctx context.Context, dst *Store) (bool, string, error) {
 	return false, "", nil
 }
 
+// DestHasRealDataPreInit reports whether dst already holds real archive data
+// BEFORE its schema has necessarily been initialized. It is the guard that must
+// run ahead of InitSchema: InitSchema performs DESTRUCTIVE one-shot migrations
+// on a populated database (attachment dedupe DELETE, phone-unique dedupe/merge,
+// default-collection seed), so a destination that will ultimately be REFUSED
+// must never reach InitSchema.
+//
+// Unlike DestHasData (which runs AFTER InitSchema and trusts every table to
+// exist), this tolerates a not-yet-created schema: a fresh database has no
+// tables, which is indistinguishable from an empty table for refusal purposes.
+// A "table does not exist" probe error is therefore treated as empty
+//   - SQLite: the per-table COUNT returns a "no such table" error.
+//   - PostgreSQL: to_regclass(table) returns NULL for a missing relation, so the
+//     count is skipped entirely (querying a missing table would also abort the
+//     surrounding transaction on PG).
+//
+// Any OTHER error is returned. The default-collection baseline (a single "All"
+// row) is treated as empty, matching DestHasData. Returns the first table found
+// with real data.
+func DestHasRealDataPreInit(ctx context.Context, dst *Store) (bool, string, error) {
+	pg := dst.IsPostgreSQL()
+	for _, table := range migrateTableOrder {
+		// applied_migrations is internal bookkeeping seeded by InitSchema on both
+		// backends; it never signals user data (see DestHasData).
+		if table == "applied_migrations" {
+			continue
+		}
+
+		if pg {
+			// Probe existence first: counting a missing relation on PG raises
+			// undefined_table and poisons the transaction. to_regclass returns
+			// NULL for a missing (or not-yet-created) relation.
+			exists, err := pgRelationExists(ctx, dst, table)
+			if err != nil {
+				return false, "", fmt.Errorf("probe %s: %w", table, err)
+			}
+			if !exists {
+				continue
+			}
+		}
+
+		n, err := countRows(ctx, dst, table)
+		if err != nil {
+			if !pg && isNoSuchTableErr(err) {
+				// SQLite: a fresh DB has no tables yet; treat as empty.
+				continue
+			}
+			return false, "", fmt.Errorf("count %s: %w", table, err)
+		}
+		if n == 0 {
+			continue
+		}
+		// The auto-seeded default collection is part of the empty baseline.
+		if table == "collections" && n == 1 {
+			only, err := onlyDefaultCollection(ctx, dst)
+			if err != nil {
+				return false, "", err
+			}
+			if only {
+				continue
+			}
+		}
+		return true, table, nil
+	}
+	return false, "", nil
+}
+
+// pgRelationExists reports whether a relation named table is visible on the
+// current PostgreSQL search_path. to_regclass yields NULL for a missing
+// relation (without raising), so a not-yet-created schema reads as "no table".
+func pgRelationExists(ctx context.Context, dst *Store, table string) (bool, error) {
+	var reg sql.NullString
+	if err := dst.DB().QueryRowContext(ctx,
+		"SELECT to_regclass($1)", table).Scan(&reg); err != nil {
+		return false, err
+	}
+	return reg.Valid, nil
+}
+
+// isNoSuchTableErr reports whether err is SQLite's "no such table" error, raised
+// when probing a table that does not exist yet on a fresh, un-initialized DB.
+func isNoSuchTableErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "no such table")
+}
+
 // onlyDefaultCollection reports whether the single collections row is the
 // auto-seeded default ("All").
 func onlyDefaultCollection(ctx context.Context, dst *Store) (bool, error) {

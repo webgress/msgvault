@@ -2,9 +2,15 @@ package store_test
 
 import (
 	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"fmt"
+	"os"
 	"strings"
 	"testing"
 
+	_ "github.com/jackc/pgx/v5/stdlib" // pgx driver for raw schema setup
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/store"
@@ -302,6 +308,73 @@ func TestPGOrphanChecksCoverAllFKEdges(t *testing.T) {
 	} {
 		assert.Containsf(edges, want, "missing FK edge %q from dynamic coverage", want)
 	}
+}
+
+// TestDestHasRealDataPreInitPostgres (G1) exercises the PostgreSQL path of the
+// pre-InitSchema populated-destination guard. It must:
+//   - tolerate a NOT-YET-INITIALIZED schema (no tables): to_regclass returns
+//     NULL for every relation, so the probe reports empty WITHOUT raising
+//     undefined_table (which would also poison the surrounding transaction);
+//   - report populated once a real source row exists.
+//
+// Skipped cleanly when MSGVAULT_TEST_DB is not a PostgreSQL DSN.
+func TestDestHasRealDataPreInitPostgres(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := context.Background()
+
+	dbURL := os.Getenv("MSGVAULT_TEST_DB")
+	if !strings.HasPrefix(dbURL, "postgres://") && !strings.HasPrefix(dbURL, "postgresql://") {
+		t.Skip("MSGVAULT_TEST_DB is not a PostgreSQL DSN; skipping")
+	}
+
+	// Create an isolated schema but DO NOT initialize it, so the store opens onto
+	// a schema with zero tables (the pre-InitSchema fresh-destination shape).
+	buf := make([]byte, 8)
+	_, err := rand.Read(buf)
+	require.NoError(err, "random schema name")
+	schemaName := "msgvault_preinit_" + hex.EncodeToString(buf)
+
+	setupDB, err := sql.Open("pgx", dbURL)
+	require.NoError(err, "open setup connection")
+	_, err = setupDB.Exec("CREATE SCHEMA " + schemaName)
+	require.NoError(err, "create schema")
+	t.Cleanup(func() {
+		_, _ = setupDB.Exec(fmt.Sprintf("DROP SCHEMA %s CASCADE", schemaName))
+		_ = setupDB.Close()
+	})
+
+	sep := "?"
+	if strings.Contains(dbURL, "?") {
+		sep = "&"
+	}
+	testURL := dbURL + sep + "search_path=" + schemaName
+
+	st, err := store.Open(testURL)
+	require.NoError(err, "open uninitialized pg store")
+	t.Cleanup(func() { _ = st.Close() })
+
+	// Pristine, uninitialized schema: no tables. The probe must report empty and
+	// NOT error (to_regclass NULL, no undefined_table).
+	nonEmpty, table, err := store.DestHasRealDataPreInit(ctx, st)
+	require.NoError(err, "pre-init probe must tolerate a schema with no tables")
+	assert.False(nonEmpty, "uninitialized schema must read as empty")
+	assert.Empty(table, "no table reported for an empty destination")
+
+	// Initialize the schema: a freshly initialized store carries only the default
+	// "All" collection baseline, which the guard treats as empty.
+	require.NoError(st.InitSchema(), "init schema")
+	nonEmpty, _, err = store.DestHasRealDataPreInit(ctx, st)
+	require.NoError(err, "pre-init probe on initialized empty store")
+	assert.False(nonEmpty, "freshly initialized store (default collection only) reads as empty")
+
+	// Add real data: now the guard must report populated.
+	_, err = st.GetOrCreateSource("gmail", "alice@example.com")
+	require.NoError(err, "create source")
+	nonEmpty, table, err = store.DestHasRealDataPreInit(ctx, st)
+	require.NoError(err, "pre-init probe on populated store")
+	assert.True(nonEmpty, "store with a real source must read as populated")
+	assert.Equal("sources", table, "first populated table reported")
 }
 
 // searchHitIDs returns the message ids matching term via the public FTS search

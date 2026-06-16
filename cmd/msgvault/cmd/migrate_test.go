@@ -270,6 +270,154 @@ func TestRunMigrateTruncateDestAbortsBeforeMutationOnBadAttachDir(t *testing.T) 
 	assert.Equal(int64(1), n, "destination data must be intact (not truncated)")
 }
 
+// TestRunMigrateRefusesPopulatedDestWithoutMutating (G1) asserts the
+// populated-destination refusal happens BEFORE InitSchema, so a destination that
+// is ultimately refused (no --truncate-dest/--resume) is left BYTE-FOR-BYTE
+// unmutated. InitSchema runs three destructive one-shot migrations on a legacy
+// DB — attachment dedupe DELETE, phone dedupe/merge, and default-collection
+// seed; this test plants a destination in exactly that legacy shape and proves
+// none of them fired:
+//   - two participants share a phone number (phone dedupe would merge/delete one)
+//   - two attachments share (message_id, content_hash) (attachment dedupe would
+//     DELETE one)
+//   - the default "All" collection is absent (EnsureDefaultCollection would
+//     re-seed it)
+func TestRunMigrateRefusesPopulatedDestWithoutMutating(t *testing.T) {
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	savedCfg := cfg
+	defer func() { cfg = savedCfg; resetMigrateFlags() }()
+
+	srcDir := t.TempDir()
+	dstDir := t.TempDir()
+	srcPath := filepath.Join(srcDir, "src.db")
+	dstPath := filepath.Join(dstDir, "dst.db")
+	populateSQLiteVault(t, srcPath)
+
+	dstMsgID := buildLegacyMutableDest(t, dstPath)
+
+	// Snapshot pre-run counts of the tables InitSchema would mutate.
+	dst, err := store.Open(dstPath)
+	require.NoError(err, "open dest pre-run")
+	countOf := func(table string) int64 {
+		var n int64
+		require.NoError(dst.DB().QueryRow("SELECT COUNT(*) FROM "+table).Scan(&n), "count "+table)
+		return n
+	}
+	beforeParticipants := countOf("participants")
+	beforeAttachments := countOf("attachments")
+	beforeCollections := countOf("collections")
+	require.Equal(int64(2), beforeParticipants, "fixture has 2 phone-dup participants")
+	require.Equal(int64(2), beforeAttachments, "fixture has 2 hash-dup attachments")
+	require.Equal(int64(0), beforeCollections, "fixture has NO default collection")
+	require.NoError(dst.Close(), "close dest pre-run")
+
+	// cfg points at an unrelated home so attachment dirs would resolve to
+	// nothing; but the refusal must fire BEFORE that even matters. Use
+	// --no-attachments so the only thing under test is the populated-dest gate.
+	cfg = &config.Config{HomeDir: t.TempDir(), Data: config.DataConfig{DataDir: t.TempDir()}}
+
+	resetMigrateFlags()
+	migrateFrom = srcPath
+	migrateTo = dstPath
+	migrateNoAttach = true
+	migrateAttachments = false
+	// No --truncate-dest, no --resume: a populated dest MUST be refused.
+
+	err = runMigrate(&cobra.Command{}, nil)
+	require.Error(err, "populated dest without overwrite flag must be refused")
+	assert.Contains(err.Error(), "already has data", "error explains the refusal")
+
+	// The destination must be byte-for-byte unmutated: InitSchema never ran, so
+	// none of its destructive migrations fired.
+	dst2, err := store.Open(dstPath)
+	require.NoError(err, "reopen dest post-run")
+	defer func() { _ = dst2.Close() }()
+	after := func(table string) int64 {
+		var n int64
+		require.NoError(dst2.DB().QueryRow("SELECT COUNT(*) FROM "+table).Scan(&n), "post count "+table)
+		return n
+	}
+	assert.Equal(beforeParticipants, after("participants"),
+		"phone-dup participants NOT merged (dedupe migration must not have run)")
+	assert.Equal(beforeAttachments, after("attachments"),
+		"hash-dup attachments NOT deleted (dedupe migration must not have run)")
+	assert.Equal(int64(0), after("collections"),
+		"default collection NOT seeded (EnsureDefaultCollection must not have run)")
+
+	// The original message is still present and untouched.
+	var msgs int64
+	require.NoError(dst2.DB().QueryRow("SELECT COUNT(*) FROM messages WHERE id = ?", dstMsgID).
+		Scan(&msgs), "count dest message")
+	assert.Equal(int64(1), msgs, "destination message intact")
+}
+
+// buildLegacyMutableDest creates a SQLite vault at path shaped exactly like a
+// LEGACY database that InitSchema would mutate: it carries phone-duplicate
+// participants and content-hash-duplicate attachments (with the enforcing unique
+// indexes dropped and their applied_migrations marker removed so InitSchema
+// would re-run the dedupe), and it has NO default "All" collection (so
+// EnsureDefaultCollection would re-seed it). Returns the seeded message id.
+func buildLegacyMutableDest(t *testing.T, path string) int64 {
+	t.Helper()
+	require := requirepkg.New(t)
+
+	st, err := store.Open(path)
+	require.NoError(err, "open dest vault")
+	require.NoError(st.InitSchema(), "init dest schema")
+
+	s1, err := st.GetOrCreateSource("gmail", "alice@example.com")
+	require.NoError(err, "create dest source")
+	convID, err := st.EnsureConversation(s1.ID, "thread-1", "Hello")
+	require.NoError(err, "ensure dest conversation")
+	msgID, err := st.UpsertMessage(&store.Message{
+		ConversationID: convID, SourceID: s1.ID,
+		SourceMessageID: "m1", MessageType: "email",
+	})
+	require.NoError(err, "upsert dest message")
+
+	db := st.DB()
+
+	// Drop the enforcing unique indexes and clear the migration markers so
+	// InitSchema would treat this as a legacy DB and re-run BOTH dedupe paths.
+	_, err = db.Exec("DROP INDEX IF EXISTS idx_attachments_msg_content_hash")
+	require.NoError(err, "drop attachment unique index")
+	_, err = db.Exec("DROP INDEX IF EXISTS idx_participants_phone")
+	require.NoError(err, "drop participants phone unique index")
+	_, err = db.Exec("DELETE FROM applied_migrations WHERE name = 'participants_phone_unique_index'")
+	require.NoError(err, "clear phone migration marker")
+
+	// Two participants sharing a phone number: the phone dedupe would merge them
+	// (delete the higher id) if InitSchema ran.
+	_, err = db.Exec(
+		"INSERT INTO participants (id, phone_number, display_name) VALUES (101, '+15551234567', 'Dup A')")
+	require.NoError(err, "insert phone-dup participant A")
+	_, err = db.Exec(
+		"INSERT INTO participants (id, phone_number, display_name) VALUES (102, '+15551234567', 'Dup B')")
+	require.NoError(err, "insert phone-dup participant B")
+
+	// Two attachments sharing (message_id, content_hash): the attachment dedupe
+	// would DELETE the higher id if InitSchema ran.
+	_, err = db.Exec(
+		"INSERT INTO attachments (id, message_id, filename, storage_path, content_hash) "+
+			"VALUES (201, ?, 'a.pdf', 'ab/dup', 'samehash')", msgID)
+	require.NoError(err, "insert hash-dup attachment A")
+	_, err = db.Exec(
+		"INSERT INTO attachments (id, message_id, filename, storage_path, content_hash) "+
+			"VALUES (202, ?, 'a.pdf', 'ab/dup', 'samehash')", msgID)
+	require.NoError(err, "insert hash-dup attachment B")
+
+	// Remove the auto-seeded default collection so EnsureDefaultCollection would
+	// re-seed it if InitSchema ran.
+	_, err = db.Exec("DELETE FROM collection_sources")
+	require.NoError(err, "clear collection_sources")
+	_, err = db.Exec("DELETE FROM collections")
+	require.NoError(err, "clear collections")
+
+	require.NoError(st.Close(), "close dest vault")
+	return msgID
+}
+
 // TestRunMigrateDryRunCreatesNothing (M1) asserts a --dry-run to a fresh
 // destination path creates NO file (no open/init/seed) and modifies nothing.
 func TestRunMigrateDryRunCreatesNothing(t *testing.T) {
