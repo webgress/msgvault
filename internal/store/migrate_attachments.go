@@ -272,8 +272,18 @@ func asString(v any) string {
 // copyFile copies srcPath to dstPath, creating parent directories. Returns the
 // number of bytes written. The copy is cancellable: it checks ctx between
 // chunks so a long copy aborts promptly on context cancellation.
+//
+// The temp file is created with os.CreateTemp (O_CREATE|O_EXCL + a randomized
+// name), so a pre-planted symlink at the old fixed "<dst>.tmp" sibling can no
+// longer be followed: O_EXCL refuses to open through an existing symlink, and
+// the random suffix means the attacker cannot predict the name to plant one in
+// the first place. The temp path is also containment-checked (withinDir) against
+// the destination directory before the copy, matching the check dstPath already
+// gets, so even a symlinked parent dir cannot redirect the write outside the
+// tree.
 func copyFile(ctx context.Context, srcPath, dstPath string) (int64, error) {
-	if err := os.MkdirAll(filepath.Dir(dstPath), 0700); err != nil {
+	dstParent := filepath.Dir(dstPath)
+	if err := os.MkdirAll(dstParent, 0700); err != nil {
 		return 0, fmt.Errorf("create parent dir: %w", err)
 	}
 	in, err := os.Open(srcPath)
@@ -282,11 +292,25 @@ func copyFile(ctx context.Context, srcPath, dstPath string) (int64, error) {
 	}
 	defer func() { _ = in.Close() }()
 
-	tmp := dstPath + ".tmp"
-	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	// Randomized, O_EXCL temp file in the destination's own directory. CreateTemp
+	// will not follow or clobber a planted symlink (a fixed-name O_TRUNC open
+	// would). filepath.Base keeps the temp file beside the final blob so the
+	// subsequent Rename is same-directory (atomic on the same filesystem).
+	out, err := os.CreateTemp(dstParent, filepath.Base(dstPath)+".tmp-*")
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("create temp file: %w", err)
 	}
+	tmp := out.Name()
+
+	// Containment guard on the temp path too: a symlinked component along
+	// dstParent could otherwise redirect the temp write (and thus the rename
+	// target) outside the destination tree. Resolve relative to dstParent.
+	if !withinDir(dstParent, filepath.Base(tmp)) {
+		_ = out.Close()
+		_ = os.Remove(tmp)
+		return 0, fmt.Errorf("temp file %q escapes destination dir", tmp)
+	}
+
 	n, err := io.Copy(out, &ctxReader{ctx: ctx, r: in})
 	if closeErr := out.Close(); err == nil {
 		err = closeErr

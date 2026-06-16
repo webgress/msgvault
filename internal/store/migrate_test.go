@@ -479,6 +479,56 @@ func TestCopyAttachmentsReCopiesOnContentDivergence(t *testing.T) {
 	assert.Equal(want, got, "dest now holds source bytes")
 }
 
+// TestCopyAttachmentsTempSymlinkNotFollowed (G3) plants a symlink at the OLD
+// fixed "<dst>.tmp" sibling path, pointing at a file OUTSIDE the destination
+// tree, then runs the copy. The previous implementation opened that exact fixed
+// path with O_CREATE|O_TRUNC and would have WRITTEN THROUGH the symlink,
+// truncating/overwriting the outside target. The hardened copyFile uses
+// os.CreateTemp (randomized name + O_EXCL), so the planted symlink is neither
+// predictable nor followed: the outside target must stay untouched and the copy
+// must still land the real blob at the destination.
+func TestCopyAttachmentsTempSymlinkNotFollowed(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := context.Background()
+
+	src := newSQLiteStore(t)
+	buildSourceVault(t, src) // references "ab/abc123def456"
+
+	srcDir := t.TempDir()
+	dstParent := t.TempDir()
+	dstDir := filepath.Join(dstParent, "dest")
+	const rel = "ab/abc123def456"
+	require.NoError(os.MkdirAll(filepath.Join(dstDir, "ab"), 0o755), "make dest subdir")
+
+	// Source blob the copy should land at the destination.
+	want := []byte("REAL-PDF-BYTES")
+	testutil.WriteFile(t, srcDir, rel, want)
+
+	// A protected file OUTSIDE the destination tree, with sentinel content.
+	outside := filepath.Join(dstParent, "victim.txt")
+	sentinel := []byte("DO-NOT-OVERWRITE")
+	require.NoError(os.WriteFile(outside, sentinel, 0o600), "write victim file")
+
+	// Plant a symlink at the OLD fixed temp path: dstDir/ab/abc123def456.tmp ->
+	// outside. The legacy O_TRUNC open would follow this and clobber `outside`.
+	plantedTmp := filepath.Join(dstDir, rel+".tmp")
+	require.NoError(os.Symlink(outside, plantedTmp), "plant temp symlink")
+
+	res, err := store.CopyAttachments(ctx, src, srcDir, dstDir)
+	require.NoError(err, "CopyAttachments")
+	assert.Equal(int64(1), res.Copied, "blob copied via a safe temp name")
+
+	// The outside victim must be byte-for-byte intact (NOT written through).
+	got, err := os.ReadFile(outside)
+	require.NoError(err, "read victim after copy")
+	assert.Equal(sentinel, got, "outside target must not be written through the planted symlink")
+
+	// The real blob must have landed at the destination.
+	landed := testutil.ReadFile(t, filepath.Join(dstDir, rel))
+	assert.Equal(want, landed, "destination blob holds the source bytes")
+}
+
 // TestCopyAttachmentsCancelled (L1) asserts the copy honors a cancelled context.
 func TestCopyAttachmentsCancelled(t *testing.T) {
 	require := require.New(t)
