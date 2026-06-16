@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"database/sql"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -353,6 +354,170 @@ func TestCopyAttachmentsUnresolvedDirErrors(t *testing.T) {
 	require.Error(err, "empty source dir must error")
 	_, err = store.CopyAttachments(ctx, src, t.TempDir(), "")
 	require.Error(err, "empty dest dir must error")
+}
+
+// TestCopyAttachmentsRejectsUnsafePaths (H3) asserts that a DB-supplied path
+// that would traverse outside the destination dir is skipped-and-counted, never
+// copied. The traversal target outside dstDir must NOT be created.
+func TestCopyAttachmentsRejectsUnsafePaths(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := context.Background()
+
+	src := newSQLiteStore(t)
+	pop := buildSourceVault(t, src)
+
+	srcDir := t.TempDir()
+	dstParent := t.TempDir()
+	dstDir := filepath.Join(dstParent, "dest")
+	require.NoError(os.MkdirAll(dstDir, 0o755), "make dstDir")
+
+	// Inject an attachment whose storage_path traverses out of the dest dir.
+	// (UpsertAttachment stores the path verbatim; no validation at write time.)
+	require.NoError(src.UpsertAttachment(pop.rootMsgID, "evil.pdf", "application/pdf",
+		"../escape.pdf", "deadbeef", 4), "inject traversal path")
+	// Provide a source file at the traversal location so only the path check —
+	// not a missing-file skip — governs the outcome.
+	require.NoError(os.WriteFile(filepath.Join(srcDir, "escape.pdf"), []byte("evil"), 0o600),
+		"write would-be source")
+
+	res, err := store.CopyAttachments(ctx, src, srcDir, dstDir)
+	require.NoError(err, "CopyAttachments")
+	assert.Positive(res.Rejected, "traversal path counted as rejected")
+	assert.NotEmpty(res.RejectedSample, "rejected sample recorded")
+
+	// The traversal target outside dstDir must not exist.
+	_, statErr := os.Stat(filepath.Join(dstParent, "escape.pdf"))
+	assert.True(os.IsNotExist(statErr), "traversal target must not be written")
+}
+
+// TestCopyAttachmentsCountsMissing (M2) asserts a blob referenced in the DB but
+// absent on disk is counted as Missing (with a sample) instead of silently
+// skipped.
+func TestCopyAttachmentsCountsMissing(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := context.Background()
+
+	src := newSQLiteStore(t)
+	buildSourceVault(t, src) // references ab/abc123def456, never written to disk
+
+	srcDir := t.TempDir() // intentionally empty
+	dstDir := t.TempDir()
+
+	res, err := store.CopyAttachments(ctx, src, srcDir, dstDir)
+	require.NoError(err, "CopyAttachments")
+	assert.Equal(int64(0), res.Copied, "nothing copied")
+	assert.Positive(res.Missing, "missing blob counted")
+	assert.NotEmpty(res.MissingSample, "missing sample recorded")
+}
+
+// TestCopyAttachmentsReCopiesOnContentDivergence (M3) asserts that a dest blob
+// with a MATCHING SIZE but DIFFERENT content is not skipped — the copy detects
+// the content divergence (via hash) and overwrites with the source bytes.
+func TestCopyAttachmentsReCopiesOnContentDivergence(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := context.Background()
+
+	src := newSQLiteStore(t)
+	buildSourceVault(t, src) // attachment rel path "ab/abc123def456"
+
+	srcDir := t.TempDir()
+	dstDir := t.TempDir()
+	const rel = "ab/abc123def456"
+	want := []byte("AAAAAAA") // 7 bytes
+	corrupt := []byte("BBBBBBB")
+	require.Len(corrupt, len(want), "fixture sizes must match for the test")
+	testutil.WriteFile(t, srcDir, rel, want)
+	testutil.WriteFile(t, dstDir, rel, corrupt) // same size, different content
+
+	res, err := store.CopyAttachments(ctx, src, srcDir, dstDir)
+	require.NoError(err, "CopyAttachments")
+	assert.Equal(int64(1), res.Copied, "diverged blob re-copied")
+	assert.Equal(int64(0), res.Skipped, "must not skip on size-only match")
+	got := testutil.ReadFile(t, filepath.Join(dstDir, rel))
+	assert.Equal(want, got, "dest now holds source bytes")
+}
+
+// TestCopyAttachmentsCancelled (L1) asserts the copy honors a cancelled context.
+func TestCopyAttachmentsCancelled(t *testing.T) {
+	require := require.New(t)
+	src := newSQLiteStore(t)
+	buildSourceVault(t, src)
+
+	srcDir := t.TempDir()
+	dstDir := t.TempDir()
+	testutil.WriteFile(t, srcDir, "ab/abc123def456", []byte("PDFDATA"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := store.CopyAttachments(ctx, src, srcDir, dstDir)
+	require.ErrorIs(err, context.Canceled, "cancelled copy must return context error")
+}
+
+// TestVerifyCatchesContentDivergence (H4) mutates the destination so a table's
+// id-SET differs from the source while row count AND MIN/MAX id stay identical.
+// The old count + id-range checks would pass; the new full id-set content hash
+// must catch it. message_recipients is used because nothing references its id,
+// so its id can be re-keyed freely under foreign_keys=ON.
+func TestVerifyCatchesContentDivergence(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := context.Background()
+
+	src := newSQLiteStore(t)
+	dst := newSQLiteStore(t)
+	pop := buildSourceVault(t, src)
+	carolID := mustParticipant(t, src, "carol@example.com", "Carol", "example.com")
+
+	// Give message_recipients a sparse id-set on the SOURCE (ids 10, 20, 30) so
+	// the destination can later fill an interior hole with a DIFFERENT id while
+	// keeping count/MIN/MAX identical. Each uses a DISTINCT participant to
+	// satisfy UNIQUE(message_id, participant_id, recipient_type).
+	pids := []int64{pop.aliceID, pop.bobID, carolID}
+	for i, id := range []int64{10, 20, 30} {
+		_, err := src.DB().Exec(
+			"INSERT INTO message_recipients (id, message_id, participant_id, recipient_type, display_name) "+
+				"VALUES (?,?,?,?,?)",
+			id, pop.rootMsgID, pids[i], "cc", "X")
+		require.NoError(err, "seed source recipient")
+	}
+	// Remove the recipients buildSourceVault added so the id-set is exactly
+	// {10,20,30} and the count is predictable.
+	_, err := src.DB().Exec("DELETE FROM message_recipients WHERE id NOT IN (10,20,30)")
+	require.NoError(err, "trim seeded recipients")
+
+	clearDefaultCollection(t, dst)
+	_, err = store.MigrateVault(ctx, src, dst, store.MigrateOptions{Batch: 100})
+	require.NoError(err, "MigrateVault")
+
+	var srcCount, srcMin, srcMax int64
+	require.NoError(src.DB().QueryRow("SELECT COUNT(*),MIN(id),MAX(id) FROM message_recipients").
+		Scan(&srcCount, &srcMin, &srcMax), "src stats")
+	require.Equal(int64(3), srcCount, "source has 3 recipients")
+	require.Equal(int64(10), srcMin)
+	require.Equal(int64(30), srcMax)
+
+	// On the destination, re-key the interior row id=20 -> id=15. Count stays 3,
+	// MIN stays 10, MAX stays 30, but the id-SET diverges ({10,15,30}).
+	_, err = dst.DB().Exec("UPDATE message_recipients SET id = 15 WHERE id = 20")
+	require.NoError(err, "rekey interior recipient")
+
+	var dstCount, dstMin, dstMax int64
+	require.NoError(dst.DB().QueryRow("SELECT COUNT(*),MIN(id),MAX(id) FROM message_recipients").
+		Scan(&dstCount, &dstMin, &dstMax), "dst stats")
+	require.Equal(srcCount, dstCount, "count unchanged")
+	require.Equal(srcMin, dstMin, "min unchanged")
+	require.Equal(srcMax, dstMax, "max unchanged")
+
+	vr, err := store.VerifyMigration(ctx, src, dst)
+	require.NoError(err, "VerifyMigration")
+	assert.False(vr.OK(), "verify must fail on diverged id-set")
+	found := slices.ContainsFunc(vr.Problems, func(p string) bool {
+		return strings.Contains(p, "message_recipients") && strings.Contains(p, "content hash")
+	})
+	assert.Truef(found, "expected a message_recipients content-hash problem, got: %v", vr.Problems)
 }
 
 // --- small scan helpers (kept local; not assertion wrappers) ---
