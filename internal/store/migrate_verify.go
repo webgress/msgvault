@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -272,6 +273,17 @@ func tableContentHash(ctx context.Context, st *Store, table string) (string, err
 	// verify hash spans exactly the copied column set. contentHashSkipColumns
 	// additionally drops columns whose value is destination-local and therefore
 	// never expected to match cross-backend (see its doc).
+	//
+	// CRITICAL: the projection is canonicalized by sorting on column NAME, NOT
+	// physical SELECT * / rows.Columns() order. A legacy SQLite source whose
+	// columns were ALTER-appended in a different physical order than a fresh
+	// destination's holds IDENTICAL data but reports a different rows.Columns()
+	// order; hashing positionally would make --verify FALSE-FAIL that common
+	// legacy->fresh upgrade even though copyTable (which INSERTs by column name)
+	// copied correctly. Sorting by name — stable and identical on both backends —
+	// makes the folded byte stream independent of physical layout. The column
+	// name is also written into the hashed buffer (see below) as an extra guard
+	// so a renamed/missing column can never alias another's value.
 	never := neverCopyColumns[table]
 	skip := contentHashSkipColumns[table]
 	keepIdx := make([]int, 0, len(allCols))
@@ -283,6 +295,9 @@ func tableContentHash(ctx context.Context, st *Store, table string) (string, err
 		keepIdx = append(keepIdx, i)
 		keepCol = append(keepCol, c)
 	}
+	// Reorder (keepIdx, keepCol) so both src and dst fold columns in the same
+	// name-sorted sequence regardless of physical column order.
+	sort.Sort(byColumnName{idx: keepIdx, col: keepCol})
 
 	scan := make([]any, len(allCols))
 	ptrs := make([]any, len(allCols))
@@ -301,7 +316,16 @@ func tableContentHash(ctx context.Context, st *Store, table string) (string, err
 		}
 		buf.Reset()
 		for j, idx := range keepIdx {
-			enc := canonicalCol(table, keepCol[j], scan[idx])
+			name := keepCol[j]
+			enc := canonicalCol(table, name, scan[idx])
+			// Write the column NAME into the hashed stream as a guard: combined
+			// with the name-sorted order above, this makes the hash depend on
+			// which column held which value, so two columns with swapped contents
+			// (or a missing/renamed column) can never alias to the same digest.
+			buf.WriteString(strconv.Itoa(len(name)))
+			buf.WriteByte('=')
+			buf.WriteString(name)
+			buf.WriteByte('|')
 			// Length-prefix each field so column boundaries are unambiguous and
 			// "ab"+"c" can never collide with "a"+"bc".
 			buf.WriteString(strconv.Itoa(len(enc)))
@@ -316,6 +340,22 @@ func tableContentHash(ctx context.Context, st *Store, table string) (string, err
 		return "", fmt.Errorf("iterate %s: %w", table, err)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// byColumnName sorts a parallel (idx, col) projection by column name, keeping
+// each scan-buffer index aligned with its column. Sorting by name (not physical
+// rows.Columns() order) gives both backends an identical fold order regardless
+// of the underlying table's physical column layout.
+type byColumnName struct {
+	idx []int
+	col []string
+}
+
+func (s byColumnName) Len() int           { return len(s.col) }
+func (s byColumnName) Less(i, j int) bool { return s.col[i] < s.col[j] }
+func (s byColumnName) Swap(i, j int) {
+	s.col[i], s.col[j] = s.col[j], s.col[i]
+	s.idx[i], s.idx[j] = s.idx[j], s.idx[i]
 }
 
 // canonicalCol renders a scanned value as a backend-independent canonical

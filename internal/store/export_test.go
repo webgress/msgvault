@@ -30,6 +30,14 @@ func MigrateTableOrderForTest() []string {
 	return out
 }
 
+// TableContentHashForTest exposes the unexported per-table content hash so tests
+// can assert it is independent of physical column order (a legacy SQLite source
+// whose columns were ALTER-appended in a different order than a fresh
+// destination must still hash equal for identical data).
+func TableContentHashForTest(ctx context.Context, st *Store, table string) (string, error) {
+	return tableContentHash(ctx, st, table)
+}
+
 // PGForeignKeyEdgesForTest returns "child.col->parent.col" strings for every
 // foreign key the dynamic PG orphan check enumerates, so tests can assert the
 // catalog-driven coverage spans all FK edges (not a hand-curated subset).

@@ -692,6 +692,95 @@ func TestVerifyExpectFTSFlagsUnavailable(t *testing.T) {
 	assert.Truef(found, "expected an FTS problem, got: %v", vrFTS.Problems)
 }
 
+// TestContentHashIndependentOfPhysicalColumnOrder (G2) proves the per-table
+// content hash is canonicalized by column NAME, not physical SELECT * order. Two
+// SQLite stores hold IDENTICAL participant data, but store B's participants table
+// has its display_name column physically moved to the END (via DROP+ADD COLUMN,
+// exactly how a legacy DB that ALTER-appended a column ends up). Their
+// rows.Columns() order therefore differs; before the fix the positional hash
+// would FALSE-FAIL this common legacy->fresh shape. With name-sorted folding the
+// two hashes must be EQUAL — and a real value change must still differ.
+func TestContentHashIndependentOfPhysicalColumnOrder(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	ctx := context.Background()
+
+	a := newSQLiteStore(t)
+	b := newSQLiteStore(t)
+
+	// Identical participant data in both stores.
+	seed := func(st *store.Store) {
+		_, err := st.DB().Exec(
+			"INSERT INTO participants (id, email_address, phone_number, display_name, domain, canonical_id, created_at, updated_at) " +
+				"VALUES (1,'alice@example.com',NULL,'Alice','example.com','c1','2024-01-01 00:00:00','2024-01-01 00:00:00')")
+		require.NoError(err, "seed participant 1")
+		_, err = st.DB().Exec(
+			"INSERT INTO participants (id, email_address, phone_number, display_name, domain, canonical_id, created_at, updated_at) " +
+				"VALUES (2,'bob@example.com',NULL,'Bob','example.com','c2','2024-01-01 00:00:00','2024-01-01 00:00:00')")
+		require.NoError(err, "seed participant 2")
+	}
+	seed(a)
+	seed(b)
+
+	// Confirm the baseline physical column orders are identical, then DIVERGE
+	// store B by physically relocating display_name to the end of the table. SQLite
+	// DROP COLUMN + ADD COLUMN appends, mirroring a legacy ALTER-appended column.
+	require.Equal(physicalColumns(t, a), physicalColumns(t, b),
+		"baseline column order identical before reordering")
+
+	_, err := b.DB().Exec("ALTER TABLE participants DROP COLUMN display_name")
+	require.NoError(err, "drop display_name on B")
+	_, err = b.DB().Exec("ALTER TABLE participants ADD COLUMN display_name TEXT")
+	require.NoError(err, "re-add display_name on B")
+	_, err = b.DB().Exec("UPDATE participants SET display_name = 'Alice' WHERE id = 1")
+	require.NoError(err, "restore display_name 1 on B")
+	_, err = b.DB().Exec("UPDATE participants SET display_name = 'Bob' WHERE id = 2")
+	require.NoError(err, "restore display_name 2 on B")
+
+	// Physical orders now DIFFER (this is what would break a positional hash).
+	colsA := physicalColumns(t, a)
+	colsB := physicalColumns(t, b)
+	require.NotEqual(colsA, colsB, "physical column order must differ after reorder")
+	require.ElementsMatch(colsA, colsB, "same column SET, only order differs")
+
+	hashA, err := store.TableContentHashForTest(ctx, a, "participants")
+	require.NoError(err, "hash A")
+	hashB, err := store.TableContentHashForTest(ctx, b, "participants")
+	require.NoError(err, "hash B")
+	assert.Equal(hashA, hashB,
+		"content hash must be identical despite differing physical column order")
+
+	// Teeth: a genuine value change still produces a DIFFERENT hash (the
+	// canonicalization must not collapse real differences).
+	_, err = b.DB().Exec("UPDATE participants SET display_name = 'CHANGED' WHERE id = 1")
+	require.NoError(err, "mutate display_name on B")
+	hashBChanged, err := store.TableContentHashForTest(ctx, b, "participants")
+	require.NoError(err, "hash B after change")
+	assert.NotEqual(hashA, hashBChanged,
+		"a real value change must still flip the content hash")
+}
+
+// physicalColumns returns the participants table's columns in physical
+// (CREATE/ALTER) order via PRAGMA table_info, so a test can assert two stores
+// have a different physical layout for the same logical schema.
+func physicalColumns(t *testing.T, st *store.Store) []string {
+	t.Helper()
+	rows, err := st.DB().Query("PRAGMA table_info(participants)")
+	require.NoError(t, err, "table_info")
+	defer func() { _ = rows.Close() }()
+	var cols []string
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		require.NoError(t, rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk), "scan table_info")
+		cols = append(cols, name)
+	}
+	require.NoError(t, rows.Err(), "iterate table_info")
+	return cols
+}
+
 // --- small scan helpers (kept local; not assertion wrappers) ---
 
 func scanInt(t *testing.T, st *store.Store, query string) int64 {
