@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"strings"
 )
@@ -17,6 +19,7 @@ type TableVerify struct {
 	DstMinID int64
 	DstMaxID int64
 	HasID    bool
+	IDHashOK bool // identity-PK tables only: full id-set hash matched
 	OK       bool
 	Mismatch string // non-empty describes the first detected problem
 }
@@ -90,6 +93,28 @@ func VerifyMigration(ctx context.Context, src, dst *Store) (*VerifyResult, error
 				res.Problems = append(res.Problems,
 					fmt.Sprintf("%s: %s", table, m))
 			}
+
+			// Content check: count + MIN/MAX can collide for a different
+			// interior id-set, so hash the FULL ordered id set and compare.
+			// This also catches corrupted id values not at the extremes.
+			sHash, err := idSetHash(ctx, src, table)
+			if err != nil {
+				return nil, fmt.Errorf("id-set hash source %s: %w", table, err)
+			}
+			dHash, err := idSetHash(ctx, dst, table)
+			if err != nil {
+				return nil, fmt.Errorf("id-set hash dest %s: %w", table, err)
+			}
+			tv.IDHashOK = sHash == dHash
+			if !tv.IDHashOK {
+				tv.OK = false
+				m := "id-set content hash mismatch"
+				if tv.Mismatch == "" {
+					tv.Mismatch = m
+				}
+				res.Problems = append(res.Problems,
+					fmt.Sprintf("%s: %s", table, m))
+			}
 		}
 
 		res.Tables = append(res.Tables, tv)
@@ -138,6 +163,30 @@ func VerifyMigration(ctx context.Context, src, dst *Store) (*VerifyResult, error
 	return res, nil
 }
 
+// idSetHash returns a hash of the FULL ordered id set of table, so two tables
+// with the same row count and MIN/MAX id but a different interior id-set (or a
+// corrupted id) hash differently. The ordered id list is concatenated in the
+// database (string_agg/group_concat ORDER BY id) and the resulting string is
+// hashed in Go so the value is identical across SQLite and PostgreSQL backends.
+func idSetHash(ctx context.Context, st *Store, table string) (string, error) {
+	var query string
+	if st.IsPostgreSQL() {
+		// string_agg carries its own ORDER BY for deterministic ordering.
+		query = "SELECT COALESCE(string_agg(id::text, ',' ORDER BY id), '') FROM " + table
+	} else {
+		// SQLite group_concat gained an ORDER BY argument only in 3.44, so order
+		// the rows in a subquery to keep the concatenation deterministic.
+		query = "SELECT COALESCE(group_concat(id, ','), '') FROM " +
+			"(SELECT id FROM " + table + " ORDER BY id)"
+	}
+	var concat string
+	if err := st.DB().QueryRowContext(ctx, query).Scan(&concat); err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(concat))
+	return hex.EncodeToString(sum[:]), nil
+}
+
 // idRange returns COALESCE(MIN(id),0), COALESCE(MAX(id),0) for table.
 func idRange(ctx context.Context, st *Store, table string) (int64, int64, error) {
 	var lo, hi int64
@@ -173,41 +222,110 @@ func sqliteForeignKeyCheck(ctx context.Context, dst *Store) ([]string, error) {
 	return violations, nil
 }
 
-// pgOrphanChecks spot-checks the most load-bearing FK edges on a PostgreSQL
-// destination for orphan rows. PostgreSQL enforces FKs at insert time, so a
-// non-zero count here indicates a genuine copy defect.
+// pgForeignKey describes one foreign-key column edge discovered from the PG
+// catalog: child.childCol -> parent.parentCol, under constraint name.
+type pgForeignKey struct {
+	constraint string
+	childTable string
+	childCol   string
+	parentTbl  string
+	parentCol  string
+}
+
+// pgForeignKeys enumerates every foreign-key column edge in the destination's
+// current schema (search_path). It joins table_constraints,
+// key_column_usage, and constraint_column_usage so all FK edges are covered,
+// matching SQLite's PRAGMA foreign_key_check completeness rather than a hand
+// curated subset. Composite FKs surface as one row per column, which is fine —
+// each column edge gets its own orphan probe.
+func pgForeignKeys(ctx context.Context, dst *Store) ([]pgForeignKey, error) {
+	const q = `
+SELECT tc.constraint_name,
+       kcu.table_name  AS child_table,
+       kcu.column_name AS child_col,
+       ccu.table_name  AS parent_table,
+       ccu.column_name AS parent_col
+FROM information_schema.table_constraints tc
+JOIN information_schema.key_column_usage kcu
+  ON tc.constraint_name = kcu.constraint_name
+ AND tc.constraint_schema = kcu.constraint_schema
+JOIN information_schema.constraint_column_usage ccu
+  ON tc.constraint_name = ccu.constraint_name
+ AND tc.constraint_schema = ccu.constraint_schema
+WHERE tc.constraint_type = 'FOREIGN KEY'
+  AND tc.table_schema = current_schema()
+ORDER BY tc.constraint_name, kcu.ordinal_position`
+	rows, err := dst.DB().QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("enumerate foreign keys: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var fks []pgForeignKey
+	for rows.Next() {
+		var fk pgForeignKey
+		if err := rows.Scan(&fk.constraint, &fk.childTable, &fk.childCol,
+			&fk.parentTbl, &fk.parentCol); err != nil {
+			return nil, fmt.Errorf("scan foreign key: %w", err)
+		}
+		fks = append(fks, fk)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate foreign keys: %w", err)
+	}
+	return fks, nil
+}
+
+// pgOrphanChecks checks EVERY foreign-key edge on a PostgreSQL destination for
+// orphan rows, generating the probes dynamically from the catalog. PostgreSQL
+// enforces FKs at insert time, so a non-zero count here indicates a genuine
+// copy defect (or a constraint that was somehow disabled).
 func pgOrphanChecks(ctx context.Context, dst *Store) ([]string, error) {
-	checks := []struct {
-		name, query string
-	}{
-		{"messages->conversations",
-			"SELECT COUNT(*) FROM messages m WHERE NOT EXISTS (SELECT 1 FROM conversations c WHERE c.id = m.conversation_id)"},
-		{"messages->sources",
-			"SELECT COUNT(*) FROM messages m WHERE NOT EXISTS (SELECT 1 FROM sources s WHERE s.id = m.source_id)"},
-		{"messages.reply_to->messages",
-			"SELECT COUNT(*) FROM messages m WHERE m.reply_to_message_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM messages p WHERE p.id = m.reply_to_message_id)"},
-		{"message_recipients->messages",
-			"SELECT COUNT(*) FROM message_recipients mr WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = mr.message_id)"},
-		{"attachments->messages",
-			"SELECT COUNT(*) FROM attachments a WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = a.message_id)"},
-		{"message_labels->labels",
-			"SELECT COUNT(*) FROM message_labels ml WHERE NOT EXISTS (SELECT 1 FROM labels l WHERE l.id = ml.label_id)"},
+	fks, err := pgForeignKeys(ctx, dst)
+	if err != nil {
+		return nil, err
 	}
 	var problems []string
-	for _, c := range checks {
+	for _, fk := range fks {
+		child := pgQuoteIdent(fk.childTable)
+		childCol := pgQuoteIdent(fk.childCol)
+		parent := pgQuoteIdent(fk.parentTbl)
+		parentCol := pgQuoteIdent(fk.parentCol)
+		// A NULL FK value is not an orphan (the reference is simply absent), so
+		// only probe non-NULL child columns.
+		query := fmt.Sprintf(
+			"SELECT COUNT(*) FROM %s c WHERE c.%s IS NOT NULL AND NOT EXISTS "+
+				"(SELECT 1 FROM %s p WHERE p.%s = c.%s)",
+			child, childCol, parent, parentCol, childCol)
 		var n int64
-		if err := dst.DB().QueryRowContext(ctx, c.query).Scan(&n); err != nil {
-			return nil, fmt.Errorf("orphan check %s: %w", c.name, err)
+		if err := dst.DB().QueryRowContext(ctx, query).Scan(&n); err != nil {
+			return nil, fmt.Errorf("orphan check %s (%s.%s->%s.%s): %w",
+				fk.constraint, fk.childTable, fk.childCol, fk.parentTbl, fk.parentCol, err)
 		}
 		if n > 0 {
-			problems = append(problems, fmt.Sprintf("%d orphan rows in %s", n, c.name))
+			problems = append(problems, fmt.Sprintf(
+				"%d orphan rows in %s.%s->%s.%s",
+				n, fk.childTable, fk.childCol, fk.parentTbl, fk.parentCol))
 		}
 	}
 	return problems, nil
 }
 
-// pgSequenceAtLeastMax reports whether table's identity sequence last_value is
-// at least MAX(id). An empty table is trivially OK.
+// pgQuoteIdent wraps a PostgreSQL identifier in double quotes, doubling any
+// embedded quotes. The identifiers here come from the catalog (not user input),
+// but quoting keeps the generated SQL safe and handles reserved words.
+func pgQuoteIdent(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+// pgSequenceAtLeastMax reports whether table's identity sequence is positioned
+// so the next insert yields an id strictly greater than the current MAX(id).
+//
+// "Positioned" accounts for is_called: a sequence's effective next value is
+// last_value + (is_called ? 1 : 0). An UNCALLED sequence at last_value=N hands
+// out N next, so for an empty table we want last_value=1 is_called=false
+// (effective next = 1). For a non-empty table we want effective next > MAX(id).
+// An empty table is trivially OK.
 func pgSequenceAtLeastMax(ctx context.Context, dst *Store, table string) (bool, string, error) {
 	var seq sql.NullString
 	if err := dst.DB().QueryRowContext(ctx,
@@ -225,13 +343,30 @@ func pgSequenceAtLeastMax(ctx context.Context, dst *Store, table string) (bool, 
 	if maxID == 0 {
 		return true, "empty table", nil
 	}
-	var lastVal int64
+	// Resolve a fully-qualified, quote-safe relation name for the sequence from
+	// the catalog (keyed by its regclass oid), so the name is never interpolated
+	// raw. last_value and is_called are only available by selecting from the
+	// sequence relation itself (pg_sequences omits is_called).
+	var qname string
 	if err := dst.DB().QueryRowContext(ctx,
-		"SELECT last_value FROM "+seq.String).Scan(&lastVal); err != nil {
-		return false, "", fmt.Errorf("sequence last_value %s: %w", table, err)
+		"SELECT quote_ident(n.nspname)||'.'||quote_ident(c.relname) "+
+			"FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "+
+			"WHERE c.oid = $1::regclass", seq.String).Scan(&qname); err != nil {
+		return false, "", fmt.Errorf("resolve sequence name %s: %w", table, err)
 	}
-	if lastVal < maxID {
-		return false, fmt.Sprintf("last_value=%d max_id=%d", lastVal, maxID), nil
+	var lastVal int64
+	var isCalled bool
+	if err := dst.DB().QueryRowContext(ctx,
+		"SELECT last_value, is_called FROM "+qname).Scan(&lastVal, &isCalled); err != nil {
+		return false, "", fmt.Errorf("sequence state %s: %w", table, err)
+	}
+	effectiveNext := lastVal
+	if isCalled {
+		effectiveNext = lastVal + 1
+	}
+	if effectiveNext <= maxID {
+		return false, fmt.Sprintf("effective_next=%d (last_value=%d is_called=%t) max_id=%d",
+			effectiveNext, lastVal, isCalled, maxID), nil
 	}
 	return true, "", nil
 }

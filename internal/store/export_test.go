@@ -1,5 +1,7 @@
 package store
 
+import "context"
+
 // ParseDBTime is exported for testing unexported timestamp parsing behavior.
 var ParseDBTime = parseDBTime
 
@@ -26,4 +28,19 @@ func MigrateTableOrderForTest() []string {
 	out := make([]string, len(migrateTableOrder))
 	copy(out, migrateTableOrder)
 	return out
+}
+
+// PGForeignKeyEdgesForTest returns "child.col->parent.col" strings for every
+// foreign key the dynamic PG orphan check enumerates, so tests can assert the
+// catalog-driven coverage spans all FK edges (not a hand-curated subset).
+func PGForeignKeyEdgesForTest(ctx context.Context, dst *Store) ([]string, error) {
+	fks, err := pgForeignKeys(ctx, dst)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, len(fks))
+	for i, fk := range fks {
+		out[i] = fk.childTable + "." + fk.childCol + "->" + fk.parentTbl + "." + fk.parentCol
+	}
+	return out, nil
 }

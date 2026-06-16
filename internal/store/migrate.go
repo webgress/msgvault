@@ -125,6 +125,11 @@ var boolColumns = map[string]map[string]bool{
 	},
 }
 
+// DefaultMigrateBatch is the default number of rows per multi-row INSERT batch
+// for a MigrateVault run. Referenced by MigrateVault's own default, the CLI
+// flag default, and tests so the three never drift apart.
+const DefaultMigrateBatch = 5000
+
 // MigrateOptions configures a MigrateVault run.
 type MigrateOptions struct {
 	// Batch is the number of rows per multi-row INSERT (and per transaction).
@@ -175,9 +180,12 @@ func (r *MigrateResult) RowsCopied() int64 {
 // two passes so its self-referential reply_to_message_id can be set only after
 // every message row exists. On a PostgreSQL destination each identity-PK table's
 // sequence is advanced past the largest copied id after the table is copied.
+//
+// When opts.DryRun is set, only source counts are read and dst is never touched;
+// callers may pass a nil dst for a dry run.
 func MigrateVault(ctx context.Context, src, dst *Store, opts MigrateOptions) (*MigrateResult, error) {
 	if opts.Batch <= 0 {
-		opts.Batch = 5000
+		opts.Batch = DefaultMigrateBatch
 	}
 	start := time.Now()
 	result := &MigrateResult{DryRun: opts.DryRun}
@@ -647,8 +655,17 @@ func coerceBool(v any) any {
 
 // resetPGSequence advances the identity sequence backing table.id past the
 // largest copied id so subsequent normal inserts don't collide. Uses
-// pg_get_serial_sequence so it works regardless of the sequence's exact name;
-// COALESCE(MAX(id),1) keeps setval valid on an empty table.
+// pg_get_serial_sequence so it works regardless of the sequence's exact name.
+//
+// The 3-arg setval(seq, value, is_called) form is deliberate:
+//   - empty table  -> setval(seq, 1, false): the sequence stays UNCALLED at 1,
+//     so the very first subsequent insert yields id=1 (the 2-arg form would
+//     mark it called and skip id=1).
+//   - non-empty    -> setval(seq, MAX(id), true): the next insert yields
+//     MAX(id)+1.
+//
+// This stays consistent with pgSequenceAtLeastMax's effective-next computation
+// (last_value + (is_called ? 1 : 0)).
 func resetPGSequence(ctx context.Context, dst *Store, table string) error {
 	var seq sql.NullString
 	err := dst.DB().QueryRowContext(ctx,
@@ -662,7 +679,7 @@ func resetPGSequence(ctx context.Context, dst *Store, table string) error {
 		return nil
 	}
 	_, err = dst.DB().ExecContext(ctx, fmt.Sprintf(
-		"SELECT setval(%s, (SELECT COALESCE(MAX(id),1) FROM %s))",
+		"SELECT setval(%s, GREATEST(COALESCE(MAX(id),1),1), MAX(id) IS NOT NULL) FROM %s",
 		quoteLiteral(seq.String), table))
 	if err != nil {
 		return fmt.Errorf("setval %s: %w", table, err)
