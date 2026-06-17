@@ -737,19 +737,21 @@ func (s *Store) InitSchema() error {
 		return fmt.Errorf("ensure FTS index: %w", err)
 	}
 
-	// Create the partial index over messages still needing embedding. Must
-	// run AFTER the embed_gen ADD COLUMN migration above — a legacy DB whose
-	// messages table predates embed_gen would fail this index on the missing
-	// column if it lived in schema.sql. The partial form (WHERE embed_gen IS
-	// NULL) and IF NOT EXISTS are portable across SQLite (3.8+) and
-	// PostgreSQL. Run under runMaintenance so the build over a populated
-	// messages table cannot trip the pool-wide statement_timeout on PG.
+	// Drop the obsolete partial index over messages needing embedding. It was
+	// redundant with the per-generation embed watermark (the work-finder scan
+	// rides the messages PRIMARY KEY B-tree via `id > :watermark ORDER BY id`)
+	// and useless during a rebuild (old-gen leftovers carry a non-NULL embed_gen
+	// that an `embed_gen IS NULL` index never covers), while costing index
+	// maintenance on the two hottest write paths (message insert + embed_gen
+	// stamp). DROP IF EXISTS is idempotent and portable across SQLite/PG; it
+	// cleans up any dev DB that already created the index. Run under
+	// runMaintenance to match the original CREATE's transaction context.
 	if err := s.runMaintenance(context.Background(), func(ctx context.Context, tx *loggedTx) error {
 		_, err := tx.ExecContext(ctx,
-			`CREATE INDEX IF NOT EXISTS idx_messages_embed_gen ON messages(embed_gen) WHERE embed_gen IS NULL`)
+			`DROP INDEX IF EXISTS idx_messages_embed_gen`)
 		return err
 	}); err != nil {
-		return fmt.Errorf("create idx_messages_embed_gen: %w", err)
+		return fmt.Errorf("drop idx_messages_embed_gen: %w", err)
 	}
 
 	// Load the optional FTS schema, if the dialect keeps one separate.

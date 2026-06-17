@@ -371,11 +371,6 @@ CREATE INDEX IF NOT EXISTS idx_conversations_type ON conversations(conversation_
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, sent_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_source ON messages(source_id);
 CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);
--- NOTE: the partial index over messages needing embedding
--- (idx_messages_embed_gen WHERE embed_gen IS NULL) is created by
--- InitSchema AFTER the LegacyColumnMigrations add embed_gen, not here: a
--- legacy DB whose messages table predates embed_gen would fail this index
--- on the missing column if it lived in schema.sql.
 CREATE INDEX IF NOT EXISTS idx_messages_sent_at ON messages(sent_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_type ON messages(message_type);
 CREATE INDEX IF NOT EXISTS idx_messages_deleted ON messages(source_id, deleted_from_source_at);
