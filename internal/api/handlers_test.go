@@ -1964,7 +1964,7 @@ func TestHandleStats_VectorEnabledWithActive(t *testing.T) {
 	require.True(ok, "expected 'vector_search' object, got %T: %v", resp["vector_search"], resp["vector_search"])
 
 	assert.Equal(true, vs["enabled"], "enabled")
-	assert.InDelta(float64(7), vs["pending_embeddings_total"], 1e-9, "pending_embeddings_total")
+	assert.InDelta(float64(7), vs["missing_embeddings_total"], 1e-9, "missing_embeddings_total")
 
 	active, ok := vs["active_generation"].(map[string]any)
 	require.True(ok, "expected 'vector_search.active_generation' object, got %T", vs["active_generation"])

@@ -7,66 +7,100 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/sqlitevec"
 )
 
-// openVectorsDBWithPending opens a fresh vectors.db with one generation
-// (id=1) and n pending rows for that generation. The database is closed
-// automatically on test cleanup.
-func openVectorsDBWithPending(t *testing.T, n int) *sql.DB {
-	t.Helper()
-	ctx := context.Background()
-	require.NoError(t, sqlitevec.RegisterExtension(), "RegisterExtension")
-	path := filepath.Join(t.TempDir(), "vectors.db")
-	db, err := sql.Open(sqlitevec.DriverName(), path)
-	require.NoError(t, err, "open vectors.db")
-	t.Cleanup(func() { _ = db.Close() })
-	require.NoError(t, sqlitevec.Migrate(ctx, db, 768), "Migrate")
-
-	_, err = db.ExecContext(ctx, `
-        INSERT INTO index_generations (id, model, dimension, fingerprint, started_at, state)
-        VALUES (1, 'm', 768, 'm:768', 0, 'building')`)
-	require.NoError(t, err, "insert generation")
-	for i := 1; i <= n; i++ {
-		_, err := db.ExecContext(ctx,
-			`INSERT INTO pending_embeddings (generation_id, message_id, enqueued_at) VALUES (1, ?, 0)`,
-			i)
-		require.NoError(t, err, "insert pending")
-	}
-	return db
+// testWorkStore is a minimal WorkStore backed by the test main DB. It
+// mirrors store.ScanForEmbedding / store.SetEmbedGen against the test's
+// `messages` table (which carries id, subject, deleted_at,
+// deleted_from_source_at, embed_gen).
+type testWorkStore struct {
+	db *sql.DB
 }
 
-// countAvailable returns the number of rows for gen whose claimed_at
-// IS NULL (i.e. available to be claimed).
-func countAvailable(t *testing.T, db *sql.DB, gen int64) int {
+func (s *testWorkStore) ScanForEmbedding(ctx context.Context, target int64, afterID int64, limit int) ([]int64, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id FROM messages
+		  WHERE (embed_gen IS NULL OR embed_gen <> ?)
+		    AND deleted_at IS NULL AND deleted_from_source_at IS NULL
+		    AND id > ?
+		  ORDER BY id LIMIT ?`, target, afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+func (s *testWorkStore) SetEmbedGen(ctx context.Context, ids []int64, target int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	ph := make([]string, len(ids))
+	args := make([]any, 0, 1+len(ids))
+	args = append(args, target)
+	for i, id := range ids {
+		ph[i] = "?"
+		args = append(args, id)
+	}
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE messages SET embed_gen = ? WHERE id IN (`+strings.Join(ph, ",")+`)`, args...)
+	return err
+}
+
+// countMissing returns how many live messages still need embedding for
+// gen (embed_gen IS NULL OR embed_gen <> gen) in the test main DB.
+func countMissing(t *testing.T, db *sql.DB, gen int64) int {
 	t.Helper()
 	var n int
 	err := db.QueryRow(
-		`SELECT COUNT(*) FROM pending_embeddings WHERE generation_id = ? AND claimed_at IS NULL`,
-		gen).Scan(&n)
-	require.NoError(t, err, "countAvailable")
+		`SELECT COUNT(*) FROM messages
+		  WHERE (embed_gen IS NULL OR embed_gen <> ?)
+		    AND deleted_at IS NULL AND deleted_from_source_at IS NULL`, gen).Scan(&n)
+	require.NoError(t, err, "countMissing")
 	return n
+}
+
+// readWatermark returns the persisted watermark for gen (0 if absent).
+func readWatermark(t *testing.T, db *sql.DB, gen int64) int64 {
+	t.Helper()
+	var id int64
+	err := db.QueryRow(`SELECT watermark_id FROM embed_watermark WHERE generation_id = ?`, gen).Scan(&id)
+	if err == sql.ErrNoRows {
+		return 0
+	}
+	require.NoError(t, err, "readWatermark")
+	return id
 }
 
 // workerFixture bundles everything needed for an end-to-end worker test.
 type workerFixture struct {
 	MainDB      *sql.DB
 	VectorsDB   *sql.DB
+	Store       WorkStore
 	Backend     vector.Backend
 	BuildingGen vector.GenerationID
 	FakeClient  *fakeEmbeddingClient
 }
 
 // newWorkerFixture creates a main DB with n messages (subject="msg N",
-// body="body N"), opens a real sqlitevec backend, creates a building
-// generation (seeds pending_embeddings from the main DB), and installs a
-// fakeEmbeddingClient that returns a deterministic vector per input.
+// body="body N", embed_gen NULL), opens a real sqlitevec backend, creates
+// a building generation, and installs a fakeEmbeddingClient that returns a
+// deterministic vector per input.
 func newWorkerFixture(t *testing.T, n int) *workerFixture {
 	t.Helper()
 	ctx := context.Background()
@@ -83,7 +117,8 @@ CREATE TABLE messages (
     id INTEGER PRIMARY KEY,
     subject TEXT,
     deleted_at DATETIME,
-    deleted_from_source_at DATETIME
+    deleted_from_source_at DATETIME,
+    embed_gen INTEGER
 );
 CREATE TABLE message_bodies (
     message_id INTEGER PRIMARY KEY,
@@ -124,50 +159,17 @@ CREATE TABLE message_bodies (
 	return &workerFixture{
 		MainDB:      mainDB,
 		VectorsDB:   vecDB,
+		Store:       &testWorkStore{db: mainDB},
 		Backend:     b,
 		BuildingGen: gid,
 		FakeClient:  fc,
 	}
 }
 
-// openVectorsDBForEnqueue opens a vectors.db with the schema applied but
-// NO generations. Useful for Enqueuer tests that insert their own generations.
-func openVectorsDBForEnqueue(t *testing.T) *sql.DB {
-	t.Helper()
-	ctx := context.Background()
-	require.NoError(t, sqlitevec.RegisterExtension(), "RegisterExtension")
-	path := filepath.Join(t.TempDir(), "vectors.db")
-	db, err := sql.Open(sqlitevec.DriverName(), path)
-	require.NoError(t, err, "open")
-	t.Cleanup(func() { _ = db.Close() })
-	require.NoError(t, sqlitevec.Migrate(ctx, db, 768), "Migrate")
-	return db
-}
-
-// insertGenerationStatic inserts an index_generations row with the given
-// state. id is used verbatim (not auto-increment).
-func insertGenerationStatic(t *testing.T, db *sql.DB, id int64, state string) {
-	t.Helper()
-	_, err := db.Exec(
-		`INSERT INTO index_generations (id, model, dimension, fingerprint, started_at, state)
-         VALUES (?, 'm', 768, 'm:768', 0, ?)`, id, state)
-	require.NoError(t, err, "insert generation %d", id)
-}
-
-// assertPending asserts the number of pending rows for gen.
-func assertPending(t *testing.T, db *sql.DB, gen int64, want int) {
-	t.Helper()
-	var n int
-	err := db.QueryRow(
-		`SELECT COUNT(*) FROM pending_embeddings WHERE generation_id = ?`, gen).Scan(&n)
-	require.NoError(t, err, "count pending (gen=%d)", gen)
-	assert.Equal(t, want, n, "pending for gen %d", gen)
-}
-
 // fakeEmbeddingClient returns a deterministic vector per input; tests
 // may force failures with FailNext(n) or run a callback inside Embed
-// (after the queue claim, before Upsert/Complete) to perturb DB state
-// for race or failure testing.
+// (after the scan, before Upsert/stamp) to perturb DB state for race or
+// failure testing.
 type fakeEmbeddingClient struct {
 	dim       int
 	failN     int

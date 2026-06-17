@@ -409,7 +409,7 @@ func TestGetStats_VectorEnabled(t *testing.T) {
 	assert.Equal(vector.GenerationID(5), ag.ID, "active_generation.id")
 	assert.Equal("nomic-embed", ag.Model, "active_generation.model")
 	assert.Equal(int64(100), ag.MessageCount, "active_generation.message_count")
-	assert.Equal(int64(3), resp.VectorSearch.PendingEmbeddingsTotal, "pending_embeddings_total")
+	assert.Equal(int64(3), resp.VectorSearch.MissingEmbeddingsTotal, "missing_embeddings_total")
 	assert.Nil(resp.VectorSearch.BuildingGeneration, "building_generation")
 }
 
