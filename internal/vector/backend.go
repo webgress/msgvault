@@ -175,6 +175,17 @@ type Backend interface {
 	Delete(ctx context.Context, gen GenerationID, messageIDs []int64) error
 	Stats(ctx context.Context, gen GenerationID) (Stats, error)
 
+	// EmbeddedMessageCount reports how many distinct messages actually have
+	// at least one embedding row for gen — COUNT(DISTINCT message_id) over
+	// the embeddings table. This is the "embedded" leg of the coverage
+	// readout (live / embedded / blank / missing). It lives on the backend
+	// because the embeddings table is in vectors.db on SQLite (and the main
+	// DB on PG); only the backend holds that handle. It is a cheap COUNT
+	// with no joins. Distinct from Stats.EmbeddingCount only in intent: this
+	// is the dedicated coverage helper and never folds the aggregate
+	// (gen == 0) path.
+	EmbeddedMessageCount(ctx context.Context, gen GenerationID) (int64, error)
+
 	// EnsureSeeded is a no-op under the scan-and-fill design: there is no
 	// separate pending_embeddings seed pass to re-run — the embed worker
 	// discovers work by scanning messages.embed_gen. Retained on the

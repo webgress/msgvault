@@ -130,21 +130,29 @@ func (s *Store) ResetEmbedGen(ctx context.Context, ids []int64) error {
 // backends and needs no access to the embeddings store.
 //
 //   - live:     total live messages (the embedding universe).
-//   - embedded: live messages stamped embed_gen = activeGen.
+//   - stamped:  live messages stamped embed_gen = activeGen. This is the
+//     2nd return value (historically named "embedded"). It counts every
+//     row the worker has marked DONE for the generation, INCLUDING blanks —
+//     messages with no extractable body that were stamped terminal but
+//     never produced a vector. It is therefore an UPPER bound on the true
+//     embedded count; the embedded/blank split is resolved at the display
+//     layer via the backend's EmbeddedMessageCount (the embeddings table
+//     lives in a separate DB on SQLite, so this single-DB query cannot do
+//     it). blank = stamped - embedded.
+//   - blank:    the 3rd return value is always 0 here — it cannot be
+//     computed without the embeddings table. The real blank count is
+//     derived by the caller as stamped - backend.EmbeddedMessageCount(gen)
+//     (see cmd/msgvault/cmd/embeddings_manage.go). Kept in the signature
+//     so callers that only need missing (the scheduler/CLI activation gate)
+//     do not have to change.
 //   - missing:  live messages still needing work for activeGen
-//     (embed_gen IS NULL OR embed_gen <> activeGen). live = embedded +
-//     missing exactly.
-//   - blank:    always 0 here. Distinguishing "stamped but has zero
-//     embedding rows" (a missing/empty message stamped to a terminal DONE
-//     state) from "stamped and embedded" requires joining the embeddings
-//     table, which lives in a separate DB on SQLite. Per the design this is
-//     a best-effort/optional number; we report 0 rather than pay the
-//     cross-DB cost. Callers that need a true blank count can derive it
-//     from backend Stats.
+//     (embed_gen IS NULL OR embed_gen <> activeGen). live = stamped +
+//     missing exactly. With the display-layer split: live = embedded +
+//     blank + missing.
 //
 // activeGen == 0 means "no active/target generation"; then everything
-// live is missing and embedded is 0.
-func (s *Store) CoverageCounts(ctx context.Context, activeGen int64) (live, embedded, blank, missing int64, err error) {
+// live is missing and stamped is 0.
+func (s *Store) CoverageCounts(ctx context.Context, activeGen int64) (live, stamped, blank, missing int64, err error) {
 	live, err = s.countLiveMessages(ctx)
 	if err != nil {
 		return 0, 0, 0, 0, err
@@ -152,15 +160,15 @@ func (s *Store) CoverageCounts(ctx context.Context, activeGen int64) (live, embe
 	if activeGen != 0 {
 		q := `SELECT COUNT(*) FROM messages
 		       WHERE embed_gen = ? AND ` + LiveMessagesWhere("", true)
-		if err := s.db.QueryRowContext(ctx, q, activeGen).Scan(&embedded); err != nil {
-			return 0, 0, 0, 0, fmt.Errorf("count embedded: %w", err)
+		if err := s.db.QueryRowContext(ctx, q, activeGen).Scan(&stamped); err != nil {
+			return 0, 0, 0, 0, fmt.Errorf("count stamped: %w", err)
 		}
 	}
-	missing = live - embedded
+	missing = live - stamped
 	if missing < 0 {
 		missing = 0
 	}
-	return live, embedded, 0, missing, nil
+	return live, stamped, 0, missing, nil
 }
 
 // countLiveMessages returns the total live-message count. Shared by

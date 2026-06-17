@@ -1082,3 +1082,19 @@ func (b *Backend) Stats(ctx context.Context, gen vector.GenerationID) (vector.St
 	}
 	return s, nil
 }
+
+// EmbeddedMessageCount returns COUNT(DISTINCT message_id) over the
+// embeddings table for gen — the number of messages that actually have at
+// least one vector for the generation. Used by the coverage readout to
+// split stamped messages into embedded vs blank. Counts distinct messages
+// (not chunk rows) so a long, multi-chunk message counts once, matching
+// the EmbeddingCount semantic elsewhere.
+func (b *Backend) EmbeddedMessageCount(ctx context.Context, gen vector.GenerationID) (int64, error) {
+	var n int64
+	if err := b.db.QueryRowContext(ctx,
+		`SELECT COUNT(DISTINCT message_id) FROM embeddings WHERE generation_id = $1`,
+		int64(gen)).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count embedded messages: %w", err)
+	}
+	return n, nil
+}

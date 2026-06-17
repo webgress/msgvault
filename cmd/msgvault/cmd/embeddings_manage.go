@@ -32,26 +32,76 @@ type embeddingGenerationRow struct {
 	CompletedAt  *time.Time
 	ActivatedAt  *time.Time
 	MessageCount int64
-	// MissingCount is the number of live messages still needing embedding
-	// for this generation (embed_gen <> id), computed from the main DB
-	// coverage rather than a queue table. Filled by fillCoverage.
-	MissingCount int64
+	// Coverage counts for this generation over the live-message universe,
+	// computed from the main DB (live/stamped/missing) plus the vector
+	// backend (embedded). Filled by fillCoverage / fillFullCoverage. The
+	// invariant LiveCount == EmbeddedCount + BlankCount + MissingCount holds.
+	//
+	//   - LiveCount:     total live messages (the embedding universe).
+	//   - EmbeddedCount: live messages that actually have >=1 vector for
+	//     this generation (COUNT(DISTINCT message_id) in the embeddings
+	//     table). Only filled by fillFullCoverage (needs the backend).
+	//   - BlankCount:    stamped-but-empty messages (stamped embed_gen=id
+	//     but no vector) — the body-extraction-regression detector.
+	//     Only filled by fillFullCoverage.
+	//   - MissingCount:  live messages not yet stamped for this generation.
+	LiveCount     int64
+	EmbeddedCount int64
+	BlankCount    int64
+	MissingCount  int64
 }
 
-// fillCoverage populates row.MissingCount from the main DB so the
-// management commands can show/gate on how many live messages still need
-// embedding for the generation. Opens the main store read-only-ish via
-// the configured DSN. A failure is surfaced to the caller.
+// fillCoverage populates row.LiveCount and row.MissingCount from the main
+// DB so the management commands can gate on how many live messages still
+// need embedding for the generation. This is the cheap, backend-free path
+// used by the activation gate (which only needs MissingCount). It leaves
+// EmbeddedCount/BlankCount at zero — use fillFullCoverage for the display
+// table where the embedded/blank split is wanted. A failure is surfaced to
+// the caller.
 func fillCoverage(ctx context.Context, row *embeddingGenerationRow) error {
 	s, err := store.Open(cfg.DatabaseDSN())
 	if err != nil {
 		return fmt.Errorf("open main db for coverage: %w", err)
 	}
 	defer func() { _ = s.Close() }()
-	_, _, _, missing, err := s.CoverageCounts(ctx, int64(row.ID))
+	live, _, _, missing, err := s.CoverageCounts(ctx, int64(row.ID))
 	if err != nil {
 		return err
 	}
+	row.LiveCount = live
+	row.MissingCount = missing
+	return nil
+}
+
+// fillFullCoverage populates the complete live/embedded/blank/missing split
+// for the generation. The main DB supplies live, stamped (embed_gen=id),
+// and missing; the vector backend supplies embedded (COUNT(DISTINCT
+// message_id) in the embeddings table for this generation). blank is the
+// remainder, stamped - embedded, clamped >= 0 — messages stamped terminal
+// DONE but with no vector (the empty/unembeddable case). The invariant
+// live == embedded + blank + missing holds. The backend handle is passed
+// in by the caller (which already opened it for the generation listing).
+func fillFullCoverage(ctx context.Context, backend vector.Backend, row *embeddingGenerationRow) error {
+	s, err := store.Open(cfg.DatabaseDSN())
+	if err != nil {
+		return fmt.Errorf("open main db for coverage: %w", err)
+	}
+	defer func() { _ = s.Close() }()
+	live, stamped, _, missing, err := s.CoverageCounts(ctx, int64(row.ID))
+	if err != nil {
+		return err
+	}
+	embedded, err := backend.EmbeddedMessageCount(ctx, row.ID)
+	if err != nil {
+		return fmt.Errorf("count embedded messages for generation %d: %w", row.ID, err)
+	}
+	blank := stamped - embedded
+	if blank < 0 {
+		blank = 0
+	}
+	row.LiveCount = live
+	row.EmbeddedCount = embedded
+	row.BlankCount = blank
 	row.MissingCount = missing
 	return nil
 }
@@ -72,27 +122,45 @@ func runEmbeddingsList(cmd *cobra.Command, _ []string) error {
 		return nil
 	}
 
-	// Fill per-generation coverage (missing count) from the main DB; a
-	// non-retired generation's missing count is the interesting number.
-	// Retired generations are immutable, so leave their MissingCount at 0.
+	// Fill per-generation coverage (live/embedded/blank/missing) for
+	// non-retired generations — the interesting numbers. The embedded leg
+	// comes from the vector backend (the embeddings table), so open it once
+	// and thread it down. Retired generations are immutable; leave their
+	// coverage at zero and skip the backend scan.
+	needCoverage := false
 	for i := range rows {
-		if rows[i].State == vector.GenerationRetired {
-			continue
+		if rows[i].State != vector.GenerationRetired {
+			needCoverage = true
+			break
 		}
-		if err := fillCoverage(cmd.Context(), &rows[i]); err != nil {
+	}
+	if needCoverage {
+		backend, closeBackend, err := openEmbeddingsBackend(cmd.Context())
+		if err != nil {
 			return err
+		}
+		defer closeBackend()
+		for i := range rows {
+			if rows[i].State == vector.GenerationRetired {
+				continue
+			}
+			if err := fillFullCoverage(cmd.Context(), backend, &rows[i]); err != nil {
+				return err
+			}
 		}
 	}
 
 	w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(w, "ID\tSTATE\tMODEL\tDIM\tMESSAGES\tMISSING\tFINGERPRINT\tSTARTED\tCOMPLETED\tACTIVATED")
+	_, _ = fmt.Fprintln(w, "ID\tSTATE\tMODEL\tDIM\tLIVE\tEMBEDDED\tBLANK\tMISSING\tFINGERPRINT\tSTARTED\tCOMPLETED\tACTIVATED")
 	for _, row := range rows {
-		_, _ = fmt.Fprintf(w, "%d\t%s\t%s\t%d\t%d\t%d\t%s\t%s\t%s\t%s\n",
+		_, _ = fmt.Fprintf(w, "%d\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\n",
 			row.ID,
 			row.State,
 			row.Model,
 			row.Dimension,
-			row.MessageCount,
+			row.LiveCount,
+			row.EmbeddedCount,
+			row.BlankCount,
 			row.MissingCount,
 			row.Fingerprint,
 			formatGenerationTime(row.StartedAt),

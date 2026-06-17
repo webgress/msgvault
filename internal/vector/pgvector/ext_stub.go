@@ -100,6 +100,11 @@ func (b *Backend) LoadVector(_ context.Context, _ int64) ([]float32, error) {
 	return nil, ErrNotBuilt
 }
 
+// EmbeddedMessageCount always returns ErrNotBuilt in non-pgvector builds.
+func (b *Backend) EmbeddedMessageCount(_ context.Context, _ vector.GenerationID) (int64, error) {
+	return 0, ErrNotBuilt
+}
+
 // Compile-time check that the stub matches the vector.Backend
 // interface. Keeping the assertion here means changes to the interface
 // break stub and real builds in lockstep.

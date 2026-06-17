@@ -1183,6 +1183,9 @@ type fakeBackend struct {
 func (f *fakeBackend) LoadVector(_ context.Context, _ int64) ([]float32, error) {
 	return f.loadVec, f.loadErr
 }
+func (f *fakeBackend) EmbeddedMessageCount(_ context.Context, _ vector.GenerationID) (int64, error) {
+	return 0, errors.New("not implemented")
+}
 func (f *fakeBackend) ActiveGeneration(_ context.Context) (vector.Generation, error) {
 	return f.active, f.activeErr
 }
