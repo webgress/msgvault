@@ -320,6 +320,11 @@ func (d *PostgreSQLDialect) LegacyColumnMigrations() []ColumnMigration {
 		// column and FTS stays unavailable. Its GIN index is created
 		// separately by EnsureFTSIndex AFTER this migration runs. [cr2-10]
 		{`ALTER TABLE messages ADD COLUMN IF NOT EXISTS search_fts TSVECTOR`, "search_fts"},
+		// embed_gen: per-message vector-embedding watermark. NULL default
+		// means every legacy row reads as "needs embedding", which is
+		// correct — the scan-and-fill worker (and backstop) will embed and
+		// stamp them. No backfill.
+		{`ALTER TABLE messages ADD COLUMN IF NOT EXISTS embed_gen BIGINT`, "embed_gen"},
 	}
 }
 
@@ -374,7 +379,7 @@ func (d *PostgreSQLDialect) CheckpointWAL(db *sql.DB) error { return nil }
 // SchemaStaleCheck returns the SQL to check whether migrations are needed.
 // PostgreSQL uses information_schema instead of pragma_table_info.
 func (d *PostgreSQLDialect) SchemaStaleCheck() string {
-	return postgresColumnExistsSQL("conversations", "conversation_type")
+	return postgresColumnExistsSQL("messages", "embed_gen")
 }
 
 // IsDuplicateColumnError returns true if the error is a "column already exists" error.

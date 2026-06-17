@@ -135,6 +135,11 @@ CREATE TABLE IF NOT EXISTS messages (
     -- Full-text search column
     search_fts TSVECTOR,
 
+    -- Vector-embedding watermark: the index generation this message's
+    -- embeddings were last written for. NULL means "needs embedding"
+    -- (new rows default to NULL). See schema.sql for the full contract.
+    embed_gen BIGINT,
+
     UNIQUE(source_id, source_message_id)
 );
 
@@ -357,6 +362,10 @@ CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id
 CREATE INDEX IF NOT EXISTS idx_messages_source ON messages(source_id);
 CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);
 CREATE INDEX IF NOT EXISTS idx_messages_sent_at ON messages(sent_at DESC);
+-- Partial index over messages that still need embedding (embed_gen IS
+-- NULL). The scan-and-fill embed worker probes this set every run; the
+-- partial predicate keeps the index tiny once the corpus is embedded.
+CREATE INDEX IF NOT EXISTS idx_messages_embed_gen ON messages(embed_gen) WHERE embed_gen IS NULL;
 CREATE INDEX IF NOT EXISTS idx_messages_type ON messages(message_type);
 CREATE INDEX IF NOT EXISTS idx_messages_deleted ON messages(source_id, deleted_from_source_at);
 CREATE INDEX IF NOT EXISTS idx_messages_source_message_id ON messages(source_message_id);

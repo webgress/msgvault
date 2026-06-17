@@ -652,7 +652,7 @@ func (s *Store) SchemaStale() (bool, string, error) {
 		return false, "", fmt.Errorf("check schema version: %w", err)
 	}
 	if count == 0 {
-		return true, "conversations.conversation_type", nil
+		return true, "messages.embed_gen", nil
 	}
 	return false, "", nil
 }
