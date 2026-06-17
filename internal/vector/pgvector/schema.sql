@@ -87,3 +87,15 @@ CREATE TABLE IF NOT EXISTS embed_runs (
     truncated     INTEGER NOT NULL DEFAULT 0,
     error         TEXT
 );
+
+-- embed_watermark tracks the highest message id the scan-and-fill embed
+-- worker has already swept for a generation, so each RunOnce resumes the
+-- forward scan instead of re-scanning the whole messages table. It is a
+-- pure optimization: losing it only makes the next scan start at id 0,
+-- which is harmless (the scan predicate + idempotent upsert make
+-- re-sweeping covered rows a no-op). The full-scan backstop ignores it.
+-- See internal/vector/sqlitevec/schema.sql for the full contract.
+CREATE TABLE IF NOT EXISTS embed_watermark (
+    generation_id BIGINT PRIMARY KEY,
+    watermark_id  BIGINT NOT NULL DEFAULT 0
+);

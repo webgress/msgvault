@@ -79,3 +79,18 @@ CREATE TABLE IF NOT EXISTS embed_runs (
     truncated     INTEGER NOT NULL DEFAULT 0,
     error         TEXT
 );
+
+-- embed_watermark tracks the highest message id the scan-and-fill embed
+-- worker has already swept for a generation, so each RunOnce resumes the
+-- forward scan from where the last one stopped instead of re-scanning the
+-- whole messages B-tree. It is a pure optimization: losing it (or never
+-- seeding it) only makes the next scan start at id 0, which is harmless
+-- because the scan predicate (embed_gen IS NULL OR embed_gen <> gen) and
+-- the idempotent upsert make re-sweeping covered rows a no-op. The
+-- full-scan backstop ignores this watermark entirely. No FK to messages
+-- (those live in the main DB on SQLite); it lives here with the
+-- generations it watermarks.
+CREATE TABLE IF NOT EXISTS embed_watermark (
+    generation_id INTEGER PRIMARY KEY,
+    watermark_id  INTEGER NOT NULL DEFAULT 0
+);

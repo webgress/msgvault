@@ -158,6 +158,14 @@ CREATE TABLE IF NOT EXISTS messages (
     -- Platform-specific metadata
     metadata JSON,
 
+    -- Vector-embedding watermark: the index generation this message's
+    -- embeddings were last written for. NULL means "needs embedding"
+    -- (new rows default to NULL); a value equal to the active/building
+    -- generation id means "covered". The scan-and-fill embed worker
+    -- finds work via (embed_gen IS NULL OR embed_gen <> <target>) and
+    -- stamps this column after a successful upsert (or skip).
+    embed_gen INTEGER,
+
     UNIQUE(source_id, source_message_id)
 );
 
@@ -363,6 +371,10 @@ CREATE INDEX IF NOT EXISTS idx_conversations_type ON conversations(conversation_
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, sent_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_source ON messages(source_id);
 CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);
+-- Partial index over messages that still need embedding (embed_gen IS
+-- NULL). The scan-and-fill embed worker probes this set every run; the
+-- partial predicate keeps the index tiny once the corpus is embedded.
+CREATE INDEX IF NOT EXISTS idx_messages_embed_gen ON messages(embed_gen) WHERE embed_gen IS NULL;
 CREATE INDEX IF NOT EXISTS idx_messages_sent_at ON messages(sent_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_type ON messages(message_type);
 CREATE INDEX IF NOT EXISTS idx_messages_deleted ON messages(source_id, deleted_from_source_at);
