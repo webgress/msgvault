@@ -34,10 +34,69 @@ func (c *pgFakeEmbeddingClient) Embed(_ context.Context, inputs []string) ([][]f
 	return out, nil
 }
 
+// pgWorkStore is a minimal WorkStore over the PG test schema, mirroring
+// store.ScanForEmbedding / store.SetEmbedGen with $N placeholders.
+type pgWorkStore struct{ db *sql.DB }
+
+func (s *pgWorkStore) ScanForEmbedding(ctx context.Context, target int64, afterID int64, limit int) ([]int64, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id FROM messages
+		  WHERE (embed_gen IS NULL OR embed_gen <> $1)
+		    AND deleted_at IS NULL AND deleted_from_source_at IS NULL
+		    AND id > $2
+		  ORDER BY id LIMIT $3`, target, afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+func (s *pgWorkStore) SetEmbedGen(ctx context.Context, ids []int64, target int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE messages SET embed_gen = $1 WHERE id = ANY($2::bigint[])`, target, int64ArrayLiteral(ids))
+	return err
+}
+
+func int64ArrayLiteral(ids []int64) string {
+	var sb strings.Builder
+	sb.WriteByte('{')
+	for i, id := range ids {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		fmt.Fprintf(&sb, "%d", id)
+	}
+	sb.WriteByte('}')
+	return sb.String()
+}
+
+func pgCountMissing(t *testing.T, db *sql.DB, gen int64) int {
+	t.Helper()
+	var n int
+	require.NoError(t, db.QueryRow(
+		`SELECT COUNT(*) FROM messages
+		  WHERE (embed_gen IS NULL OR embed_gen <> $1)
+		    AND deleted_at IS NULL AND deleted_from_source_at IS NULL`, gen).Scan(&n))
+	return n
+}
+
 // openPGWorkerDB stands up a per-test schema on MSGVAULT_TEST_DB with the
 // minimal main-schema tables embedBatch reads (messages + message_bodies,
-// including the deleted_* columns LiveMessagesWhere references) and seeds
-// n live messages. It returns the *sql.DB; cleanup drops the schema.
+// including embed_gen and the deleted_* columns LiveMessagesWhere
+// references) and seeds n live messages. Returns the *sql.DB; cleanup
+// drops the schema.
 func openPGWorkerDB(t *testing.T, n int) *sql.DB {
 	t.Helper()
 	url := os.Getenv("MSGVAULT_TEST_DB")
@@ -80,7 +139,8 @@ func openPGWorkerDB(t *testing.T, n int) *sql.DB {
 			id BIGINT PRIMARY KEY,
 			subject TEXT,
 			deleted_at TIMESTAMPTZ,
-			deleted_from_source_at TIMESTAMPTZ
+			deleted_from_source_at TIMESTAMPTZ,
+			embed_gen BIGINT
 		);
 		CREATE TABLE message_bodies (
 			message_id BIGINT PRIMARY KEY,
@@ -101,12 +161,10 @@ func openPGWorkerDB(t *testing.T, n int) *sql.DB {
 	return db
 }
 
-// TestWorkerPG_RunOnce_EndToEnd drives the full embed BUILD pipeline
-// against pgx: CreateGeneration seeds pending_embeddings from messages,
-// then RunOnce claims, fetches bodies via embedBatch's IN(...) query,
-// embeds, upserts, and completes. This exercises the $N-placeholder path
-// in embedBatch — before the rebind fix it failed with pgx error 42601
-// ("syntax error at or near ','") because embedBatch emitted literal `?`.
+// TestWorkerPG_RunOnce_EndToEnd drives the full scan-and-fill pipeline
+// against pgx: the worker scans messages.embed_gen, fetches bodies via
+// embedBatch's IN(...) query (rebound to $N), embeds, upserts, and stamps
+// embed_gen. Coverage must reach zero.
 func TestWorkerPG_RunOnce_EndToEnd(t *testing.T) {
 	ctx := context.Background()
 	const n = 5
@@ -119,19 +177,17 @@ func TestWorkerPG_RunOnce_EndToEnd(t *testing.T) {
 	gen, err := backend.CreateGeneration(ctx, "fake", 4, "")
 	require.NoError(t, err, "CreateGeneration")
 
-	// Sanity: seeding put one pending row per live message.
-	var pending int
-	require.NoError(t, db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM pending_embeddings WHERE generation_id = $1`, int64(gen)).Scan(&pending))
-	require.Equal(t, n, pending, "pending seeded from messages")
+	// Everything reads as missing before the run.
+	require.Equal(t, n, pgCountMissing(t, db, int64(gen)), "missing before run")
 
 	worker := NewWorker(WorkerDeps{
 		Backend:   backend,
 		VectorsDB: db,
 		MainDB:    db,
+		Store:     &pgWorkStore{db: db},
 		Client:    &pgFakeEmbeddingClient{dim: 4},
 		Rebind:    (&store.PostgreSQLDialect{}).Rebind,
-		BatchSize: 2, // force multiple claim/embedBatch rounds
+		BatchSize: 2, // force multiple scan/embedBatch rounds
 	})
 
 	res, err := worker.RunOnce(ctx, gen)
@@ -139,10 +195,8 @@ func TestWorkerPG_RunOnce_EndToEnd(t *testing.T) {
 	assert.Equal(t, n, res.Succeeded, "all messages embedded")
 	assert.Equal(t, 0, res.Failed, "no failures")
 
-	// Queue fully drained.
-	require.NoError(t, db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM pending_embeddings WHERE generation_id = $1`, int64(gen)).Scan(&pending))
-	assert.Equal(t, 0, pending, "pending drained after RunOnce")
+	// Coverage complete after the run.
+	assert.Equal(t, 0, pgCountMissing(t, db, int64(gen)), "missing after run")
 
 	// Embeddings landed, one row per message.
 	var embedded int
@@ -151,11 +205,9 @@ func TestWorkerPG_RunOnce_EndToEnd(t *testing.T) {
 	assert.Equal(t, n, embedded, "one embedding row per message")
 }
 
-// TestWorkerPG_EmbedBatch_RebindsINClause targets embedBatch directly:
-// it must rebind the WHERE id IN (...) placeholders to $N so the pgx
-// driver accepts the query. A non-rebinding embedBatch returns a 42601
-// syntax error here; the assertion is simply that the fetch succeeds and
-// returns the seeded messages.
+// TestWorkerPG_EmbedBatch_RebindsINClause targets embedBatch directly: it
+// must rebind the WHERE id IN (...) placeholders to $N so the pgx driver
+// accepts the query.
 func TestWorkerPG_EmbedBatch_RebindsINClause(t *testing.T) {
 	ctx := context.Background()
 	db := openPGWorkerDB(t, 3)
@@ -168,6 +220,7 @@ func TestWorkerPG_EmbedBatch_RebindsINClause(t *testing.T) {
 		Backend:   backend,
 		VectorsDB: db,
 		MainDB:    db,
+		Store:     &pgWorkStore{db: db},
 		Client:    &pgFakeEmbeddingClient{dim: 4},
 		Rebind:    (&store.PostgreSQLDialect{}).Rebind,
 	})
@@ -178,7 +231,6 @@ func TestWorkerPG_EmbedBatch_RebindsINClause(t *testing.T) {
 	assert.Len(t, eb.chunks, 3, "one chunk per short message")
 	assert.Empty(t, eb.missing, "no missing messages")
 	assert.Empty(t, eb.empty, "no empty messages")
-	// Every chunk carries a non-zero vector of the generation's dim.
 	for _, c := range eb.chunks {
 		assert.Len(t, c.Vector, 4)
 	}

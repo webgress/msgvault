@@ -25,7 +25,7 @@ func TestMigrate_FreshAndIdempotent(t *testing.T) {
 
 	for _, tbl := range []string{
 		"index_generations", "embeddings", "embed_runs",
-		"pending_embeddings", "vectors_vec_d768", "schema_version",
+		"embed_watermark", "vectors_vec_d768", "schema_version",
 	} {
 		var name string
 		err := db.QueryRow(`SELECT name FROM sqlite_master WHERE name = ?`, tbl).Scan(&name)
@@ -379,9 +379,13 @@ func TestForeignKeys_PerConnection(t *testing.T) {
 		err := c.QueryRowContext(ctx, `PRAGMA foreign_keys`).Scan(&fk)
 		require.NoErrorf(err, "conn %d pragma read", i)
 		assert.Equalf(1, fk, "conn %d: foreign_keys (ConnectHook missed this conn)", i)
+		// embeddings.generation_id REFERENCES index_generations(id); insert
+		// a row pointing at a non-existent generation to trigger the FK
+		// violation on a properly-configured connection.
 		_, err = c.ExecContext(ctx,
-			`INSERT INTO pending_embeddings (generation_id, message_id, enqueued_at)
-			 VALUES (?, ?, ?)`, 9999999, int64(i), int64(i))
+			`INSERT INTO embeddings
+			   (generation_id, message_id, chunk_index, embedded_at, source_char_len)
+			 VALUES (?, ?, 0, 0, 0)`, 9999999, int64(i))
 		//nolint:testifylint // guarded assert+continue: a require here would abort the per-conn loop instead of skipping to the next connection
 		if !assert.Errorf(err, "conn %d: FK-violating insert should fail", i) {
 			continue

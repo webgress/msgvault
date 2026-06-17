@@ -2,14 +2,12 @@ package scheduler
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
 	assertpkg "github.com/stretchr/testify/assert"
 	requirepkg "github.com/stretchr/testify/require"
 
@@ -415,10 +413,6 @@ type fakeBackend struct {
 	activateErr     error
 	mu              sync.Mutex
 	activateCallIDs []vector.GenerationID
-	// ensureSeededErr is what EnsureSeeded returns; ensureSeededIDs
-	// records the gen IDs the EmbedJob passed to EnsureSeeded.
-	ensureSeededErr error
-	ensureSeededIDs []vector.GenerationID
 
 	activeCalls   atomic.Int32
 	buildingCalls atomic.Int32
@@ -467,17 +461,10 @@ func (f *fakeBackend) LoadVector(ctx context.Context, messageID int64) ([]float3
 	panic("unexpected: LoadVector")
 }
 func (f *fakeBackend) Close() error { return nil }
-func (f *fakeBackend) EnsureSeeded(_ context.Context, gen vector.GenerationID) error {
-	f.mu.Lock()
-	f.ensureSeededIDs = append(f.ensureSeededIDs, gen)
-	f.mu.Unlock()
-	return f.ensureSeededErr
-}
-func (f *fakeBackend) ensureSeededCalls() []vector.GenerationID {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]vector.GenerationID(nil), f.ensureSeededIDs...)
-}
+
+// EnsureSeeded is a no-op under the scan-and-fill design (kept to satisfy
+// the vector.Backend interface).
+func (f *fakeBackend) EnsureSeeded(_ context.Context, _ vector.GenerationID) error { return nil }
 
 // fakeRunner records calls to satisfy EmbedRunner.
 type fakeRunner struct {
@@ -650,9 +637,8 @@ func TestEmbedJob_Run_PrefersBuildingOverActive(t *testing.T) {
 		active:   vector.Generation{ID: 5, State: vector.GenerationActive, Fingerprint: "m:768"},
 		building: building,
 	}
-	// Pending count = 0 (no VectorsDB wired), so the activation gate
-	// will skip auto-activation; we're only asserting the target
-	// selection here.
+	// No Store wired, so the activation gate skips auto-activation; we're
+	// only asserting target selection here.
 	runner := &fakeRunner{}
 	job := &EmbedJob{Worker: runner, Backend: backend, Fingerprint: "m:768"}
 
@@ -665,20 +651,20 @@ func TestEmbedJob_Run_PrefersBuildingOverActive(t *testing.T) {
 }
 
 // TestEmbedJob_Run_ActivatesBuildingWhenDrained verifies the
-// activation gate: after RunOnce on a building generation, if
-// pending_embeddings is empty for that gen, the daemon must call
-// ActivateGeneration so the new index actually starts serving.
-// Without this, a daemon-only deployment can never complete a
+// activation gate: after RunOnce on a building generation, if coverage
+// is complete for that gen (no live message still needs embedding), the
+// daemon must call ActivateGeneration so the new index actually starts
+// serving. Without this, a daemon-only deployment can never complete a
 // `--full-rebuild` started by the CLI.
 func TestEmbedJob_Run_ActivatesBuildingWhenDrained(t *testing.T) {
-	db := newPendingDB(t)
 	building := &vector.Generation{ID: 77, State: vector.GenerationBuilding, Fingerprint: "m:768"}
 	backend := &fakeBackend{
 		activeErr: vector.ErrNoActiveGeneration,
 		building:  building,
 	}
 	runner := &fakeRunner{}
-	job := &EmbedJob{Worker: runner, Backend: backend, VectorsDB: db, Fingerprint: "m:768"}
+	cov := &fakeCoverage{missing: 0}
+	job := &EmbedJob{Worker: runner, Backend: backend, Store: cov, Fingerprint: "m:768"}
 
 	job.Run(context.Background())
 
@@ -686,23 +672,21 @@ func TestEmbedJob_Run_ActivatesBuildingWhenDrained(t *testing.T) {
 }
 
 // TestEmbedJob_Run_DoesNotActivateWhilePending guards the inverse
-// case: pending_embeddings still has rows, so the building must NOT
-// be activated yet (its index is incomplete).
+// case: coverage still reports missing messages, so the building must
+// NOT be activated yet (its index is incomplete).
 func TestEmbedJob_Run_DoesNotActivateWhilePending(t *testing.T) {
-	db := newPendingDB(t)
-	_, err := db.Exec(`INSERT INTO pending_embeddings (generation_id, message_id) VALUES (77, 1)`)
-	requirepkg.NoError(t, err, "seed pending")
 	building := &vector.Generation{ID: 77, State: vector.GenerationBuilding, Fingerprint: "m:768"}
 	backend := &fakeBackend{
 		activeErr: vector.ErrNoActiveGeneration,
 		building:  building,
 	}
 	runner := &fakeRunner{}
-	job := &EmbedJob{Worker: runner, Backend: backend, VectorsDB: db, Fingerprint: "m:768"}
+	cov := &fakeCoverage{missing: 1}
+	job := &EmbedJob{Worker: runner, Backend: backend, Store: cov, Fingerprint: "m:768"}
 
 	job.Run(context.Background())
 
-	assertpkg.Empty(t, backend.activations(), "activations (pending still > 0)")
+	assertpkg.Empty(t, backend.activations(), "activations (missing still > 0)")
 }
 
 // TestEmbedJob_Run_LeavesMismatchedBuildingForCLI guards against the
@@ -726,82 +710,34 @@ func TestEmbedJob_Run_LeavesMismatchedBuildingForCLI(t *testing.T) {
 	assertpkg.Empty(t, backend.activations(), "activations")
 }
 
-// TestEmbedJob_Run_EnsuresSeededBeforeRunOnce regresses the crash
-// window where CreateGeneration inserted a `building` row but died
-// before committing the initial seed. Without EnsureSeeded on the
-// resume path, RunOnce would see an empty queue, pendingCount would
-// be 0, and the daemon would activate an unseeded generation — a
-// silent, catastrophic data loss for semantic search. EnsureSeeded
-// must be called BEFORE RunOnce so the seed commits first.
-func TestEmbedJob_Run_EnsuresSeededBeforeRunOnce(t *testing.T) {
-	db := newPendingDB(t)
-	building := &vector.Generation{ID: 99, State: vector.GenerationBuilding, Fingerprint: "m:768"}
-	backend := &fakeBackend{
-		activeErr: vector.ErrNoActiveGeneration,
-		building:  building,
-	}
-	runner := &fakeRunner{}
-	job := &EmbedJob{Worker: runner, Backend: backend, VectorsDB: db, Fingerprint: "m:768"}
-
-	job.Run(context.Background())
-
-	assertpkg.Equal(t, []vector.GenerationID{99}, backend.ensureSeededCalls(), "EnsureSeeded calls")
-	_, run, _ := runner.calls()
-	assertpkg.Equal(t, 1, run, "RunOnce calls (should run after seeding)")
-}
-
-// TestEmbedJob_Run_EnsureSeededErrorBailsOut guards the error path:
-// if EnsureSeeded returns an error (e.g. the generation was already
-// activated or retired between BuildingGeneration and EnsureSeeded),
-// the daemon must NOT call RunOnce or ActivateGeneration — the
-// generation is not in a state the daemon can safely drive.
-func TestEmbedJob_Run_EnsureSeededErrorBailsOut(t *testing.T) {
-	db := newPendingDB(t)
-	building := &vector.Generation{ID: 55, State: vector.GenerationBuilding, Fingerprint: "m:768"}
-	backend := &fakeBackend{
-		activeErr:       vector.ErrNoActiveGeneration,
-		building:        building,
-		ensureSeededErr: errors.New("generation state=active, want building"),
-	}
-	runner := &fakeRunner{}
-	job := &EmbedJob{Worker: runner, Backend: backend, VectorsDB: db, Fingerprint: "m:768"}
-
-	job.Run(context.Background())
-
-	_, run, _ := runner.calls()
-	assertpkg.Equal(t, 0, run, "RunOnce calls (EnsureSeeded failed — must not proceed)")
-	assertpkg.Empty(t, backend.activations(), "activations (EnsureSeeded failed)")
-}
-
 // TestEmbedJob_Run_PostActivationEnqueueDrainsOnNextRun is the
 // eventual-consistency check that pairs with the comment in
 // embed_job.go's activation gate. It simulates the race the gate is
-// designed to tolerate: pendingCount reads 0, activation flips
-// state to active, then a new pending row appears (as if a sync
-// committed between the read and the activate). The next worker
-// run must pick the now-active generation as its target — proving
-// the post-activation top-up path runs and the system converges.
+// designed to tolerate: coverage reads 0 missing, activation flips
+// state to active, then a new message appears (as if a sync committed
+// between the read and the activate). The next worker run must pick the
+// now-active generation as its target — proving the post-activation
+// top-up path runs and the system converges.
 func TestEmbedJob_Run_PostActivationEnqueueDrainsOnNextRun(t *testing.T) {
 	require := requirepkg.New(t)
 	assert := assertpkg.New(t)
-	db := newPendingDB(t)
 	gen := vector.Generation{ID: 88, State: vector.GenerationBuilding, Fingerprint: "m:768"}
 	backend := &fakeBackend{
 		activeErr: vector.ErrNoActiveGeneration,
 		building:  &gen,
 	}
 	runner := &fakeRunner{}
-	job := &EmbedJob{Worker: runner, Backend: backend, VectorsDB: db, Fingerprint: "m:768"}
+	cov := &fakeCoverage{missing: 0}
+	job := &EmbedJob{Worker: runner, Backend: backend, Store: cov, Fingerprint: "m:768"}
 
-	// Tick 1: building drained, activation flips to active.
+	// Tick 1: building covered, activation flips to active.
 	job.Run(context.Background())
 	require.Equal([]vector.GenerationID{88}, backend.activations(), "tick 1 activations")
 
-	// Simulate the race: a sync.EnqueueMessages commit lands AFTER
-	// activation, adding a pending row bound to the (now-active)
-	// generation. The fakeBackend reflects the post-activation state.
-	_, err := db.Exec(`INSERT INTO pending_embeddings (generation_id, message_id) VALUES (88, 1)`)
-	require.NoError(err, "enqueue")
+	// Simulate the race: a sync commit lands AFTER activation, adding a
+	// message that reads as missing for the (now-active) generation. The
+	// fakeBackend reflects the post-activation state.
+	cov.missing = 1
 	backend.building = nil
 	backend.active = vector.Generation{ID: 88, State: vector.GenerationActive, Fingerprint: "m:768"}
 	backend.activeErr = nil
@@ -816,21 +752,14 @@ func TestEmbedJob_Run_PostActivationEnqueueDrainsOnNextRun(t *testing.T) {
 	assert.Len(backend.activations(), 1, "activations (only first activation)")
 }
 
-// newPendingDB returns an in-memory SQLite handle with just the
-// pending_embeddings table the activation gate counts against.
-func newPendingDB(t *testing.T) *sql.DB {
-	t.Helper()
-	db, err := sql.Open("sqlite3", ":memory:")
-	requirepkg.NoError(t, err, "open")
-	t.Cleanup(func() { _ = db.Close() })
-	_, err = db.Exec(`
-CREATE TABLE pending_embeddings (
-    generation_id INTEGER NOT NULL,
-    message_id    INTEGER NOT NULL,
-    PRIMARY KEY (generation_id, message_id)
-);`)
-	requirepkg.NoError(t, err, "schema")
-	return db
+// fakeCoverage satisfies EmbedCoverage for the activation-gate tests:
+// it reports a fixed number of live messages still needing embedding.
+type fakeCoverage struct {
+	missing int64
+}
+
+func (c *fakeCoverage) CoverageCounts(_ context.Context, _ int64) (live, embedded, skipped, missing int64, err error) {
+	return c.missing, 0, 0, c.missing, nil
 }
 
 // slowRunner blocks RunOnce on `release` so tests can control when it
