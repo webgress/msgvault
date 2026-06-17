@@ -32,7 +32,28 @@ type embeddingGenerationRow struct {
 	CompletedAt  *time.Time
 	ActivatedAt  *time.Time
 	MessageCount int64
-	PendingCount int64
+	// MissingCount is the number of live messages still needing embedding
+	// for this generation (embed_gen <> id), computed from the main DB
+	// coverage rather than a queue table. Filled by fillCoverage.
+	MissingCount int64
+}
+
+// fillCoverage populates row.MissingCount from the main DB so the
+// management commands can show/gate on how many live messages still need
+// embedding for the generation. Opens the main store read-only-ish via
+// the configured DSN. A failure is surfaced to the caller.
+func fillCoverage(ctx context.Context, row *embeddingGenerationRow) error {
+	s, err := store.Open(cfg.DatabaseDSN())
+	if err != nil {
+		return fmt.Errorf("open main db for coverage: %w", err)
+	}
+	defer func() { _ = s.Close() }()
+	_, _, _, missing, err := s.CoverageCounts(ctx, int64(row.ID))
+	if err != nil {
+		return err
+	}
+	row.MissingCount = missing
+	return nil
 }
 
 func runEmbeddingsList(cmd *cobra.Command, _ []string) error {
@@ -51,8 +72,20 @@ func runEmbeddingsList(cmd *cobra.Command, _ []string) error {
 		return nil
 	}
 
+	// Fill per-generation coverage (missing count) from the main DB; a
+	// non-retired generation's missing count is the interesting number.
+	// Retired generations are immutable, so leave their MissingCount at 0.
+	for i := range rows {
+		if rows[i].State == vector.GenerationRetired {
+			continue
+		}
+		if err := fillCoverage(cmd.Context(), &rows[i]); err != nil {
+			return err
+		}
+	}
+
 	w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(w, "ID\tSTATE\tMODEL\tDIM\tMESSAGES\tPENDING\tFINGERPRINT\tSTARTED\tCOMPLETED\tACTIVATED")
+	_, _ = fmt.Fprintln(w, "ID\tSTATE\tMODEL\tDIM\tMESSAGES\tMISSING\tFINGERPRINT\tSTARTED\tCOMPLETED\tACTIVATED")
 	for _, row := range rows {
 		_, _ = fmt.Fprintf(w, "%d\t%s\t%s\t%d\t%d\t%d\t%s\t%s\t%s\t%s\n",
 			row.ID,
@@ -60,7 +93,7 @@ func runEmbeddingsList(cmd *cobra.Command, _ []string) error {
 			row.Model,
 			row.Dimension,
 			row.MessageCount,
-			row.PendingCount,
+			row.MissingCount,
 			row.Fingerprint,
 			formatGenerationTime(row.StartedAt),
 			formatGenerationTimePtr(row.CompletedAt),
@@ -153,16 +186,20 @@ func runEmbeddingsActivate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("generation %d fingerprint=%q does not match config=%q; pass --force to activate anyway",
 			gen, row.Fingerprint, expected)
 	}
-	// The pending/seeded gate is enforced atomically inside
-	// backend.ActivateGeneration (see below) so a concurrent sync that
-	// dual-enqueues a pending row cannot slip it in between this read and
-	// the state flip. We still surface a friendly pre-flight error here
-	// (against the committed metadata read) so the common case fails fast
-	// before opening a backend connection and before prompting — but the
-	// backend's transactional gate is the authoritative guarantee.
-	if row.PendingCount > 0 && !embeddingsActivateForce {
-		return fmt.Errorf("generation %d still has %d pending embedding rows; run `msgvault embeddings resume` or pass --force",
-			gen, row.PendingCount)
+	// The coverage/seeded gate is enforced inside
+	// backend.ActivateGeneration (atomically on PG; via a Go pre-check on
+	// SQLite). We still surface a friendly pre-flight error here (against
+	// the main-DB coverage) so the common case fails fast before opening a
+	// backend connection and before prompting — but the backend's gate is
+	// the authoritative guarantee.
+	if !embeddingsActivateForce {
+		if err := fillCoverage(cmd.Context(), &row); err != nil {
+			return err
+		}
+		if row.MissingCount > 0 {
+			return fmt.Errorf("generation %d still has %d message(s) needing embedding; run `msgvault embeddings resume` or pass --force",
+				gen, row.MissingCount)
+		}
 	}
 	if row.SeededAt == nil && !embeddingsActivateForce {
 		return fmt.Errorf("generation %d has not finished seeding; run `msgvault embeddings resume` or pass --force",
@@ -345,10 +382,8 @@ func listEmbeddingGenerations(ctx context.Context, db *sql.DB, rebind func(strin
 	rows, err := db.QueryContext(ctx, `
 		SELECT g.id, g.model, g.dimension, g.fingerprint, g.state,
 		       g.started_at, g.completed_at, g.activated_at, g.message_count,
-		       g.seeded_at, COUNT(p.message_id) AS pending_count
+		       g.seeded_at
 		  FROM index_generations g
-		  LEFT JOIN pending_embeddings p ON p.generation_id = g.id
-		 GROUP BY g.id
 		 ORDER BY g.id`)
 	if err != nil {
 		return nil, fmt.Errorf("list embedding generations: %w", err)
@@ -373,11 +408,9 @@ func getEmbeddingGeneration(ctx context.Context, db *sql.DB, rebind func(string)
 	row := db.QueryRowContext(ctx, rebind(`
 		SELECT g.id, g.model, g.dimension, g.fingerprint, g.state,
 		       g.started_at, g.completed_at, g.activated_at, g.message_count,
-		       g.seeded_at, COUNT(p.message_id) AS pending_count
+		       g.seeded_at
 		  FROM index_generations g
-		  LEFT JOIN pending_embeddings p ON p.generation_id = g.id
-		 WHERE g.id = ?
-		 GROUP BY g.id`), int64(gen))
+		 WHERE g.id = ?`), int64(gen))
 	g, err := scanEmbeddingGeneration(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return embeddingGenerationRow{}, fmt.Errorf("%w: %d", vector.ErrUnknownGeneration, gen)
@@ -392,11 +425,9 @@ func activeEmbeddingGeneration(ctx context.Context, db *sql.DB, rebind func(stri
 	row := db.QueryRowContext(ctx, rebind(`
 		SELECT g.id, g.model, g.dimension, g.fingerprint, g.state,
 		       g.started_at, g.completed_at, g.activated_at, g.message_count,
-		       g.seeded_at, COUNT(p.message_id) AS pending_count
+		       g.seeded_at
 		  FROM index_generations g
-		  LEFT JOIN pending_embeddings p ON p.generation_id = g.id
-		 WHERE g.state = ?
-		 GROUP BY g.id`), string(vector.GenerationActive))
+		 WHERE g.state = ?`), string(vector.GenerationActive))
 	g, err := scanEmbeddingGeneration(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return embeddingGenerationRow{}, false, nil
@@ -426,7 +457,6 @@ func scanEmbeddingGeneration(s generationScanner) (embeddingGenerationRow, error
 		&activatedAt,
 		&row.MessageCount,
 		&seededAt,
-		&row.PendingCount,
 	); err != nil {
 		return embeddingGenerationRow{}, err
 	}

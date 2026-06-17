@@ -98,10 +98,14 @@ func runEmbed(cmd *cobra.Command) error {
 		Timeout:    cfg.Vector.Embeddings.Timeout,
 		MaxRetries: cfg.Vector.Embeddings.MaxRetries,
 	})
-	totalPending, err := pendingCount(ctx, vectorsDB, rebind, gen)
+	// "Pending" is now the count of live messages still needing work for
+	// this generation (embed_gen <> gen), read from the main DB coverage
+	// rather than a queue table.
+	_, _, _, missing, err := s.CoverageCounts(ctx, int64(gen))
 	if err != nil {
-		return fmt.Errorf("count pending: %w", err)
+		return fmt.Errorf("coverage counts: %w", err)
 	}
+	totalPending := int(missing)
 
 	worker := embed.NewWorker(embed.WorkerDeps{
 		Backend:   backend,
@@ -124,38 +128,37 @@ func runEmbed(cmd *cobra.Command) error {
 		Progress:      newProgressPrinter(errOut, totalPending, cfg.Vector.Embeddings.ETAWindow),
 	})
 
-	if n, err := worker.ReclaimStale(ctx); err != nil {
-		return fmt.Errorf("reclaim stale: %w", err)
-	} else if n > 0 {
-		_, _ = fmt.Fprintf(errOut, "Reclaimed %d stale claims.\n", n)
+	var res embed.RunResult
+	if embedBackstop {
+		res, err = worker.RunBackstop(ctx, gen)
+	} else {
+		res, err = worker.RunOnce(ctx, gen)
 	}
-
-	res, err := worker.RunOnce(ctx, gen)
 	if err != nil {
 		return fmt.Errorf("embed run: %w", err)
 	}
-	_, _ = fmt.Fprintf(out, "Claimed: %d, succeeded: %d, failed: %d, truncated: %d\n",
+	_, _ = fmt.Fprintf(out, "Scanned: %d, succeeded: %d, failed: %d, truncated: %d\n",
 		res.Claimed, res.Succeeded, res.Failed, res.Truncated)
 
-	// Activation is a function of the generation's final state, not
+	// Activation is a function of the generation's final coverage, not
 	// of the cumulative retry counter — transient failures that the
 	// worker later recovers from must not block activation, and an
 	// active generation must not be re-activated.
 	if rebuildInProgress {
-		remaining, err := pendingCount(ctx, vectorsDB, rebind, gen)
+		_, _, _, remaining, err := s.CoverageCounts(ctx, int64(gen))
 		if err != nil {
-			return fmt.Errorf("count pending: %w", err)
+			return fmt.Errorf("coverage counts: %w", err)
 		}
 		if remaining == 0 {
 			// force=false: we already gated on remaining==0 above, and the
-			// backend re-asserts the seeded/no-pending gate atomically.
+			// backend re-asserts the no-missing gate atomically.
 			if err := backend.ActivateGeneration(ctx, gen, false); err != nil {
 				return fmt.Errorf("activate generation: %w", err)
 			}
 			_, _ = fmt.Fprintf(out, "Generation %d activated.\n", gen)
 		} else {
 			_, _ = fmt.Fprintf(errOut,
-				"Generation %d still has %d pending rows; run `msgvault embeddings resume` again to finish, then it will activate automatically.\n",
+				"Generation %d still has %d message(s) needing embedding; run `msgvault embeddings resume` again to finish, then it will activate automatically.\n",
 				gen, remaining)
 		}
 	}
@@ -277,21 +280,6 @@ func pickEmbedGeneration(ctx context.Context, backend vector.Backend, opts embed
 	default:
 		return 0, false, fmt.Errorf("resolve active generation: %w (hint: run with --full-rebuild to start)", err)
 	}
-}
-
-// pendingCount counts queue rows for gen. rebind translates the
-// ?-placeholder to the driver's native form; nil is treated as the
-// identity so the SQLite path is unchanged.
-func pendingCount(ctx context.Context, db *sql.DB, rebind func(string) string, gen vector.GenerationID) (int, error) {
-	if rebind == nil {
-		rebind = func(q string) string { return q }
-	}
-	var n int
-	if err := db.QueryRowContext(ctx,
-		rebind(`SELECT COUNT(*) FROM pending_embeddings WHERE generation_id = ?`), int64(gen)).Scan(&n); err != nil {
-		return 0, fmt.Errorf("query pending: %w", err)
-	}
-	return n, nil
 }
 
 // newProgressPrinter returns an embed.Worker Progress callback that

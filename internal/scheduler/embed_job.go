@@ -2,7 +2,6 @@ package scheduler
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"log/slog"
 	"sync"
@@ -16,6 +15,13 @@ import (
 type EmbedRunner interface {
 	RunOnce(ctx context.Context, gen vector.GenerationID) (embed.RunResult, error)
 	ReclaimStale(ctx context.Context) (int, error)
+}
+
+// EmbedCoverage is the subset of *store.Store the activation gate needs:
+// the count of live messages still needing embedding for a generation,
+// read from the main DB. Tests satisfy it with a fake.
+type EmbedCoverage interface {
+	CoverageCounts(ctx context.Context, activeGen int64) (live, embedded, skipped, missing int64, err error)
 }
 
 // Compile-time check that the production worker satisfies EmbedRunner.
@@ -40,18 +46,11 @@ type EmbedJob struct {
 	Backend vector.Backend
 	Log     *slog.Logger
 
-	// VectorsDB is the vectors.db handle, used to count remaining
-	// pending_embeddings for activation gating. May be nil; in that
-	// case the daemon will not auto-activate building generations.
-	VectorsDB *sql.DB
-
-	// Rebind translates ?-placeholders to the driver's native form for
-	// queries this job issues directly against VectorsDB (pendingCount).
-	// nil is treated as the identity (used by SQLite); the PostgreSQL
-	// serve path must wire in (&store.PostgreSQLDialect{}).Rebind so the
-	// activation-gate count runs on pgx — a bare ? is rejected by the
-	// pgx driver.
-	Rebind func(string) string
+	// Store provides the main-DB coverage count used for activation
+	// gating (how many live messages still need embedding for the
+	// building generation). May be nil; in that case the daemon will not
+	// auto-activate building generations.
+	Store EmbedCoverage
 
 	// Fingerprint is the configured generation fingerprint (typically
 	// vector.Config.GenerationFingerprint() — "model:dim:preprocess").
@@ -98,20 +97,6 @@ func (j *EmbedJob) Run(ctx context.Context) {
 		return
 	}
 
-	// Guard against the CreateGeneration crash window: if a prior
-	// rebuild inserted the building row but died before committing
-	// the initial seed, the pending queue is empty and the daemon
-	// would happily "drain" it and activate an unseeded generation.
-	// EnsureSeeded is idempotent on already-seeded generations, so
-	// calling it on every resume is cheap and safe.
-	if isBuilding {
-		if err := j.Backend.EnsureSeeded(ctx, target); err != nil {
-			log.Warn("embed: ensure seeded failed; leaving building generation for CLI to resolve",
-				"gen", target, "error", err)
-			return
-		}
-	}
-
 	res, err := j.Worker.RunOnce(ctx, target)
 	if err != nil {
 		log.Warn("embed run failed", "gen", target, "error", err)
@@ -120,7 +105,7 @@ func (j *EmbedJob) Run(ctx context.Context) {
 	log.Info("embed run complete",
 		"gen", target,
 		"building", isBuilding,
-		"claimed", res.Claimed,
+		"scanned", res.Claimed,
 		"succeeded", res.Succeeded,
 		"failed", res.Failed,
 		"truncated", res.Truncated,
@@ -129,39 +114,37 @@ func (j *EmbedJob) Run(ctx context.Context) {
 	if !isBuilding {
 		return
 	}
-	// Activation gate: only flip the building generation to active
-	// when the queue has fully drained for it. Transient embed
-	// failures that the worker later recovers from must not block
-	// activation, but a generation with pending rows must not
-	// auto-activate either (it would expose an incomplete index).
+	// Activation gate: only flip the building generation to active when
+	// coverage is complete (no live message still needs embedding for it).
+	// Transient embed failures that the worker later recovers from must
+	// not block activation, but an incompletely-covered generation must
+	// not auto-activate either (it would expose an incomplete index).
 	//
-	// This check + ActivateGeneration is intentionally non-atomic.
-	// If sync.EnqueueMessages commits a new pending row between the
-	// pendingCount read and the activation call, activation still
-	// succeeds and the new row stays bound to the (now-active)
-	// generation. The next worker tick picks it up via the active-
-	// generation top-up path, so the system reaches consistency on
-	// the next run rather than blocking activation forever on a
-	// moving target. This is by design — at steady state every
-	// active generation has incremental rows showing up between
-	// runs, so the activation gate must not require a snapshot.
-	if j.VectorsDB == nil {
-		log.Debug("embed: building drained but VectorsDB not wired; skipping auto-activation",
+	// This check + ActivateGeneration is intentionally non-atomic on
+	// SQLite (cross-DB): a message synced between the coverage read and
+	// the activation call leaves embed_gen NULL on the now-active
+	// generation. The next worker tick (and the full-scan backstop) picks
+	// it up via the active-generation scan, so the system reaches
+	// consistency on the next run rather than blocking activation forever
+	// on a moving target. The backend re-asserts the gate (atomically on
+	// PG; via a Go pre-check on SQLite) inside ActivateGeneration.
+	if j.Store == nil {
+		log.Debug("embed: building covered but Store not wired; skipping auto-activation",
 			"gen", target)
 		return
 	}
-	remaining, err := j.pendingCount(ctx, target)
+	_, _, _, missing, err := j.Store.CoverageCounts(ctx, int64(target))
 	if err != nil {
-		log.Warn("embed: count pending after run failed", "gen", target, "error", err)
+		log.Warn("embed: coverage count after run failed", "gen", target, "error", err)
 		return
 	}
-	if remaining > 0 {
-		log.Info("embed: building generation still has pending rows; will retry next tick",
-			"gen", target, "remaining", remaining)
+	if missing > 0 {
+		log.Info("embed: building generation still has messages needing embedding; will retry next tick",
+			"gen", target, "remaining", missing)
 		return
 	}
-	// force=false: the pendingCount==0 check above is the scheduler's gate,
-	// and the backend re-asserts it atomically inside the activation tx.
+	// force=false: the missing==0 check above is the scheduler's gate,
+	// and the backend re-asserts it inside ActivateGeneration.
 	if err := j.Backend.ActivateGeneration(ctx, target, false); err != nil {
 		log.Warn("embed: activation failed", "gen", target, "error", err)
 		return
@@ -230,19 +213,4 @@ func (j *EmbedJob) pickTarget(ctx context.Context, log *slog.Logger) (vector.Gen
 		log.Warn("embed: active generation lookup failed", "error", err)
 		return 0, false, false
 	}
-}
-
-// pendingCount returns the number of pending_embeddings rows for gen.
-// Used by the activation gate.
-func (j *EmbedJob) pendingCount(ctx context.Context, gen vector.GenerationID) (int, error) {
-	rebind := j.Rebind
-	if rebind == nil {
-		rebind = func(q string) string { return q }
-	}
-	var n int
-	if err := j.VectorsDB.QueryRowContext(ctx,
-		rebind(`SELECT COUNT(*) FROM pending_embeddings WHERE generation_id = ?`), int64(gen)).Scan(&n); err != nil {
-		return 0, err
-	}
-	return n, nil
 }

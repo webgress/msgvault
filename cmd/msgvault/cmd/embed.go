@@ -9,6 +9,7 @@ import (
 var (
 	embedFullRebuild            bool
 	embedYes                    bool
+	embedBackstop               bool
 	embeddingsRetireYes         bool
 	embeddingsRetireForceActive bool
 	embeddingsActivateForce     bool
@@ -65,6 +66,8 @@ to point at a running OpenAI-compatible endpoint.`,
 	}
 	cmd.Flags().BoolVar(&embedFullRebuild, "full-rebuild", false, "Create a new generation and rebuild from scratch")
 	cmd.Flags().BoolVar(&embedYes, "yes", false, "Skip confirmation prompts")
+	cmd.Flags().BoolVar(&embedBackstop, "backstop", false,
+		"Full-scan pass that ignores the per-generation watermark, catching any straggler messages the incremental scan skipped (idempotent)")
 	return cmd
 }
 

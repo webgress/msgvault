@@ -12,11 +12,10 @@ CREATE TABLE IF NOT EXISTS index_generations (
     dimension     INTEGER NOT NULL,
     fingerprint   TEXT NOT NULL,
     started_at    BIGINT NOT NULL,
-    -- seeded_at marks when the initial pending_embeddings seed pass
-    -- finished. NULL means "row inserted but seed never committed"
-    -- (e.g. crash between insert and seed) — the resume path re-runs
-    -- seedPending in that case rather than activating an empty
-    -- generation.
+    -- seeded_at is stamped at CreateGeneration. Under the scan-and-fill
+    -- design there is no separate seed pass; this column is retained only
+    -- because the activation gate still asserts seeded_at IS NOT NULL as a
+    -- belt-and-suspenders lifecycle check.
     seeded_at     BIGINT,
     completed_at  BIGINT,
     activated_at  BIGINT,
@@ -62,19 +61,6 @@ CREATE TABLE IF NOT EXISTS embeddings (
 );
 CREATE INDEX IF NOT EXISTS idx_embeddings_msg ON embeddings(message_id);
 CREATE INDEX IF NOT EXISTS idx_embeddings_dim ON embeddings(dimension);
-
-CREATE TABLE IF NOT EXISTS pending_embeddings (
-    generation_id BIGINT NOT NULL REFERENCES index_generations(id) ON DELETE CASCADE,
-    message_id    BIGINT NOT NULL,
-    enqueued_at   BIGINT NOT NULL,
-    claimed_at    BIGINT,
-    claim_token   TEXT,
-    PRIMARY KEY (generation_id, message_id)
-);
-CREATE INDEX IF NOT EXISTS idx_pending_available
-    ON pending_embeddings(generation_id, message_id) WHERE claimed_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_pending_claims
-    ON pending_embeddings(claimed_at) WHERE claimed_at IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS embed_runs (
     id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

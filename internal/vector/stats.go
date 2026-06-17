@@ -26,10 +26,12 @@ type StatsView struct {
 	// Omitted entirely when no build is running.
 	BuildingGeneration *BuildingSummary `json:"building_generation,omitempty"`
 
-	// PendingEmbeddingsTotal is the sum of pending_embeddings rows
-	// across the active and building generations. Retired generations
-	// are assumed to have zero pending items.
-	PendingEmbeddingsTotal int64 `json:"pending_embeddings_total"`
+	// MissingEmbeddingsTotal is the sum, across the active and building
+	// generations, of live messages still needing embedding for that
+	// generation (embed_gen <> gen), computed from the main DB rather than
+	// a queue table. Retired generations contribute zero. Replaces the
+	// former pending_embeddings_total under the scan-and-fill design.
+	MissingEmbeddingsTotal int64 `json:"missing_embeddings_total"`
 }
 
 // GenerationSummary reports the serving state for the active index
@@ -98,7 +100,7 @@ func CollectStats(ctx context.Context, b Backend) (*StatsView, error) {
 				MessageCount: s.EmbeddingCount,
 				ActivatedAt:  formatTimePtr(active.ActivatedAt),
 			}
-			out.PendingEmbeddingsTotal += s.PendingCount
+			out.MissingEmbeddingsTotal += s.PendingCount
 		}
 	case errors.Is(err, ErrNoActiveGeneration):
 		// Leave ActiveGeneration nil; this is normal during first build.
@@ -124,7 +126,7 @@ func CollectStats(ctx context.Context, b Backend) (*StatsView, error) {
 					Total: s.EmbeddingCount + s.PendingCount,
 				},
 			}
-			out.PendingEmbeddingsTotal += s.PendingCount
+			out.MissingEmbeddingsTotal += s.PendingCount
 		}
 	}
 	return out, errors.Join(errs...)

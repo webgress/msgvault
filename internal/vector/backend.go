@@ -123,8 +123,13 @@ type Hit struct {
 // Stats reports the size of one generation (or 0 for totals).
 type Stats struct {
 	EmbeddingCount int64
-	PendingCount   int64
-	StorageBytes   int64
+	// PendingCount, under the scan-and-fill design, is the number of live
+	// messages still needing embedding for this generation (embed_gen <>
+	// gen), computed from the main DB rather than a queue table. It is 0
+	// for the aggregate (gen == 0) path. The name is retained for API
+	// stability; semantically it is now a "missing" count.
+	PendingCount int64
+	StorageBytes int64
 }
 
 // Backend is the minimum contract a vector store must implement.
@@ -170,16 +175,10 @@ type Backend interface {
 	Delete(ctx context.Context, gen GenerationID, messageIDs []int64) error
 	Stats(ctx context.Context, gen GenerationID) (Stats, error)
 
-	// EnsureSeeded guarantees that the building generation gen has had
-	// its initial pending_embeddings seed pass committed. If a prior
-	// CreateGeneration crashed between inserting the building row and
-	// committing the seed, the queue would be empty and a naive resume
-	// could "drain" zero rows and activate an unseeded index.
-	// EnsureSeeded re-runs the seed (idempotent — INSERT OR IGNORE) and
-	// stamps seeded_at when it commits. Call this on the resume path
-	// before draining the queue. Returns ErrUnknownGeneration if gen no
-	// longer exists in the index, and an error if gen is not in the
-	// `building` state.
+	// EnsureSeeded is a no-op under the scan-and-fill design: there is no
+	// separate pending_embeddings seed pass to re-run — the embed worker
+	// discovers work by scanning messages.embed_gen. Retained on the
+	// interface for compatibility with the resume paths that still call it.
 	EnsureSeeded(ctx context.Context, gen GenerationID) error
 
 	// LoadVector returns the embedding for a specific message in the
