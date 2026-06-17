@@ -26,9 +26,9 @@ var embeddingsResumeCmd = &cobra.Command{
 	Use:   "resume",
 	Short: "Resume or top up the current vector embedding generation",
 	Long: `Resume or top up the current vector embedding generation.
-If a matching generation is building, this drains its pending queue and
-activates it when complete. Otherwise it embeds pending rows for the
-active generation.`,
+If a matching generation is building, this embeds any messages still
+needing embedding for it and activates it when complete. Otherwise it
+embeds any messages still needing embedding for the active generation.`,
 	RunE: runEmbeddingsResume,
 }
 var embeddingsListCmd = &cobra.Command{
@@ -56,9 +56,10 @@ func newEmbeddingsBuildCmd(use string) *cobra.Command {
 		Short: "Build or update the vector embedding index (incremental by default; --full-rebuild for a new generation)",
 		Long: `Build or update the vector embedding index for hybrid search.
 Writes vectors to the co-located vectors.db. In the default incremental
-mode, the command drains any pending rows in the active generation. With
---full-rebuild, it creates a new building generation, embeds the entire
-corpus, and (on a clean completion) atomically activates it.
+mode, the command embeds any messages still needing embedding for the
+active generation. With --full-rebuild, it creates a new building
+generation, embeds the entire corpus, and (on a clean completion)
+atomically activates it.
 
 Requires [vector] to be enabled in config.toml and [vector.embeddings]
 to point at a running OpenAI-compatible endpoint.`,
@@ -98,7 +99,7 @@ func init() {
 	embeddingsRetireCmd.Flags().BoolVar(&embeddingsRetireYes, "yes", false, "Skip confirmation prompt")
 	embeddingsRetireCmd.Flags().BoolVar(&embeddingsRetireForceActive, "force-active", false, "Allow retiring the active generation")
 	embeddingsActivateCmd.Flags().BoolVar(&embeddingsActivateYes, "yes", false, "Skip confirmation prompt")
-	embeddingsActivateCmd.Flags().BoolVar(&embeddingsActivateForce, "force", false, "Allow activation with pending rows or a fingerprint mismatch")
+	embeddingsActivateCmd.Flags().BoolVar(&embeddingsActivateForce, "force", false, "Allow activation while messages still need embedding, or with a fingerprint mismatch")
 	embeddingsCmd.AddCommand(embeddingsBuildCmd)
 	embeddingsCmd.AddCommand(embeddingsResumeCmd)
 	embeddingsCmd.AddCommand(embeddingsListCmd)

@@ -29,8 +29,9 @@ var _ EmbedRunner = (*embed.Worker)(nil)
 
 // EmbedJob runs the vector-embedding worker. Each invocation prefers
 // an in-flight rebuild for the configured fingerprint over the
-// existing active generation, drains its queue via RunOnce, and
-// activates it once pending hits zero. This mirrors the CLI
+// existing active generation, embeds its outstanding messages via
+// RunOnce, and activates once coverage is complete (no live message
+// still needs embedding). This mirrors the CLI
 // (cmd/msgvault/cmd/embed_vector.go pickEmbedGeneration) so a
 // daemon-only deployment can complete a `--full-rebuild` started by
 // the operator. Without the building-first preference, a daemon

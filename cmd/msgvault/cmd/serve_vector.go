@@ -16,16 +16,16 @@ import (
 	"go.kenn.io/msgvault/internal/vector/sqlitevec"
 )
 
-// setupVectorFeatures builds the vector backend, hybrid engine, embed
-// worker, and enqueuer used by the serve daemon and the MCP command. The
-// backend is dialect-selected from mainPath: a postgres:// DSN uses the
-// pgvector backend sharing mainDB (no separate vectors.db, no ATTACH);
+// setupVectorFeatures builds the vector backend, hybrid engine, and embed
+// worker used by the serve daemon and the MCP command. The backend is
+// dialect-selected from mainPath: a postgres:// DSN uses the pgvector
+// backend sharing mainStore's DB (no separate vectors.db, no ATTACH);
 // otherwise the sqlitevec backend opens/attaches vectors.db. Returns
 // (nil, nil) when cfg.Vector.Enabled is false. The returned Close function
 // must be called on shutdown.
 //
-// mainDB is the already-opened handle to the main database. On SQLite,
-// mainPath is the msgvault.db filesystem path FusedSearch uses to ATTACH
+// mainStore is the already-opened main-database store. On SQLite, mainPath
+// is the msgvault.db filesystem path FusedSearch uses to ATTACH
 // vectors.db; on PostgreSQL it is the DSN, used only for dialect detection
 // (store.IsPostgresURL).
 //
@@ -43,11 +43,10 @@ func setupVectorFeatures(ctx context.Context, mainStore *store.Store, mainPath s
 	}
 	mainDB := mainStore.DB()
 
-	// Resolve the dialect once from the main DSN. The queue, worker, and
-	// enqueuer are dialect-portable via Rebind / InsertOrIgnore, so the
-	// serve daemon and MCP run vector features on PostgreSQL the same way
-	// `msgvault embed` does. SQLite's Rebind / InsertOrIgnore are identity
-	// so the SQLite path is unchanged.
+	// Resolve the dialect once from the main DSN. The worker is
+	// dialect-portable via Rebind, so the serve daemon and MCP run vector
+	// features on PostgreSQL the same way `msgvault embed` does. SQLite's
+	// Rebind is identity so the SQLite path is unchanged.
 	var dialect store.Dialect = &store.SQLiteDialect{}
 	if store.IsPostgresURL(mainPath) {
 		dialect = &store.PostgreSQLDialect{}
