@@ -201,8 +201,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		embedJob := &scheduler.EmbedJob{
 			Worker:      vf.Worker,
 			Backend:     vf.Backend,
-			VectorsDB:   vf.VectorsDB,
-			Rebind:      vf.Rebind,
+			Store:       s,
 			Fingerprint: vf.Cfg.GenerationFingerprint(),
 			Log:         logger,
 		}
