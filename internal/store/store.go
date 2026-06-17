@@ -737,6 +737,21 @@ func (s *Store) InitSchema() error {
 		return fmt.Errorf("ensure FTS index: %w", err)
 	}
 
+	// Create the partial index over messages still needing embedding. Must
+	// run AFTER the embed_gen ADD COLUMN migration above — a legacy DB whose
+	// messages table predates embed_gen would fail this index on the missing
+	// column if it lived in schema.sql. The partial form (WHERE embed_gen IS
+	// NULL) and IF NOT EXISTS are portable across SQLite (3.8+) and
+	// PostgreSQL. Run under runMaintenance so the build over a populated
+	// messages table cannot trip the pool-wide statement_timeout on PG.
+	if err := s.runMaintenance(context.Background(), func(ctx context.Context, tx *loggedTx) error {
+		_, err := tx.ExecContext(ctx,
+			`CREATE INDEX IF NOT EXISTS idx_messages_embed_gen ON messages(embed_gen) WHERE embed_gen IS NULL`)
+		return err
+	}); err != nil {
+		return fmt.Errorf("create idx_messages_embed_gen: %w", err)
+	}
+
 	// Load the optional FTS schema, if the dialect keeps one separate.
 	// PostgreSQL returns "" here because its tsvector lives in the main schema.
 	if ftsFile := s.dialect.SchemaFTS(); ftsFile != "" {
