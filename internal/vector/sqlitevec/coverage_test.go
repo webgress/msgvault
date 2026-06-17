@@ -123,3 +123,98 @@ func TestCoverageSplit_EmbeddedBlankMissing(t *testing.T) {
 	assert.Equal(live, embedded+blank+missingCount,
 		"invariant: live == embedded + blank + missing")
 }
+
+// TestCoverageSplit_NonLiveEmbeddedHoldsInvariant proves the coverage
+// invariant survives a message that was EMBEDDED for the generation and
+// then went non-live (soft-deleted). Backend.Delete has no production
+// callers, so the embedding row survives the soft-delete; an unfiltered
+// EmbeddedMessageCount would then count the dead message, making
+// embedded > stamped (stamped is live-only), driving blank negative
+// (clamped to 0) and breaking live == embedded + blank + missing — with
+// EMBEDDED able to exceed LIVE.
+//
+// With the live-intersected count the dead message drops out of embedded,
+// so embedded <= stamped <= live, blank >= 0, and the invariant holds.
+func TestCoverageSplit_NonLiveEmbeddedHoldsInvariant(t *testing.T) {
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	ctx := context.Background()
+
+	st := testutil.NewTestStore(t)
+	b, err := Open(ctx, Options{
+		Path:      filepath.Join(t.TempDir(), "vectors.db"),
+		Dimension: 8,
+		MainDB:    st.DB(),
+	})
+	require.NoError(err, "Open backend")
+	t.Cleanup(func() { _ = b.Close() })
+
+	source, err := st.GetOrCreateSource("gmail", "me@example.com")
+	require.NoError(err, "GetOrCreateSource")
+	convID, err := st.EnsureConversationWithType(source.ID, "conv-1", "email_thread", "Subject")
+	require.NoError(err, "EnsureConversationWithType")
+
+	makeMsg := func(srcMsgID string) int64 {
+		m := &store.Message{
+			SourceID:        source.ID,
+			SourceMessageID: srcMsgID,
+			ConversationID:  convID,
+			MessageType:     "email",
+			Subject:         sql.NullString{String: "s-" + srcMsgID, Valid: true},
+		}
+		id, err := st.UpsertMessage(m)
+		require.NoErrorf(err, "UpsertMessage %s", srcMsgID)
+		return id
+	}
+	embeddedA := makeMsg("emb-a")
+	embeddedB := makeMsg("emb-b")
+	missing := makeMsg("missing")
+
+	gen, err := b.CreateGeneration(ctx, "test-model", 8, "fp")
+	require.NoError(err, "CreateGeneration")
+
+	vec := func(seed float32) []float32 {
+		v := make([]float32, 8)
+		v[0] = seed
+		return v
+	}
+	require.NoError(b.Upsert(ctx, gen, []vector.Chunk{
+		{MessageID: embeddedA, Vector: vec(1)},
+		{MessageID: embeddedB, Vector: vec(2)},
+	}), "Upsert embedded vectors")
+	require.NoError(st.SetEmbedGen(ctx, []int64{embeddedA, embeddedB}, int64(gen)), "stamp embedded")
+	_ = missing
+
+	// Sanity before the soft-delete: both embedded messages are live.
+	embeddedBefore, err := b.EmbeddedMessageCount(ctx, gen)
+	require.NoError(err, "EmbeddedMessageCount before")
+	assert.Equal(int64(2), embeddedBefore, "two live embedded before soft-delete")
+
+	// Soft-delete one EMBEDDED message (deleted_from_source_at) — its
+	// embedding row stays behind, but it is no longer a live message.
+	_, err = st.DB().Exec(
+		st.Rebind("UPDATE messages SET deleted_from_source_at = CURRENT_TIMESTAMP WHERE id = ?"),
+		embeddedA)
+	require.NoError(err, "soft-delete embeddedA")
+
+	// Compute the split exactly as the CLI does.
+	live, stamped, _, missingCount, err := st.CoverageCounts(ctx, int64(gen))
+	require.NoError(err, "CoverageCounts")
+	embedded, err := b.EmbeddedMessageCount(ctx, gen)
+	require.NoError(err, "EmbeddedMessageCount after")
+	blank := stamped - embedded
+	if blank < 0 {
+		blank = 0
+	}
+
+	// The dead message must NOT be counted as embedded.
+	assert.Equal(int64(1), embedded, "non-live embedded message excluded")
+	assert.LessOrEqual(embedded, live, "embedded <= live")
+	assert.LessOrEqual(embedded, stamped, "embedded <= stamped")
+	assert.GreaterOrEqual(blank, int64(0), "blank >= 0")
+	// live = 2 (embeddedB live-embedded + missing live-unstamped).
+	assert.Equal(int64(2), live, "live excludes the soft-deleted message")
+	// The load-bearing invariant survives the non-live embedded row.
+	assert.Equal(live, embedded+blank+missingCount,
+		"invariant: live == embedded + blank + missing")
+}

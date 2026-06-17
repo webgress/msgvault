@@ -431,6 +431,71 @@ func TestWorker_Downshift_AllDropNoSilentDelete(t *testing.T) {
 	assertpkg.Equal(t, 4, countMissing(t, f.MainDB, int64(f.BuildingGen)), "nothing stamped")
 }
 
+// TestWorker_Downshift_Non4xxDoesNotStrandStraggler proves the watermark
+// is NOT advanced past an unstamped straggler when a downshift hits a
+// NON-4xx (transient) error AFTER an earlier singleton already stamped.
+//
+// Setup: a 3-message batch 4xxs as a whole (triggering the downshift to
+// BatchSize=1); then singleton id 1 embeds (and is stamped) while singleton
+// id 2 returns a NON-4xx error. The old code advanced the watermark to
+// batchMax (3), so subsequent RunOnce scans (id > 3) would skip ids 2 and 3
+// forever — only the MANUAL-only backstop could recover them. The fix
+// advances only to the highest contiguously-stamped id (1).
+//
+// Asserts: (a) the persisted watermark is 1, not 3; (b) ids 2 and 3 are
+// still missing; (c) a subsequent RunOnce with a healthy embedder (NO
+// backstop) re-finds and embeds them, reaching zero coverage.
+func TestWorker_Downshift_Non4xxDoesNotStrandStraggler(t *testing.T) {
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	f := newWorkerFixture(t, 3)
+
+	// First pass: whole batch 4xxs (forces downshift); singleton id 1
+	// embeds; singleton id 2 returns a transient (NON-4xx) error.
+	f.FakeClient.OnEmbed = func(inputs []string) ([][]float32, error) {
+		if len(inputs) > 1 {
+			// Whole-batch call — force the downshift.
+			return nil, fmt.Errorf("embed: HTTP 400: batch too long: %w", ErrPermanent4xx)
+		}
+		// Singleton. Message 2's preprocessed text contains "body 2".
+		if strings.Contains(inputs[0], "body 2") {
+			// Transient error — NOT a 4xx. Must leave id 2 unstamped and
+			// must not let the watermark jump past it.
+			return nil, fmt.Errorf("simulated transient embed failure for msg 2")
+		}
+		v := make([]float32, f.FakeClient.dim)
+		v[0] = 1
+		return [][]float32{v}, nil
+	}
+	w := NewWorker(WorkerDeps{
+		Backend:                f.Backend,
+		VectorsDB:              f.VectorsDB,
+		MainDB:                 f.MainDB,
+		Store:                  f.Store,
+		Client:                 f.FakeClient,
+		BatchSize:              3,
+		MaxConsecutiveFailures: 5,
+	})
+	_, err := w.RunOnce(context.Background(), f.BuildingGen)
+	require.Error(err, "expected a transient drain error")
+
+	// (a) Watermark must stay at the contiguously-stamped id (1), NOT
+	// batchMax (3).
+	assert.Equal(int64(1), readWatermark(t, f.VectorsDB, int64(f.BuildingGen)),
+		"watermark not advanced past the unstamped straggler")
+	// (b) ids 2 and 3 are still unstamped (1 is stamped).
+	assert.Equal(2, countMissing(t, f.MainDB, int64(f.BuildingGen)), "stragglers still missing")
+
+	// (c) A subsequent RunOnce (NO backstop) with a healthy embedder
+	// re-finds the stragglers (scan id > watermark==1) and embeds them.
+	f.FakeClient.OnEmbed = nil // restore default healthy behavior
+	res, err := w.RunOnce(context.Background(), f.BuildingGen)
+	require.NoError(err, "second RunOnce")
+	assert.Equal(2, res.Succeeded, "stragglers embedded on retry")
+	assert.Equal(0, countMissing(t, f.MainDB, int64(f.BuildingGen)),
+		"coverage complete without the manual backstop")
+}
+
 // --- embed_runs lifecycle ---
 
 // TestWorker_EmbedRunLifecycle: a successful RunOnce opens exactly one

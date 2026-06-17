@@ -296,7 +296,7 @@ func (w *Worker) run(ctx context.Context, gen vector.GenerationID, backstop bool
 				// unstamped (endpoint-wide failure can't be ruled out).
 				w.deps.Log.Info("embed: downshifting to BatchSize=1 to drain failing batch",
 					"gen", gen, "batch_size", len(ids))
-				embedded, stamped, drainErr := w.downshiftDrain(ctx, gen, ids, &res, &completedRows)
+				embedded, stamped, safeAdvanceID, drainErr := w.downshiftDrain(ctx, gen, ids, &res, &completedRows)
 				res.Succeeded += embedded
 				if drainErr != nil {
 					w.deps.Log.Info("embed: downshift drain returned error",
@@ -308,15 +308,24 @@ func (w *Worker) run(ctx context.Context, gen vector.GenerationID, backstop bool
 						"embedded", embedded, "stamped", stamped)
 				}
 
-				// Forward progress resets the cap and advances the cursor:
-				// stamped rows (embedded or message-specific drops) will not
-				// be re-found, so skipping the covered prefix is safe.
+				// Forward progress resets the cap and advances the cursor —
+				// but ONLY past rows that are actually stamped. On a clean
+				// drain every id is resolved (embedded, skip-marked, or a
+				// message-specific 4xx drop) so safeAdvanceID == batchMax and
+				// behavior is unchanged. On a NON-4xx (transient) drain error
+				// an EARLIER singleton may have stamped while a LATER one was
+				// left unstamped; safeAdvanceID is the highest CONTIGUOUSLY
+				// stamped id before the failure, so the watermark never jumps
+				// past the unstamped straggler and the next RunOnce re-finds
+				// and retries it (idempotent). Without this, the watermark
+				// would advance to batchMax and the straggler would be
+				// stranded — the only recovery is the MANUAL-only backstop.
 				if embedded > 0 {
 					consecutiveFailures = 0
 				}
-				if stamped > 0 {
-					afterID = batchMax
-					w.advanceWatermark(ctx, gen, batchMax, backstop)
+				if safeAdvanceID > afterID {
+					afterID = safeAdvanceID
+					w.advanceWatermark(ctx, gen, safeAdvanceID, backstop)
 				}
 
 				if drainErr != nil {
@@ -699,6 +708,16 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 //     confirmed message-specific drops). When this is > 0 the caller may
 //     advance the scan cursor; when it is 0 the deferred ids are left
 //     unstamped and the cursor must not advance.
+//   - safeAdvanceID: the highest scanned id the caller may advance the
+//     watermark past WITHOUT stranding an unstamped row. On a clean drain
+//     every id is resolved (stamped or message-specific drop) so this is
+//     the batch's max id. On a NON-4xx error return it is the highest
+//     CONTIGUOUSLY-stamped id reached before the failure — so the watermark
+//     does not jump past a later unstamped straggler that a transient fault
+//     left behind. The next RunOnce re-finds the straggler (id >
+//     safeAdvanceID) and retries it idempotently; the failure cap still
+//     bounds repeated transient failures. (On the all-drop 4xx return
+//     nothing is stamped so this stays 0.)
 //   - err: nil on a clean drain; ErrPermanent4xx (wrapped) when every
 //     singleton 4xx'd with no embeds (deferred ids left unstamped);
 //     ErrGenerationRetired (wrapped) when the generation was retired
@@ -710,14 +729,21 @@ func (w *Worker) downshiftDrain(
 	ids []int64,
 	res *RunResult,
 	completedRows *int,
-) (embedded int, stamped int, err error) {
+) (embedded int, stamped int, safeAdvanceID int64, err error) {
 	var deferredDrops []int64
 	var lastDeferredErr error
+	// contiguousStampedID tracks the highest id with an unbroken
+	// stamped-from-the-start prefix. The first time an id is left unresolved
+	// (a deferred 4xx, or a non-4xx error return) brokeContiguity latches
+	// and we stop advancing it — everything from that id on is unsafe to
+	// skip past.
+	var contiguousStampedID int64
+	brokeContiguity := false
 
 	for _, id := range ids {
 		select {
 		case <-ctx.Done():
-			return embedded, stamped, ctx.Err()
+			return embedded, stamped, contiguousStampedID, ctx.Err()
 		default:
 		}
 
@@ -725,12 +751,19 @@ func (w *Worker) downshiftDrain(
 		eb, e := w.embedBatch(ctx, []int64{id})
 		if e != nil {
 			if errors.Is(e, ErrPermanent4xx) {
-				// Defer the drop decision. See function-level comment.
+				// Defer the drop decision. See function-level comment. A
+				// deferred id breaks the contiguous-stamped prefix: even if it
+				// is stamped at end-of-drain, the watermark must not skip past
+				// it on an error return.
 				deferredDrops = append(deferredDrops, id)
 				lastDeferredErr = e
+				brokeContiguity = true
 				continue
 			}
-			return embedded, stamped, e
+			// Non-4xx (transient) error: this id is left UNSTAMPED. Return the
+			// contiguous-stamped id so the caller does not advance the
+			// watermark past it; the next RunOnce re-finds it.
+			return embedded, stamped, contiguousStampedID, e
 		}
 		if len(eb.chunks) == 0 {
 			// Missing/empty singleton — skip-mark it.
@@ -738,11 +771,14 @@ func (w *Worker) downshiftDrain(
 			if len(skip) > 0 {
 				if serr := w.deps.Store.SetEmbedGen(ctx, skip, int64(gen)); serr != nil {
 					res.Failed += len(skip)
-					return embedded, stamped, fmt.Errorf("stamp skip: %w", serr)
+					return embedded, stamped, contiguousStampedID, fmt.Errorf("stamp skip: %w", serr)
 				}
 				stamped += len(skip)
 				*completedRows += len(skip)
 				w.reportProgress(*completedRows, len(skip), 0, time.Since(batchStart))
+			}
+			if !brokeContiguity {
+				contiguousStampedID = id
 			}
 			continue
 		}
@@ -752,17 +788,20 @@ func (w *Worker) downshiftDrain(
 				// benign sentinel; remaining singletons would observe the same
 				// state. Do not stamp (the gen is going away).
 				w.deps.Log.Info("embed: generation retired mid-drain; stopping", "gen", gen, "id", id)
-				return embedded, stamped, fmt.Errorf("upsert: %w", uerr)
+				return embedded, stamped, contiguousStampedID, fmt.Errorf("upsert: %w", uerr)
 			}
-			return embedded, stamped, fmt.Errorf("upsert: %w", uerr)
+			return embedded, stamped, contiguousStampedID, fmt.Errorf("upsert: %w", uerr)
 		}
 		if serr := w.deps.Store.SetEmbedGen(ctx, eb.embeddedIDs, int64(gen)); serr != nil {
-			return embedded, stamped, fmt.Errorf("stamp embed_gen: %w", serr)
+			return embedded, stamped, contiguousStampedID, fmt.Errorf("stamp embed_gen: %w", serr)
 		}
 		res.Truncated += eb.truncated
 		embedded += len(eb.embeddedIDs)
 		stamped += len(eb.embeddedIDs)
 		*completedRows += len(eb.embeddedIDs)
+		if !brokeContiguity {
+			contiguousStampedID = id
+		}
 		batchChars := 0
 		for _, c := range eb.chunks {
 			batchChars += c.SourceCharLen
@@ -770,9 +809,14 @@ func (w *Worker) downshiftDrain(
 		w.reportProgress(*completedRows, len(eb.embeddedIDs), batchChars, time.Since(batchStart))
 	}
 
-	// Drain finished. Decide deferred-drop fate.
+	// Drain finished cleanly: every id is resolved (stamped, skip-marked, or
+	// a deferred 4xx about to be stamped below), so the whole scanned batch
+	// is safe to advance past.
+	safeAdvanceID = ids[len(ids)-1]
+
+	// Decide deferred-drop fate.
 	if len(deferredDrops) == 0 {
-		return embedded, stamped, nil
+		return embedded, stamped, safeAdvanceID, nil
 	}
 	if embedded > 0 {
 		// Endpoint works for some messages, so the 4xxs are
@@ -785,12 +829,15 @@ func (w *Worker) downshiftDrain(
 		dropStart := time.Now()
 		if serr := w.deps.Store.SetEmbedGen(ctx, deferredDrops, int64(gen)); serr != nil {
 			res.Failed += len(deferredDrops)
-			return embedded, stamped, fmt.Errorf("stamp drop: %w", serr)
+			// Some deferred drops are now unstamped; do not advance past the
+			// contiguous-stamped prefix.
+			return embedded, stamped, contiguousStampedID, fmt.Errorf("stamp drop: %w", serr)
 		}
 		stamped += len(deferredDrops)
 		*completedRows += len(deferredDrops)
 		w.reportProgress(*completedRows, len(deferredDrops), 0, time.Since(dropStart))
-		return embedded, stamped, nil
+		// All deferred drops are now stamped; the entire batch is resolved.
+		return embedded, stamped, safeAdvanceID, nil
 	}
 	// embedded == 0. We can't distinguish endpoint-wide failure from a
 	// batch where every message just happened to be unembeddable. Leave
@@ -798,8 +845,10 @@ func (w *Worker) downshiftDrain(
 	// silently drop work, and return the wrapped 4xx so the caller
 	// surfaces it. The unstamped ids are re-found on the next scan; if the
 	// underlying problem persists, the consecutive-failure cap eventually
-	// trips with the same 4xx body.
-	return embedded, stamped, fmt.Errorf("downshift all-drop: every singleton returned non-retryable 4xx (left %d row(s) unstamped): %w",
+	// trips with the same 4xx body. Advance only past the contiguous
+	// stamped prefix (the leading missing/empty skips, if any) so the
+	// unstamped deferred ids are not skipped.
+	return embedded, stamped, contiguousStampedID, fmt.Errorf("downshift all-drop: every singleton returned non-retryable 4xx (left %d row(s) unstamped): %w",
 		len(deferredDrops), lastDeferredErr)
 }
 

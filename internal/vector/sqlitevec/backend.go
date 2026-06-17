@@ -1273,18 +1273,78 @@ func (b *Backend) Stats(ctx context.Context, gen vector.GenerationID) (vector.St
 	return s, nil
 }
 
-// EmbeddedMessageCount returns COUNT(DISTINCT message_id) over the
-// embeddings table for gen — the number of live-or-not messages that
-// actually have at least one vector for the generation. Used by the
-// coverage readout to split stamped messages into embedded vs blank.
-// Counts distinct messages (not chunk rows) so a long, multi-chunk
-// message counts once, matching the EmbeddingCount semantic elsewhere.
+// EmbeddedMessageCount returns the number of LIVE messages that are
+// stamped for gen (embed_gen = gen) AND actually have at least one vector
+// for the generation. Used by the coverage readout to split stamped
+// messages into embedded vs blank. Counts distinct messages (not chunk
+// rows) so a long, multi-chunk message counts once, matching the
+// EmbeddingCount semantic elsewhere.
+//
+// The liveness + stamped filter is REQUIRED for the coverage invariant
+// live == embedded + blank + missing to hold. A non-live message
+// (soft-deleted via deleted_at / deleted_from_source_at, or a dedup
+// loser) keeps its embedding rows — Backend.Delete has no production
+// callers — so an unfiltered COUNT(DISTINCT message_id) over the
+// embeddings table can exceed stamped (which is live-only), driving
+// blank = stamped - embedded negative (clamped to 0) and breaking the
+// invariant (EMBEDDED could display larger than LIVE).
+//
+// Cross-DB on SQLite: embeddings live in vectors.db (b.db) while messages
+// + embed_gen live in main.db (b.mainDB), two separate *sql.DB handles, so
+// this cannot be a single JOIN. ATTACH is not used because it does not
+// persist reliably across database/sql pooled connections. Instead we
+// mirror the established cross-DB pattern (see dropDeletedFromSource):
+// pull the distinct embedded message ids from vectors.db, then intersect
+// them against the live+stamped set in main.db via json_each. A nil
+// mainDB (management commands that opened the backend without the main
+// handle) falls back to the unfiltered vectors.db count.
 func (b *Backend) EmbeddedMessageCount(ctx context.Context, gen vector.GenerationID) (int64, error) {
+	if b.mainDB == nil {
+		var n int64
+		if err := b.db.QueryRowContext(ctx,
+			`SELECT COUNT(DISTINCT message_id) FROM embeddings WHERE generation_id = ?`,
+			int64(gen)).Scan(&n); err != nil {
+			return 0, fmt.Errorf("count embedded messages: %w", err)
+		}
+		return n, nil
+	}
+
+	// Step 1 (vectors.db): distinct message ids with >=1 vector for gen.
+	rows, err := b.db.QueryContext(ctx,
+		`SELECT DISTINCT message_id FROM embeddings WHERE generation_id = ?`,
+		int64(gen))
+	if err != nil {
+		return 0, fmt.Errorf("list embedded message ids: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return 0, fmt.Errorf("scan embedded message id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterate embedded message ids: %w", err)
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+
+	// Step 2 (main.db): how many of those are live AND stamped for gen.
+	blob, err := json.Marshal(ids)
+	if err != nil {
+		return 0, fmt.Errorf("encode embedded ids: %w", err)
+	}
 	var n int64
-	if err := b.db.QueryRowContext(ctx,
-		`SELECT COUNT(DISTINCT message_id) FROM embeddings WHERE generation_id = ?`,
-		int64(gen)).Scan(&n); err != nil {
-		return 0, fmt.Errorf("count embedded messages: %w", err)
+	if err := b.mainDB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM messages
+		  WHERE id IN (SELECT value FROM json_each(?))
+		    AND embed_gen = ?
+		    AND `+store.LiveMessagesWhere("", true),
+		string(blob), int64(gen)).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count live embedded messages: %w", err)
 	}
 	return n, nil
 }

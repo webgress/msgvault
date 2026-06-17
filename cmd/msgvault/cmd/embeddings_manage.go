@@ -416,15 +416,28 @@ func openEmbeddingsBackend(ctx context.Context) (vector.Backend, func(), error) 
 		}
 		return nil, nil, fmt.Errorf("stat vectors.db: %w", err)
 	}
+	// On SQLite the messages table (and embed_gen) lives in the main DB,
+	// in a SEPARATE file from vectors.db. Backend methods that gate on
+	// live-message coverage — ActivateGeneration's hasMissingForGen, and
+	// the live-intersected EmbeddedMessageCount — dereference b.mainDB, so
+	// the management path must open and pass a main-DB handle just like
+	// embed_vector.go does. Omitting it leaves b.mainDB nil and panics on
+	// `msgvault embeddings activate`. Close it in the returned cleanup.
+	mainStore, err := store.Open(dsn)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open main db for embeddings backend: %w", err)
+	}
 	b, err := sqlitevec.Open(ctx, sqlitevec.Options{
 		Path:      vecPath,
 		MainPath:  dsn,
 		Dimension: cfg.Vector.Embeddings.Dimension,
+		MainDB:    mainStore.DB(),
 	})
 	if err != nil {
+		_ = mainStore.Close()
 		return nil, nil, fmt.Errorf("open vectors.db backend: %w", err)
 	}
-	return b, func() { _ = b.Close() }, nil
+	return b, func() { _ = b.Close(); _ = mainStore.Close() }, nil
 }
 
 func sqliteDSNWithBusyTimeout(path string) string {
