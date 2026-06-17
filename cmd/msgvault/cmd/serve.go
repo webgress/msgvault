@@ -520,9 +520,6 @@ func runScheduledGmailSync(ctx context.Context, email string, src *store.Source,
 	opts.AttachmentsDir = cfg.AttachmentsDir()
 
 	syncer := sync.New(client, s, opts).WithLogger(logger)
-	if vf != nil {
-		syncer.SetEmbedEnqueuer(vf.Enqueuer)
-	}
 
 	source, err := s.GetOrCreateSource(sourceTypeGmail, email)
 	if err != nil {
@@ -562,9 +559,6 @@ func runScheduledIMAPSync(ctx context.Context, src *store.Source, s *store.Store
 	opts.NoResume = true
 
 	syncer := sync.New(apiClient, s, opts).WithLogger(logger)
-	if vf != nil {
-		syncer.SetEmbedEnqueuer(vf.Enqueuer)
-	}
 
 	// runPostSourceCreateMigrations is keyed off Gmail-only legacy
 	// state, so it's a no-op for fresh IMAP installs; we still call it

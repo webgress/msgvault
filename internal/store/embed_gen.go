@@ -97,6 +97,34 @@ func (s *Store) SetEmbedGen(ctx context.Context, ids []int64, target int64) erro
 	return nil
 }
 
+// ResetEmbedGen clears embed_gen (sets it back to NULL) on the given
+// message ids, marking them as needing embedding again. Used by
+// repair-encoding after rewriting a message's text so the scan-and-fill
+// worker re-embeds it with the corrected content on its next run. Chunked
+// to stay under the driver's bind limit; idempotent.
+func (s *Store) ResetEmbedGen(ctx context.Context, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	for start := 0; start < len(ids); start += embedGenStampChunkRows {
+		end := min(start+embedGenStampChunkRows, len(ids))
+		chunk := ids[start:end]
+
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, len(chunk))
+		for i, id := range chunk {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		q := `UPDATE messages SET embed_gen = NULL WHERE id IN (` +
+			strings.Join(placeholders, ",") + `)`
+		if _, err := s.db.ExecContext(ctx, q, args...); err != nil {
+			return fmt.Errorf("reset embed_gen: %w", err)
+		}
+	}
+	return nil
+}
+
 // CoverageCounts reports embedding coverage for activeGen, computed from
 // the MAIN db (messages + embed_gen) so it is a single-DB query on both
 // backends and needs no access to the embeddings store.
