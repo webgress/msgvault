@@ -142,15 +142,12 @@ func setupVectorFeatures(ctx context.Context, mainStore *store.Store, mainPath s
 		Rebind: dialect.Rebind,
 	})
 
-	// The enqueuer drives sync-time enqueueing into pending_embeddings.
-	// On PG it must run on pgx (rebind ? → $N) and use ON CONFLICT DO
-	// NOTHING (insertOrIgnore) instead of SQLite's INSERT OR IGNORE.
-	enqueuer := embed.NewEnqueuer(vectorsDB, dialect.Rebind, dialect.InsertOrIgnore)
+	// No sync-time enqueue: newly-persisted messages get embed_gen = NULL
+	// by column default and the scan-and-fill worker picks them up.
 
 	return &vectorFeatures{
 		Backend:      backend,
 		HybridEngine: engine,
-		Enqueuer:     enqueuer,
 		Worker:       worker,
 		Cfg:          cfg.Vector,
 		VectorsDB:    vectorsDB,

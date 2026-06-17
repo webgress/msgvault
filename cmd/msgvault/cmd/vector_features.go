@@ -3,7 +3,6 @@ package cmd
 import (
 	"database/sql"
 
-	"go.kenn.io/msgvault/internal/sync"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/embed"
 	"go.kenn.io/msgvault/internal/vector/hybrid"
@@ -20,13 +19,12 @@ import (
 type vectorFeatures struct {
 	Backend      vector.Backend
 	HybridEngine *hybrid.Engine
-	Enqueuer     sync.EmbedEnqueuer
 	Worker       *embed.Worker
 	Cfg          vector.Config
-	// VectorsDB is the underlying vectors.db handle. The daemon's
-	// EmbedJob uses it to count pending_embeddings for the
-	// activation gate; other consumers should prefer the higher-
-	// level Backend abstraction.
+	// VectorsDB is the underlying vectors.db handle (vectors.db on
+	// SQLite, the shared main DB on PG). The daemon's EmbedJob uses it
+	// for the embed_runs/watermark tables; other consumers should prefer
+	// the higher-level Backend abstraction.
 	VectorsDB *sql.DB
 	// Rebind translates ?-placeholders to the driver's native form for
 	// raw queries run directly against VectorsDB (the daemon's EmbedJob
