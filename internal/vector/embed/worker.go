@@ -20,31 +20,38 @@ type EmbeddingClient interface {
 	Embed(ctx context.Context, inputs []string) ([][]float32, error)
 }
 
+// WorkStore is the subset of *store.Store the worker uses to find work
+// and stamp coverage against the MAIN db. Defined here (rather than
+// importing internal/store) to keep the embed package decoupled and the
+// worker easy to fake in tests, mirroring the func-injection style the
+// queue/enqueuer used. *store.Store satisfies this implicitly.
+type WorkStore interface {
+	// ScanForEmbedding returns up to limit live message ids needing work
+	// for target (embed_gen IS NULL OR embed_gen <> target), scanning
+	// forward from afterID in id order.
+	ScanForEmbedding(ctx context.Context, target int64, afterID int64, limit int) ([]int64, error)
+	// SetEmbedGen stamps embed_gen=target on ids (idempotent).
+	SetEmbedGen(ctx context.Context, ids []int64, target int64) error
+}
+
 // WorkerDeps bundles the collaborators a Worker needs. Backend, VectorsDB,
-// MainDB, and Client are required; the remaining fields have sensible
-// defaults when zero: BatchSize defaults to 32, StaleThreshold is
-// auto-derived from EmbedTimeout × EmbedMaxRetries with a 10-minute
-// floor (see NewWorker), MaxConsecutiveFailures defaults to 5, Log
-// defaults to slog.Default().
+// MainDB, Store, and Client are required; the remaining fields have
+// sensible defaults when zero: BatchSize defaults to 32,
+// MaxConsecutiveFailures defaults to 5, Log defaults to slog.Default().
 type WorkerDeps struct {
-	Backend        vector.Backend
-	VectorsDB      *sql.DB
-	MainDB         *sql.DB
-	Client         EmbeddingClient
-	Preprocess     PreprocessConfig
-	MaxInputChars  int
-	BatchSize      int
-	StaleThreshold time.Duration
-	// EmbedTimeout and EmbedMaxRetries inform the StaleThreshold
-	// auto-derivation: a single batch can legitimately stay claimed for
-	// up to Timeout × MaxRetries (MaxRetries is the embed.Client's
-	// total-attempts count, not retries-after-the-first) before the
-	// worker gives up, so reclaim must wait longer than that to avoid
-	// reclaiming live work. Both are read only when StaleThreshold is
-	// zero; EmbedMaxRetries=0 is normalized to 3 to match
-	// embed.NewClient's default — see derivedStaleThreshold.
-	EmbedTimeout    time.Duration
-	EmbedMaxRetries int
+	Backend vector.Backend
+	// VectorsDB is the generation-side DB handle (vectors.db on SQLite,
+	// the shared main DB on PG). Used for embed_runs and the watermark.
+	VectorsDB *sql.DB
+	// MainDB is the main msgvault.db handle (messages + bodies). Used by
+	// embedBatch's body-fetch query.
+	MainDB *sql.DB
+	// Store finds work and stamps coverage against MainDB. Required.
+	Store         WorkStore
+	Client        EmbeddingClient
+	Preprocess    PreprocessConfig
+	MaxInputChars int
+	BatchSize     int
 	// MaxConsecutiveFailures caps the number of consecutive batch
 	// failures (embed error or upsert error) before RunOnce gives up
 	// and returns an error. A successful batch resets the counter.
@@ -52,27 +59,27 @@ type WorkerDeps struct {
 	MaxConsecutiveFailures int
 	// Rebind translates ?-placeholders to the driver's native form.
 	// nil is treated as the identity (used by SQLite); pgvector callers
-	// must wire in (&store.PostgreSQLDialect{}).Rebind so the queue's
-	// IN-clause and UPDATE statements run on pgx.
+	// must wire in (&store.PostgreSQLDialect{}).Rebind so the embed_runs,
+	// watermark, and body-fetch statements run on pgx.
 	Rebind func(string) string
 	Log    *slog.Logger
-	// TotalPending is the queue depth at run start, used by a Progress
+	// TotalPending is the work depth at run start, used by a Progress
 	// callback (if any) to report percent done and ETA. Zero disables
 	// the denominator — Progress still fires but leaves ETA empty.
 	TotalPending int
-	// Progress, if non-nil, is called after queue rows are durably
-	// completed, whether they produced embeddings or were intentionally
-	// dropped as missing/empty/unembeddable. Done and BatchMsgs count
-	// completed queue rows so they can be compared to TotalPending.
-	// Callbacks run on the worker goroutine; rate-limit inside the
-	// callback if output is expensive.
+	// Progress, if non-nil, is called after a batch is durably handled,
+	// whether it produced embeddings or was intentionally skip-marked as
+	// missing/empty/unembeddable. Done and BatchMsgs count handled
+	// messages so they can be compared to TotalPending. Callbacks run on
+	// the worker goroutine; rate-limit inside the callback if output is
+	// expensive.
 	Progress func(ProgressReport)
 }
 
-// ProgressReport captures RunOnce progress after a set of queue rows
-// has been completed. Done and BatchMsgs count completed pending rows;
-// BatchChars counts source chars for rows that actually embedded.
-// BatchElapsed is end-to-end for that progress unit.
+// ProgressReport captures RunOnce progress after a set of messages has
+// been handled. Done and BatchMsgs count handled messages; BatchChars
+// counts source chars for messages that actually embedded. BatchElapsed
+// is end-to-end for that progress unit.
 type ProgressReport struct {
 	Done         int
 	TotalPending int
@@ -82,23 +89,22 @@ type ProgressReport struct {
 	RunElapsed   time.Duration
 }
 
-// Worker drives one building generation from claimed pending rows to
-// persisted embeddings. A single Worker is safe for sequential use; to
-// parallelize, construct multiple workers that share the same Backend
-// and DB handles.
+// Worker drives one generation from needs-work messages to persisted
+// embeddings via a scan-and-fill loop: it scans the main DB for messages
+// whose embed_gen does not match the target generation, embeds them,
+// upserts the vectors, then stamps embed_gen so they drop out of the next
+// scan. A single Worker is safe for sequential use.
 type Worker struct {
 	deps WorkerDeps
-	q    *Queue
+	wm   *Watermark
 	// rebind translates ?-placeholders to the driver's native form for
 	// queries the worker issues directly against MainDB (embedBatch's
-	// IN-clause). Resolved in NewWorker from WorkerDeps.Rebind; nil is
-	// normalized to the identity so the SQLite path is unchanged.
+	// IN-clause). nil is normalized to the identity.
 	rebind   func(string) string
 	runStart time.Time // valid only during a RunOnce call
 }
 
 // NewWorker constructs a Worker, applying defaults for BatchSize (32),
-// StaleThreshold (auto-derived; see derivedStaleThreshold),
 // MaxConsecutiveFailures (5), and Log (slog.Default()).
 func NewWorker(d WorkerDeps) *Worker {
 	if d.Log == nil {
@@ -107,9 +113,6 @@ func NewWorker(d WorkerDeps) *Worker {
 	if d.BatchSize == 0 {
 		d.BatchSize = 32
 	}
-	if d.StaleThreshold == 0 {
-		d.StaleThreshold = derivedStaleThreshold(d.EmbedTimeout, d.EmbedMaxRetries)
-	}
 	if d.MaxConsecutiveFailures == 0 {
 		d.MaxConsecutiveFailures = 5
 	}
@@ -117,45 +120,7 @@ func NewWorker(d WorkerDeps) *Worker {
 	if rebind == nil {
 		rebind = func(q string) string { return q }
 	}
-	return &Worker{deps: d, q: NewQueue(d.VectorsDB, rebind), rebind: rebind}
-}
-
-// derivedStaleThreshold picks a default StaleThreshold from the
-// embedder's per-request timeout and retry count, with a 10-minute
-// floor. A claim must outlive at least one full retry budget
-// (timeout × attempts) — anything less risks ReclaimStale pulling
-// rows out from under a still-running embed call, which would then
-// race a concurrent worker on the same batch and leave stale
-// Complete tokens. The 2× safety factor absorbs scheduler jitter
-// and pre/post-call overhead. The floor preserves the historical
-// default for the common case (Timeout=30s × 3 attempts = 3 minutes
-// derived; floor wins).
-//
-// maxRetries here matches embed.Client's MaxRetries semantics: it is
-// the TOTAL number of HTTP attempts (not retries-after-the-first).
-// A zero value is normalized to 3 to mirror embed.NewClient's
-// default. Without this, callers that set EmbedTimeout but leave
-// EmbedMaxRetries at its zero value would derive a budget for a
-// single attempt, while the client would actually try up to three
-// times — and ReclaimStale could pull live claims out from under a
-// retrying embed call.
-func derivedStaleThreshold(timeout time.Duration, maxRetries int) time.Duration {
-	const floor = 10 * time.Minute
-	if timeout <= 0 {
-		return floor
-	}
-	attempts := maxRetries
-	if attempts == 0 {
-		attempts = 3
-	}
-	if attempts < 1 {
-		attempts = 1
-	}
-	derived := 2 * timeout * time.Duration(attempts)
-	if derived < floor {
-		return floor
-	}
-	return derived
+	return &Worker{deps: d, wm: NewWatermark(d.VectorsDB, rebind), rebind: rebind}
 }
 
 // RunResult summarizes the outcome of RunOnce.
@@ -191,16 +156,11 @@ type inputChunk struct {
 	Trunc      bool
 }
 
-// ReclaimStale releases claims older than StaleThreshold so crashed
-// workers don't leave rows stuck. Call at startup before RunOnce.
-// Returns the number of rows reclaimed.
-func (w *Worker) ReclaimStale(ctx context.Context) (int, error) {
-	n, err := w.q.ReclaimStale(ctx, w.deps.StaleThreshold)
-	if err != nil {
-		return 0, fmt.Errorf("reclaim stale: %w", err)
-	}
-	return n, nil
-}
+// ReclaimStale is a no-op retained to satisfy the scheduler's EmbedRunner
+// interface. The scan-and-fill design has no claim leases to reclaim: a
+// crashed worker leaves messages simply unstamped (embed_gen unchanged),
+// and the next scan re-finds them. Always returns (0, nil).
+func (w *Worker) ReclaimStale(ctx context.Context) (int, error) { return 0, nil }
 
 // startEmbedRun inserts an embed_runs row and returns the new row's id.
 // A failure is non-fatal — run tracking is observability, not correctness.
@@ -240,15 +200,39 @@ func (w *Worker) finalizeEmbedRun(ctx context.Context, runID int64, res RunResul
 	}
 }
 
-// RunOnce drains the queue for the given generation until empty,
-// releasing claimed rows on embed or upsert error so another worker can
-// retry them. Returns when pending is empty or ctx is cancelled.
+// RunOnce scans the given generation for messages needing embedding and
+// fills them in, resuming the forward scan from the persisted per-gen
+// watermark. It returns when no needs-work messages remain (the scan
+// returns empty) or ctx is cancelled.
+//
+// Cross-DB ordering (SQLite): the find-work scan and the embed_gen stamp
+// run against MainDB while the embeddings upsert runs against VectorsDB,
+// so they cannot be one transaction. The worker orders the steps —
+// embeddings upsert FIRST, then stamp embed_gen — and relies on
+// idempotency: the upsert is keyed by (gen, msg, chunk), so a crash
+// between the two steps just re-does an idempotent batch on the next scan.
 //
 // Returns an error when consecutive batch failures reach
-// MaxConsecutiveFailures, so a persistently misconfigured embedder
-// (bad credentials, unreachable endpoint) surfaces quickly instead of
-// looping forever. A successful batch resets the failure counter.
+// MaxConsecutiveFailures, so a persistently misconfigured embedder (bad
+// credentials, unreachable endpoint) surfaces quickly instead of looping
+// forever. A successful batch resets the failure counter.
 func (w *Worker) RunOnce(ctx context.Context, gen vector.GenerationID) (res RunResult, retErr error) {
+	return w.run(ctx, gen, false)
+}
+
+// RunBackstop performs a full-scan pass that ignores the per-gen
+// watermark, driving coverage to zero even for sub-watermark stragglers
+// (a message that was unstamped but already swept past by the optimistic
+// watermark — e.g. dropped during a transient failure, or a legacy row
+// whose id sits below where a prior run advanced). It reuses the same
+// scan/embed/stamp path with the scan cursor pinned at 0. Idempotent:
+// already-covered rows are skipped by the scan predicate, so re-running it
+// is cheap once the corpus is embedded.
+func (w *Worker) RunBackstop(ctx context.Context, gen vector.GenerationID) (res RunResult, retErr error) {
+	return w.run(ctx, gen, true)
+}
+
+func (w *Worker) run(ctx context.Context, gen vector.GenerationID, backstop bool) (res RunResult, retErr error) {
 	consecutiveFailures := 0
 	var lastErr error
 	completedRows := 0
@@ -256,44 +240,48 @@ func (w *Worker) RunOnce(ctx context.Context, gen vector.GenerationID) (res RunR
 	runID := w.startEmbedRun(ctx, gen, w.runStart.Unix())
 	defer func() {
 		// Finalize on a context detached from the caller's cancellation so
-		// the embed_runs row is stamped (ended_at/counters/error) even when
-		// RunOnce exits because ctx was cancelled (Ctrl-C / SIGTERM /
-		// daemon shutdown). Running the close-out UPDATE on the cancelled
-		// ctx would short-circuit in database/sql and leave the row open
-		// forever, corrupting the "find in-flight/crashed runs" signal.
-		// A short timeout keeps shutdown from hanging on a wedged DB.
-		// Mirrors the query/duckdb.go cleanup convention.
+		// the embed_runs row is stamped even when RunOnce exits because ctx
+		// was cancelled. Running the close-out UPDATE on the cancelled ctx
+		// would short-circuit in database/sql and leave the row open
+		// forever. A short timeout keeps shutdown from hanging on a wedged DB.
 		fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		w.finalizeEmbedRun(fctx, runID, res, retErr, time.Now().Unix())
 	}()
-	// orphanDrainErr/orphanDrainCount preserve the latest orphan-drain
-	// failure across iterations so we can surface it on the empty-claim
-	// exit. Without this, a Complete() failure on orphan rows would be
-	// logged but invisible to the caller — and if those orphans were
-	// the last queue rows, the next Claim returns empty and RunOnce
-	// would falsely report a clean drain even though stuck claimed
-	// rows persist until ReclaimStale (~10 min later).
-	var orphanDrainErr error
-	var orphanDrainCount int
+
+	// Seed the forward-scan cursor. The backstop ignores the watermark and
+	// scans from the beginning so it catches sub-watermark stragglers.
+	var afterID int64
+	if !backstop {
+		wm, err := w.wm.GetWatermark(ctx, gen)
+		if err != nil {
+			// Non-fatal: a missing/unreadable watermark just restarts the
+			// scan from 0 (the scan predicate + idempotent upsert make this
+			// harmless). Log and continue.
+			w.deps.Log.Warn("embed: read watermark failed; scanning from start",
+				"gen", gen, "error", err)
+		} else {
+			afterID = wm
+		}
+	}
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return res, fmt.Errorf("RunOnce: %w", err)
 		}
 		batchStart := time.Now()
-		ids, token, err := w.q.Claim(ctx, gen, w.deps.BatchSize)
+		ids, err := w.deps.Store.ScanForEmbedding(ctx, int64(gen), afterID, w.deps.BatchSize)
 		if err != nil {
-			return res, fmt.Errorf("claim: %w", err)
+			return res, fmt.Errorf("scan for embedding: %w", err)
 		}
 		if len(ids) == 0 {
-			if orphanDrainErr != nil {
-				return res, fmt.Errorf(
-					"orphan-drain failed for %d row(s); they remain claimed and will be recovered by ReclaimStale on the next run: %w",
-					orphanDrainCount, orphanDrainErr)
-			}
 			return res, nil
 		}
 		res.Claimed += len(ids)
+		// batchMax is the highest id in this scan slice; once the batch is
+		// stamped these rows drop out of the predicate, but advancing the
+		// cursor past them avoids re-scanning the covered prefix.
+		batchMax := ids[len(ids)-1]
 
 		eb, err := w.embedBatch(ctx, ids)
 		if err != nil {
@@ -302,47 +290,40 @@ func (w *Worker) RunOnce(ctx context.Context, gen vector.GenerationID) (res RunR
 			w.deps.Log.Warn("embed batch failed", "gen", gen, "ids", len(ids), "error", err)
 
 			if errors.Is(err, ErrPermanent4xx) {
-				// Walk the claimed IDs one at a time. Drain decides
-				// per-ID whether to drop (if some embed, the 4xxs are
-				// message-specific) or release (if none embed,
-				// endpoint-wide failure can't be ruled out).
+				// Walk the scanned ids one at a time. Drain decides per-ID
+				// whether to stamp (it embedded, or is a confirmed
+				// message-specific 4xx given some sibling embedded) or leave
+				// unstamped (endpoint-wide failure can't be ruled out).
 				w.deps.Log.Info("embed: downshifting to BatchSize=1 to drain failing batch",
 					"gen", gen, "batch_size", len(ids))
-				embedded, dropped, drainErr := w.downshiftDrain(ctx, gen, token, ids, &res, &completedRows)
+				embedded, stamped, drainErr := w.downshiftDrain(ctx, gen, ids, &res, &completedRows)
 				res.Succeeded += embedded
 				if drainErr != nil {
 					w.deps.Log.Info("embed: downshift drain returned error",
 						"gen", gen, "batch_size", len(ids),
-						"embedded", embedded, "dropped", dropped,
-						"error", drainErr)
+						"embedded", embedded, "stamped", stamped, "error", drainErr)
 				} else {
 					w.deps.Log.Info("embed: downshift drain complete; resuming configured batch size",
 						"gen", gen, "batch_size", len(ids),
-						"embedded", embedded, "dropped", dropped)
+						"embedded", embedded, "stamped", stamped)
 				}
 
-				// Forward progress resets the cap. Same rule as the
-				// all-clean main-loop success path.
+				// Forward progress resets the cap and advances the cursor:
+				// stamped rows (embedded or message-specific drops) will not
+				// be re-found, so skipping the covered prefix is safe.
 				if embedded > 0 {
 					consecutiveFailures = 0
 				}
+				if stamped > 0 {
+					afterID = batchMax
+					w.advanceWatermark(ctx, gen, batchMax, backstop)
+				}
 
 				if drainErr != nil {
-					// Distinguish "drain confirms upstream 4xx"
-					// (every singleton returned the same
-					// ErrPermanent4xx — same failure as the upstream
-					// batch, already counted) from "drain hit an
-					// independent error" (transient-after-retries,
-					// upsert/complete failure, ctx cancel — a fresh
-					// failure that should fail this run immediately.
 					lastErr = drainErr
-					// A retired generation is a benign drop, never a hard
-					// abort. downshiftDrain handles ErrGenerationRetired
-					// inline today (so it does not surface here), but guard
-					// defensively so a future drain path that propagates the
-					// sentinel cannot trip the generic non-4xx abort below.
+					// A retired generation is a benign drop, never a hard abort.
 					if errors.Is(drainErr, vector.ErrGenerationRetired) {
-						continue
+						return res, nil
 					}
 					if !errors.Is(drainErr, ErrPermanent4xx) {
 						return res, fmt.Errorf("downshift drain: %w", drainErr)
@@ -351,15 +332,21 @@ func (w *Worker) RunOnce(ctx context.Context, gen vector.GenerationID) (res RunR
 						return res, fmt.Errorf("embed worker aborting after %d consecutive failures: %w",
 							consecutiveFailures, lastErr)
 					}
+					// Every singleton 4xx'd and nothing embedded: the rows are
+					// left unstamped (so a misconfigured endpoint does not
+					// silently lose work) and the cursor does NOT advance, so
+					// the next scan re-finds them and the failure cap trips.
+					// Avoid busy-spinning: continue lets the loop re-scan;
+					// consecutiveFailures will reach the cap.
+					continue
 				}
 				continue
 			}
 
-			// Non-4xx error: original release-and-fail path.
+			// Non-4xx error: leave the batch unstamped (next scan re-finds
+			// it) and do not advance the cursor, so the failure cap can
+			// short-circuit the loop on a persistent fault.
 			res.Failed += len(ids)
-			if rerr := w.q.Release(ctx, gen, token, ids); rerr != nil {
-				w.deps.Log.Error("release after embed failure", "error", rerr)
-			}
 			if consecutiveFailures >= w.deps.MaxConsecutiveFailures {
 				return res, fmt.Errorf("embed worker aborting after %d consecutive failures: %w",
 					consecutiveFailures, lastErr)
@@ -368,80 +355,53 @@ func (w *Worker) RunOnce(ctx context.Context, gen vector.GenerationID) (res RunR
 		}
 		res.Truncated += eb.truncated
 
+		// Skip-mark messages that produced no embeddable content (missing
+		// from the main DB, or empty after preprocess). Stamping embed_gen
+		// IS the skip-marker — it drops them out of the next scan, the
+		// scan-and-fill replacement for deleting a queue row.
+		skipIDs := append(append([]int64(nil), eb.missing...), eb.empty...)
+
 		if len(eb.chunks) == 0 {
-			// Nothing to embed (every claimed id was missing from
-			// main DB or preprocessed to empty). Drop the orphans
-			// and move on; failure here counts toward
-			// MaxConsecutiveFailures because the loop would
-			// otherwise busy-spin on a stuck claim until
-			// ReclaimStale runs (10 min default).
-			dropIDs := append(append([]int64(nil), eb.missing...), eb.empty...)
-			if len(dropIDs) > 0 {
+			// Nothing to embed. Stamp the skip set so the scan advances.
+			if len(skipIDs) > 0 {
 				if len(eb.missing) > 0 {
-					w.deps.Log.Warn("pending messages missing from main DB",
-						"gen", gen, "ids", eb.missing)
+					w.deps.Log.Warn("messages missing from main DB", "gen", gen, "ids", eb.missing)
 				}
 				if len(eb.empty) > 0 {
-					w.deps.Log.Warn("pending messages empty after preprocess",
-						"gen", gen, "ids", eb.empty)
+					w.deps.Log.Warn("messages empty after preprocess", "gen", gen, "ids", eb.empty)
 				}
-				if cerr := w.q.Complete(ctx, gen, token, dropIDs); cerr != nil {
-					res.Failed += len(dropIDs)
-					w.deps.Log.Error("complete drop failed", "error", cerr,
-						"gen", gen, "ids", len(dropIDs))
+				if serr := w.deps.Store.SetEmbedGen(ctx, skipIDs, int64(gen)); serr != nil {
+					res.Failed += len(skipIDs)
+					w.deps.Log.Error("stamp skip set failed", "error", serr, "gen", gen, "ids", len(skipIDs))
 					consecutiveFailures++
-					lastErr = cerr
-					orphanDrainErr = cerr
-					orphanDrainCount += len(dropIDs)
+					lastErr = serr
 					if consecutiveFailures >= w.deps.MaxConsecutiveFailures {
 						return res, fmt.Errorf("embed worker aborting after %d consecutive failures: %w",
 							consecutiveFailures, lastErr)
 					}
 					continue
 				}
-				completedRows += len(dropIDs)
-				w.reportProgress(completedRows, len(dropIDs), 0, time.Since(batchStart))
+				completedRows += len(skipIDs)
+				w.reportProgress(completedRows, len(skipIDs), 0, time.Since(batchStart))
 			}
+			consecutiveFailures = 0
+			afterID = batchMax
+			w.advanceWatermark(ctx, gen, batchMax, backstop)
 			continue
 		}
 
+		// Step 1: upsert embeddings (VectorsDB side).
 		if err := w.deps.Backend.Upsert(ctx, gen, eb.chunks); err != nil {
 			if errors.Is(err, vector.ErrGenerationRetired) {
-				// The generation was retired out from under this worker
-				// (its claims were reclaimed and a newer generation took
-				// over, or an operator retired it). Per the documented
-				// contract on vector.ErrGenerationRetired this is a benign
-				// "drop the batch" signal, NOT a hard failure: re-embedding
-				// would just re-fail identically and burn embedding-API cost
-				// up to MaxConsecutiveFailures. Token-aware DROP the claimed
-				// rows (Complete is a token-scoped DELETE, safe against a
-				// concurrent newer claim), do not count this as a failure,
-				// and continue draining so the run finishes cleanly.
-				// Drop the FULL claimed batch, not just the embedded subset:
-				// missing/empty rows were claimed under this token too, and
-				// leaving them claimed would strand them until ReclaimStale
-				// (cr2-5). `ids` is exactly the set of message IDs claimed for
-				// this batch (every one is embedded, missing, or empty).
-				w.deps.Log.Info("embed: generation retired mid-run; dropping batch",
-					"gen", gen, "ids", len(ids))
-				if cerr := w.q.Complete(ctx, gen, token, ids); cerr != nil {
-					// A Complete failure during a retired-gen drop leaves these
-					// rows claimed; route it through the orphan-drain surfacing
-					// channel so RunOnce cannot report a false-clean drain while
-					// rows remain stuck (cr2-6). Re-embedding a retired
-					// generation is pointless, so surface-and-continue (no
-					// consecutiveFailures escalation), matching the orphan path.
-					w.deps.Log.Error("complete drop after retired generation", "error", cerr,
-						"gen", gen, "ids", len(ids))
-					orphanDrainErr = cerr
-					orphanDrainCount += len(ids)
-				}
-				continue
+				// The generation was retired out from under this worker. Per
+				// the ErrGenerationRetired contract this is a benign "stop"
+				// signal, not a hard failure: re-embedding would re-fail
+				// identically. Do NOT stamp embed_gen (the retired gen is
+				// going away) and end the run cleanly.
+				w.deps.Log.Info("embed: generation retired mid-run; stopping", "gen", gen)
+				return res, nil
 			}
 			res.Failed += len(eb.embeddedIDs)
-			if rerr := w.q.Release(ctx, gen, token, eb.embeddedIDs); rerr != nil {
-				w.deps.Log.Error("release after upsert failure", "error", rerr)
-			}
 			w.deps.Log.Error("upsert failed", "gen", gen, "ids", len(eb.embeddedIDs), "error", err)
 			consecutiveFailures++
 			lastErr = err
@@ -451,92 +411,60 @@ func (w *Worker) RunOnce(ctx context.Context, gen vector.GenerationID) (res RunR
 			}
 			continue
 		}
-		// Complete acknowledges work via (gen, msg, claim_token) so a
-		// stale worker whose claim was already reclaimed cannot wipe
-		// the queue row belonging to the newer worker. Failure here
-		// means the embedded rows stay claimed; ReclaimStale will
-		// rescue them eventually but the next RunOnce would falsely
-		// report a clean drain in the meantime — count the batch as
-		// failed so the failure cap can short-circuit the loop.
-		if cerr := w.q.Complete(ctx, gen, token, eb.embeddedIDs); cerr != nil {
+
+		// Step 2: stamp embed_gen for the embedded + skip sets (MainDB
+		// side). Safe to do after the upsert: the upsert is idempotent, so a
+		// crash before this stamp just re-does the batch next scan. Stamp
+		// the union so embedded and skip-marked rows both drop out together.
+		stampIDs := append(append([]int64(nil), eb.embeddedIDs...), skipIDs...)
+		if serr := w.deps.Store.SetEmbedGen(ctx, stampIDs, int64(gen)); serr != nil {
 			res.Failed += len(eb.embeddedIDs)
-			w.deps.Log.Error("complete failed", "error", cerr,
-				"gen", gen, "ids", len(eb.embeddedIDs))
+			w.deps.Log.Error("stamp embed_gen failed", "gen", gen, "ids", len(stampIDs), "error", serr)
 			consecutiveFailures++
-			lastErr = cerr
+			lastErr = serr
 			if consecutiveFailures >= w.deps.MaxConsecutiveFailures {
 				return res, fmt.Errorf("embed worker aborting after %d consecutive failures: %w",
 					consecutiveFailures, lastErr)
 			}
+			// Do not advance the cursor: next scan re-finds the unstamped rows
+			// (the upsert already ran, so re-embedding is idempotent).
 			continue
 		}
 
-		// Drop queue rows for messages that disappeared between
-		// enqueue and claim. We do this AFTER embedded rows are
-		// safely upserted and acknowledged so a Complete failure on
-		// the orphans does not strand the valid embedded rows in a
-		// claimed-but-unembedded state. Using Complete with our claim
-		// token makes this a token-aware delete: we only remove rows
-		// we still own. Failure here still counts as a batch failure
-		// because the orphan rows would stay claimed until
-		// ReclaimStale runs and falsely block the queue.
-		dropIDs := append(append([]int64(nil), eb.missing...), eb.empty...)
-		if len(dropIDs) > 0 {
-			if len(eb.missing) > 0 {
-				w.deps.Log.Warn("pending messages missing from main DB",
-					"gen", gen, "ids", eb.missing)
-			}
-			if len(eb.empty) > 0 {
-				w.deps.Log.Warn("pending messages empty after preprocess",
-					"gen", gen, "ids", eb.empty)
-			}
-			if cerr := w.q.Complete(ctx, gen, token, dropIDs); cerr != nil {
-				res.Failed += len(dropIDs)
-				w.deps.Log.Error("complete drop failed", "error", cerr,
-					"gen", gen, "ids", len(dropIDs))
-				consecutiveFailures++
-				lastErr = cerr
-				orphanDrainErr = cerr
-				orphanDrainCount += len(dropIDs)
-				batchChars := 0
-				for _, c := range eb.chunks {
-					batchChars += c.SourceCharLen
-				}
-				completedRows += len(eb.embeddedIDs)
-				w.reportProgress(completedRows, len(eb.embeddedIDs), batchChars, time.Since(batchStart))
-				if consecutiveFailures >= w.deps.MaxConsecutiveFailures {
-					// Embedded rows were already counted into
-					// res.Succeeded above; record the orphan-drain
-					// failure and abort.
-					res.Succeeded += len(eb.embeddedIDs)
-					return res, fmt.Errorf("embed worker aborting after %d consecutive failures: %w",
-						consecutiveFailures, lastErr)
-				}
-				// Even though the orphan drain failed, the embedded
-				// rows ARE done — count them and reset the cap.
-				// Forward progress on real messages should reset
-				// consecutiveFailures the same way it does in the
-				// downshift drain path and the all-clean success
-				// path. The orphan-drop Complete failure has its
-				// own surfacing channel via orphanDrainErr (the
-				// empty-claim exit returns it instead of nil), so
-				// we don't need consecutiveFailures to escalate
-				// orphan failures into an abort. The orphan rows
-				// stay claimed and ReclaimStale recovers them.
-				res.Succeeded += len(eb.embeddedIDs)
-				consecutiveFailures = 0
-				continue
-			}
+		if len(eb.missing) > 0 {
+			w.deps.Log.Warn("messages missing from main DB", "gen", gen, "ids", eb.missing)
 		}
+		if len(eb.empty) > 0 {
+			w.deps.Log.Warn("messages empty after preprocess", "gen", gen, "ids", eb.empty)
+		}
+
 		res.Succeeded += len(eb.embeddedIDs)
 		consecutiveFailures = 0
-		batchProcessed := len(eb.embeddedIDs) + len(dropIDs)
+		afterID = batchMax
+		w.advanceWatermark(ctx, gen, batchMax, backstop)
+
+		batchProcessed := len(eb.embeddedIDs) + len(skipIDs)
 		completedRows += batchProcessed
 		batchChars := 0
 		for _, c := range eb.chunks {
 			batchChars += c.SourceCharLen
 		}
 		w.reportProgress(completedRows, batchProcessed, batchChars, time.Since(batchStart))
+	}
+}
+
+// advanceWatermark persists the per-gen forward-scan cursor to id after a
+// batch made forward progress. The backstop never persists (it scans from
+// 0 by design and must not push the optimistic watermark backward or
+// forward). Failure is non-critical — the watermark is a pure
+// optimization — so it is logged, not returned.
+func (w *Worker) advanceWatermark(ctx context.Context, gen vector.GenerationID, id int64, backstop bool) {
+	if backstop {
+		return
+	}
+	if err := w.wm.SetWatermark(ctx, gen, id); err != nil {
+		w.deps.Log.Warn("embed: advance watermark failed (non-critical)",
+			"gen", gen, "id", id, "error", err)
 	}
 }
 
@@ -556,9 +484,9 @@ type embedBatchResult struct {
 
 // embedBatch fetches subject/body for ids, preprocesses each, calls the
 // embedding client, and assembles the resulting chunks. Messages that
-// vanished between enqueue and claim (e.g. the sync deleted them) are
+// vanished between scan and fetch (e.g. the sync deleted them) are
 // reported in the returned result's missing slice rather than causing
-// a failure — the caller decides how to drain them from the queue.
+// a failure — the caller skip-marks them.
 func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult, error) {
 	placeholders := make([]string, len(ids))
 	args := make([]any, len(ids))
@@ -625,8 +553,8 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 		return embedBatchResult{}, fmt.Errorf("iterate message rows: %w", err)
 	}
 
-	// Identify claimed ids that had no row in messages; we'll report
-	// them back so the caller can drop them from the queue.
+	// Identify scanned ids that had no row in messages; we'll report
+	// them back so the caller can skip-mark them.
 	var missing []int64
 	for _, id := range ids {
 		if _, ok := fetched[id]; !ok {
@@ -635,8 +563,8 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 	}
 
 	if len(msgs) == 0 {
-		// All claimed ids are missing — return an empty result (no
-		// chunks, no error). Caller handles the drop.
+		// All scanned ids are missing/empty — return an empty result (no
+		// chunks, no error). Caller skip-marks them.
 		return embedBatchResult{missing: missing, empty: empty}, nil
 	}
 
@@ -673,9 +601,6 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 				// sentence may have been split across the boundary
 				// (overlap exists to recover from this), or any
 				// chunk of a message that was truncated upstream.
-				// Both feed embeddings.truncated and the per-message
-				// counter so users see a faithful picture of which
-				// embeddings cover their full source content.
 				Trunc: msgTrunc ||
 					(chunkWindow > 0 && (sp.CharEnd-sp.CharStart) == chunkWindow && j < len(spans)-1),
 			}
@@ -689,9 +614,9 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 	// single embed call past the provider's per-request limit (Ollama
 	// stops responding around 250 inputs; OpenAI caps at 2048; either
 	// way, payload size + request-timeout grow with the input count).
-	// The pending queue stays per-message — a message completes only
-	// after every one of its chunks has been embedded and upserted in
-	// this same call, so partial-failure semantics are unchanged.
+	// A message completes only after every one of its chunks has been
+	// embedded and upserted in this same call, so partial-failure
+	// semantics are unchanged.
 	embedSubBatchSize := w.deps.BatchSize
 	if embedSubBatchSize <= 0 {
 		embedSubBatchSize = len(inputs)
@@ -761,69 +686,38 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 	}, nil
 }
 
-// downshiftDrain handles a non-retryable 4xx on a claimed batch by
-// walking the same already-claimed IDs one at a time. The IDs remain
-// owned under the caller's claim_token throughout the drain, so we
-// never re-Claim them — that would race other workers.
+// downshiftDrain handles a non-retryable 4xx on a scanned batch by walking
+// the same ids one at a time. Singletons that embed are upserted and
+// stamped immediately; singletons that 4xx are deferred and the drop
+// decision is made at end-of-drain based on whether anything embedded
+// (message-specific 4xx → stamp-drop; endpoint-wide failure → leave
+// unstamped so a misconfigured endpoint does not silently lose work).
 //
-// Singleton 4xxs are NOT eagerly Completed. ErrPermanent4xx covers
-// both message-specific failures (413 payload-too-large, 422
-// Unprocessable, 400 invalid-input) and endpoint/config-wide
-// failures (401 bad-key, 403 forbidden, 404 invalid-model, 400
-// malformed-shared-config) — the two are indistinguishable at the
-// call site. If we Complete-deleted on every singleton 4xx, a
-// misconfigured endpoint would silently destroy work. Instead we
-// defer the drop decision: collect the 4xxing IDs, and at end of
-// drain decide based on whether anything embedded.
-//
-// Returned `embedded` is the count of singletons that successfully
-// embedded.
-//
-// Returned `dropped` is the count of singletons whose drop was
-// confirmed (Complete succeeded). A drain that releases its deferred
-// IDs back to the queue (because no singleton embedded) returns
-// `dropped == 0`.
-//
-// Returned `err`:
-//   - non-nil all-drop: every singleton 4xxd, no embeds. Deferred
-//     IDs were Released back to the queue (so a misconfigured
-//     endpoint does not lose work) and the wrapped 4xx is returned.
-//     The caller increments consecutiveFailures and the cap will
-//     eventually trip, surfacing the original 4xx body.
-//   - non-nil non-4xx interruption: transient errors that exhausted
-//     retries inside embedBatch, upsert/complete failures, or a
-//     cancellation seen after embedBatch starts. Deferred and
-//     unprocessed IDs are released before returning so a later run
-//     can retry them promptly. A cancellation observed before the
-//     next singleton starts returns ctx.Err without releasing; those
-//     rows remain claimed for ReclaimStale to recover.
-//   - nil: drain completed cleanly. If `embedded > 0` and there were
-//     deferred IDs, they were Completed as message-specific drops.
+// Returns:
+//   - embedded: count of singletons that successfully embedded.
+//   - stamped:  count of ids whose embed_gen was stamped (embedded +
+//     confirmed message-specific drops). When this is > 0 the caller may
+//     advance the scan cursor; when it is 0 the deferred ids are left
+//     unstamped and the cursor must not advance.
+//   - err: nil on a clean drain; ErrPermanent4xx (wrapped) when every
+//     singleton 4xx'd with no embeds (deferred ids left unstamped);
+//     ErrGenerationRetired (wrapped) when the generation was retired
+//     mid-drain (benign); or any other error (transient-after-retries,
+//     upsert, stamp) that should fail the run.
 func (w *Worker) downshiftDrain(
 	ctx context.Context,
 	gen vector.GenerationID,
-	token string,
 	ids []int64,
 	res *RunResult,
 	completedRows *int,
-) (embedded int, dropped int, err error) {
+) (embedded int, stamped int, err error) {
 	var deferredDrops []int64
 	var lastDeferredErr error
-	// retiredObserved records that at least one singleton's Upsert reported
-	// the generation as retired. It is load-bearing for the end-of-drain
-	// decision (cr2-7): once a generation is retired, no future run will ever
-	// re-claim these rows (pickTarget never targets retired gens), so the
-	// endpoint-misconfig protection that Releases on embedded==0 is moot and
-	// would only orphan the deferred rows and trigger the re-embed/hard-abort
-	// loop. retiredDrainErr captures a Complete failure during a retired drop
-	// so RunOnce can surface it rather than report a false-clean run (cr2-6).
-	var retiredObserved bool
-	var retiredDrainErr error
 
-	for i, id := range ids {
+	for _, id := range ids {
 		select {
 		case <-ctx.Done():
-			return embedded, dropped, ctx.Err()
+			return embedded, stamped, ctx.Err()
 		default:
 		}
 
@@ -831,62 +725,43 @@ func (w *Worker) downshiftDrain(
 		eb, e := w.embedBatch(ctx, []int64{id})
 		if e != nil {
 			if errors.Is(e, ErrPermanent4xx) {
-				// Defer the drop decision. See function-level
-				// comment for the endpoint-vs-message distinction.
+				// Defer the drop decision. See function-level comment.
 				deferredDrops = append(deferredDrops, id)
 				lastDeferredErr = e
 				continue
 			}
-			w.releaseDownshiftRemainder(ctx, gen, token, append(append([]int64(nil), deferredDrops...), ids[i:]...))
-			return embedded, dropped, e
+			return embedded, stamped, e
 		}
 		if len(eb.chunks) == 0 {
-			drop := append(append([]int64(nil), eb.missing...), eb.empty...)
-			if len(drop) > 0 {
-				if cerr := w.q.Complete(ctx, gen, token, drop); cerr != nil {
-					res.Failed += len(drop)
-					w.releaseDownshiftRemainder(ctx, gen, token, append(append([]int64(nil), deferredDrops...), ids[i:]...))
-					return embedded, dropped, fmt.Errorf("complete drop: %w", cerr)
+			// Missing/empty singleton — skip-mark it.
+			skip := append(append([]int64(nil), eb.missing...), eb.empty...)
+			if len(skip) > 0 {
+				if serr := w.deps.Store.SetEmbedGen(ctx, skip, int64(gen)); serr != nil {
+					res.Failed += len(skip)
+					return embedded, stamped, fmt.Errorf("stamp skip: %w", serr)
 				}
-				dropped += len(drop)
-				*completedRows += len(drop)
-				w.reportProgress(*completedRows, len(drop), 0, time.Since(batchStart))
+				stamped += len(skip)
+				*completedRows += len(skip)
+				w.reportProgress(*completedRows, len(skip), 0, time.Since(batchStart))
 			}
 			continue
 		}
 		if uerr := w.deps.Backend.Upsert(ctx, gen, eb.chunks); uerr != nil {
 			if errors.Is(uerr, vector.ErrGenerationRetired) {
-				// Benign per the ErrGenerationRetired contract: the
-				// generation was retired mid-drain. Token-aware DROP this
-				// singleton's row and continue the drain rather than
-				// wrapping into a non-4xx error (which RunOnce would treat
-				// as a hard abort). The remaining claimed rows will also
-				// observe the retired state and drop the same way, so the
-				// drain finishes cleanly and RunOnce returns nil. Record the
-				// retirement so the end-of-drain decision drops any deferred
-				// 4xx rows instead of Releasing them (cr2-7).
-				retiredObserved = true
-				w.deps.Log.Info("embed: generation retired mid-drain; dropping singleton",
-					"gen", gen, "id", id)
-				if cerr := w.q.Complete(ctx, gen, token, []int64{id}); cerr != nil {
-					// Surface the Complete failure rather than swallowing it
-					// (cr2-6): the row stays claimed and RunOnce must not
-					// report a clean run.
-					w.deps.Log.Error("complete drop after retired generation (drain)", "error", cerr,
-						"gen", gen, "id", id)
-					retiredDrainErr = cerr
-				}
-				continue
+				// Generation retired mid-drain. Stop draining and surface the
+				// benign sentinel; remaining singletons would observe the same
+				// state. Do not stamp (the gen is going away).
+				w.deps.Log.Info("embed: generation retired mid-drain; stopping", "gen", gen, "id", id)
+				return embedded, stamped, fmt.Errorf("upsert: %w", uerr)
 			}
-			w.releaseDownshiftRemainder(ctx, gen, token, append(append([]int64(nil), deferredDrops...), ids[i:]...))
-			return embedded, dropped, fmt.Errorf("upsert: %w", uerr)
+			return embedded, stamped, fmt.Errorf("upsert: %w", uerr)
 		}
-		if cerr := w.q.Complete(ctx, gen, token, eb.embeddedIDs); cerr != nil {
-			w.releaseDownshiftRemainder(ctx, gen, token, append(append([]int64(nil), deferredDrops...), ids[i:]...))
-			return embedded, dropped, fmt.Errorf("complete: %w", cerr)
+		if serr := w.deps.Store.SetEmbedGen(ctx, eb.embeddedIDs, int64(gen)); serr != nil {
+			return embedded, stamped, fmt.Errorf("stamp embed_gen: %w", serr)
 		}
 		res.Truncated += eb.truncated
 		embedded += len(eb.embeddedIDs)
+		stamped += len(eb.embeddedIDs)
 		*completedRows += len(eb.embeddedIDs)
 		batchChars := 0
 		for _, c := range eb.chunks {
@@ -897,83 +772,35 @@ func (w *Worker) downshiftDrain(
 
 	// Drain finished. Decide deferred-drop fate.
 	if len(deferredDrops) == 0 {
-		// No deferred 4xx rows. Surface a retired-drop Complete failure if one
-		// occurred (cr2-6); otherwise the drain is clean.
-		if retiredDrainErr != nil {
-			return embedded, dropped, fmt.Errorf("complete drop after retired generation: %w", retiredDrainErr)
-		}
-		return embedded, dropped, nil
-	}
-	// A retirement was observed: the generation is gone, so re-claiming is
-	// impossible (pickTarget never targets retired gens). Releasing the
-	// deferred 4xx rows would orphan them forever and trigger the wasteful
-	// re-embed/hard-abort loop. Token-DROP them instead and return nil
-	// (benign) — UNLESS a retired-drop Complete already failed, in which case
-	// we surface that so RunOnce reports the stuck rows (cr2-6/cr2-7). This
-	// check MUST precede the embedded==0 all-drop Release path below; the
-	// retiredObserved flag (not embedded==0 alone) is what distinguishes a
-	// retired generation from a misconfigured endpoint, preserving the
-	// silent-delete-on-misconfig guard.
-	if retiredObserved {
-		for _, id := range deferredDrops {
-			w.deps.Log.Warn("dropping deferred 4xx pending message; generation retired",
-				"gen", gen, "id", id, "error", lastDeferredErr)
-		}
-		dropStart := time.Now()
-		if cerr := w.q.Complete(ctx, gen, token, deferredDrops); cerr != nil {
-			res.Failed += len(deferredDrops)
-			return embedded, dropped, fmt.Errorf("complete drop after retired generation: %w", cerr)
-		}
-		dropped += len(deferredDrops)
-		*completedRows += len(deferredDrops)
-		w.reportProgress(*completedRows, len(deferredDrops), 0, time.Since(dropStart))
-		if retiredDrainErr != nil {
-			return embedded, dropped, fmt.Errorf("complete drop after retired generation: %w", retiredDrainErr)
-		}
-		return embedded, dropped, nil
+		return embedded, stamped, nil
 	}
 	if embedded > 0 {
 		// Endpoint works for some messages, so the 4xxs are
 		// message-specific (oversize input, malformed input, etc.).
-		// Drop them.
+		// Stamp them so they drop out of future scans.
 		for _, id := range deferredDrops {
-			w.deps.Log.Warn("dropping pending message after singleton 4xx",
+			w.deps.Log.Warn("stamping (dropping) message after singleton 4xx",
 				"gen", gen, "id", id, "error", lastDeferredErr)
 		}
 		dropStart := time.Now()
-		if cerr := w.q.Complete(ctx, gen, token, deferredDrops); cerr != nil {
+		if serr := w.deps.Store.SetEmbedGen(ctx, deferredDrops, int64(gen)); serr != nil {
 			res.Failed += len(deferredDrops)
-			return embedded, dropped, fmt.Errorf("complete drop: %w", cerr)
+			return embedded, stamped, fmt.Errorf("stamp drop: %w", serr)
 		}
-		dropped += len(deferredDrops)
+		stamped += len(deferredDrops)
 		*completedRows += len(deferredDrops)
 		w.reportProgress(*completedRows, len(deferredDrops), 0, time.Since(dropStart))
-		return embedded, dropped, nil
+		return embedded, stamped, nil
 	}
 	// embedded == 0. We can't distinguish endpoint-wide failure from a
-	// batch where every message just happened to be unembeddable.
-	// Release the deferred IDs (rather than Completing them) so a
-	// misconfigured endpoint does not silently destroy work, and
-	// return the wrapped 4xx so the caller surfaces it. The released
-	// IDs go back to the pending queue and will be re-claimed; if the
-	// underlying problem persists, the consecutive-failure cap will
-	// eventually trip with the same 4xx body in lastErr.
-	if rerr := w.q.Release(ctx, gen, token, deferredDrops); rerr != nil {
-		w.deps.Log.Error("release after all-drop drain", "error", rerr,
-			"gen", gen, "ids", len(deferredDrops))
-	}
-	return embedded, dropped, fmt.Errorf("downshift all-drop: every singleton returned non-retryable 4xx (released %d row(s) back to queue): %w",
+	// batch where every message just happened to be unembeddable. Leave
+	// the deferred ids UNSTAMPED so a misconfigured endpoint does not
+	// silently drop work, and return the wrapped 4xx so the caller
+	// surfaces it. The unstamped ids are re-found on the next scan; if the
+	// underlying problem persists, the consecutive-failure cap eventually
+	// trips with the same 4xx body.
+	return embedded, stamped, fmt.Errorf("downshift all-drop: every singleton returned non-retryable 4xx (left %d row(s) unstamped): %w",
 		len(deferredDrops), lastDeferredErr)
-}
-
-func (w *Worker) releaseDownshiftRemainder(ctx context.Context, gen vector.GenerationID, token string, ids []int64) {
-	if len(ids) == 0 {
-		return
-	}
-	if rerr := w.q.Release(ctx, gen, token, ids); rerr != nil {
-		w.deps.Log.Error("release after downshift interruption", "error", rerr,
-			"gen", gen, "ids", len(ids))
-	}
 }
 
 func (w *Worker) reportProgress(done, batchMsgs, batchChars int, batchElapsed time.Duration) {

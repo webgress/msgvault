@@ -34,13 +34,14 @@ import (
 // connection — e.g. the MCP server — so CREATE EXTENSION / DDL are not
 // attempted (PostgreSQL rejects them with SQLSTATE 25006). Ignored on
 // SQLite.
-func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string, readOnly bool) (*vectorFeatures, error) {
+func setupVectorFeatures(ctx context.Context, mainStore *store.Store, mainPath string, readOnly bool) (*vectorFeatures, error) {
 	if !cfg.Vector.Enabled {
 		return nil, nil //nolint:nilnil // vector disabled: callers nil-check vf; (nil, nil) means "no features, no error"
 	}
 	if err := cfg.Vector.Validate(); err != nil {
 		return nil, fmt.Errorf("vector config: %w", err)
 	}
+	mainDB := mainStore.DB()
 
 	// Resolve the dialect once from the main DSN. The queue, worker, and
 	// enqueuer are dialect-portable via Rebind / InsertOrIgnore, so the
@@ -111,6 +112,7 @@ func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string, r
 		Backend:   backend,
 		VectorsDB: vectorsDB,
 		MainDB:    mainDB,
+		Store:     mainStore,
 		Client:    client,
 		Preprocess: embed.PreprocessConfig{
 			StripQuotes:        cfg.Vector.Preprocess.StripQuotesEnabled(),
@@ -120,11 +122,9 @@ func setupVectorFeatures(ctx context.Context, mainDB *sql.DB, mainPath string, r
 			StripURLTracking:   cfg.Vector.Preprocess.StripURLTrackingEnabled(),
 			CollapseWhitespace: cfg.Vector.Preprocess.CollapseWhitespaceEnabled(),
 		},
-		MaxInputChars:   cfg.Vector.Embeddings.MaxInputChars,
-		BatchSize:       cfg.Vector.Embeddings.BatchSize,
-		EmbedTimeout:    cfg.Vector.Embeddings.Timeout,
-		EmbedMaxRetries: cfg.Vector.Embeddings.MaxRetries,
-		// Rebind makes the worker's queue + body-fetch SQL run on pgx.
+		MaxInputChars: cfg.Vector.Embeddings.MaxInputChars,
+		BatchSize:     cfg.Vector.Embeddings.BatchSize,
+		// Rebind makes the worker's body-fetch + watermark SQL run on pgx.
 		// SQLiteDialect.Rebind is identity, so the SQLite path is unchanged.
 		Rebind: dialect.Rebind,
 		Log:    logger,

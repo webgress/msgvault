@@ -107,6 +107,7 @@ func runEmbed(cmd *cobra.Command) error {
 		Backend:   backend,
 		VectorsDB: vectorsDB,
 		MainDB:    s.DB(),
+		Store:     s,
 		Client:    client,
 		Preprocess: embed.PreprocessConfig{
 			StripQuotes:        cfg.Vector.Preprocess.StripQuotesEnabled(),
@@ -116,13 +117,11 @@ func runEmbed(cmd *cobra.Command) error {
 			StripURLTracking:   cfg.Vector.Preprocess.StripURLTrackingEnabled(),
 			CollapseWhitespace: cfg.Vector.Preprocess.CollapseWhitespaceEnabled(),
 		},
-		MaxInputChars:   cfg.Vector.Embeddings.MaxInputChars,
-		BatchSize:       cfg.Vector.Embeddings.BatchSize,
-		EmbedTimeout:    cfg.Vector.Embeddings.Timeout,
-		EmbedMaxRetries: cfg.Vector.Embeddings.MaxRetries,
-		Rebind:          rebind,
-		TotalPending:    totalPending,
-		Progress:        newProgressPrinter(errOut, totalPending, cfg.Vector.Embeddings.ETAWindow),
+		MaxInputChars: cfg.Vector.Embeddings.MaxInputChars,
+		BatchSize:     cfg.Vector.Embeddings.BatchSize,
+		Rebind:        rebind,
+		TotalPending:  totalPending,
+		Progress:      newProgressPrinter(errOut, totalPending, cfg.Vector.Embeddings.ETAWindow),
 	})
 
 	if n, err := worker.ReclaimStale(ctx); err != nil {
