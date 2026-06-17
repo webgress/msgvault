@@ -758,7 +758,7 @@ type fakeCoverage struct {
 	missing int64
 }
 
-func (c *fakeCoverage) CoverageCounts(_ context.Context, _ int64) (live, embedded, skipped, missing int64, err error) {
+func (c *fakeCoverage) CoverageCounts(_ context.Context, _ int64) (live, embedded, blank, missing int64, err error) {
 	return c.missing, 0, 0, c.missing, nil
 }
 

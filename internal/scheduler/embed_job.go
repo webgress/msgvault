@@ -21,7 +21,7 @@ type EmbedRunner interface {
 // the count of live messages still needing embedding for a generation,
 // read from the main DB. Tests satisfy it with a fake.
 type EmbedCoverage interface {
-	CoverageCounts(ctx context.Context, activeGen int64) (live, embedded, skipped, missing int64, err error)
+	CoverageCounts(ctx context.Context, activeGen int64) (live, embedded, blank, missing int64, err error)
 }
 
 // Compile-time check that the production worker satisfies EmbedRunner.

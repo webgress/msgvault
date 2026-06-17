@@ -134,16 +134,17 @@ func (s *Store) ResetEmbedGen(ctx context.Context, ids []int64) error {
 //   - missing:  live messages still needing work for activeGen
 //     (embed_gen IS NULL OR embed_gen <> activeGen). live = embedded +
 //     missing exactly.
-//   - skipped:  always 0 here. Distinguishing "stamped but has zero
-//     embedding rows" (a missing/empty skip-marker) from "stamped and
-//     embedded" requires joining the embeddings table, which lives in a
-//     separate DB on SQLite. Per the design this is a best-effort/optional
-//     number; we report 0 rather than pay the cross-DB cost. Callers that
-//     need a true skipped count can derive it from backend Stats.
+//   - blank:    always 0 here. Distinguishing "stamped but has zero
+//     embedding rows" (a missing/empty message stamped to a terminal DONE
+//     state) from "stamped and embedded" requires joining the embeddings
+//     table, which lives in a separate DB on SQLite. Per the design this is
+//     a best-effort/optional number; we report 0 rather than pay the
+//     cross-DB cost. Callers that need a true blank count can derive it
+//     from backend Stats.
 //
 // activeGen == 0 means "no active/target generation"; then everything
 // live is missing and embedded is 0.
-func (s *Store) CoverageCounts(ctx context.Context, activeGen int64) (live, embedded, skipped, missing int64, err error) {
+func (s *Store) CoverageCounts(ctx context.Context, activeGen int64) (live, embedded, blank, missing int64, err error) {
 	live, err = s.countLiveMessages(ctx)
 	if err != nil {
 		return 0, 0, 0, 0, err
