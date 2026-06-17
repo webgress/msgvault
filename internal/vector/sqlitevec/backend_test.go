@@ -257,14 +257,6 @@ func TestBackend_CreateGeneration_MismatchedFingerprint(t *testing.T) {
 	assertpkg.ErrorIs(t, err, vector.ErrBuildingInProgress)
 }
 
-// TestBackend_CreateGeneration_ResumeDoesNotReseedCompleted is the
-// regression test for the "interrupted full rebuild re-embeds
-// everything" bug: after the worker has already embedded some messages
-// (Queue.Complete removed those rows from pending_embeddings), a
-// retry'd CreateGeneration must NOT push them back onto the queue. We
-// simulate this by manually removing a pending row, then calling
-// CreateGeneration again with the same fingerprint and asserting the
-// removed row is not re-enqueued.
 // TestBackend_ClaimOrInsertBuilding_RaceRecoversFromUniqueConstraint
 // exercises the post-INSERT unique-constraint recovery path: when a
 // concurrent writer slips a building row in between our SELECT and

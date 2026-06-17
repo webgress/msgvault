@@ -54,9 +54,8 @@ func seedGenWithEmbeddingsPG(t *testing.T, pgb *pgvector.Backend, ids ...int64) 
 		chunks = append(chunks, vector.Chunk{MessageID: id, ChunkIndex: 0, Vector: v})
 	}
 	require.NoError(t, pgb.Upsert(ctx, gen, chunks), "Upsert")
-	_, err = pgb.DB().ExecContext(ctx,
-		`DELETE FROM pending_embeddings WHERE generation_id = $1`, int64(gen))
-	require.NoError(t, err, "clear pending")
+	// The consuming tests force-activate/retire (force=true), bypassing the
+	// coverage gate, so no embed_gen stamping is needed here.
 	return gen
 }
 
