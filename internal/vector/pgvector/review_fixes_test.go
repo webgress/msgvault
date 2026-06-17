@@ -257,7 +257,7 @@ func TestMigrate_SkipExtension(t *testing.T) {
 	assertHatchedDDL(t, tracer)
 
 	// Schema tables exist.
-	for _, table := range []string{"index_generations", "embeddings", "pending_embeddings", "embed_runs"} {
+	for _, table := range []string{"index_generations", "embeddings", "embed_watermark", "embed_runs"} {
 		var reg sql.NullString
 		require.NoError(t, db.QueryRowContext(ctx,
 			`SELECT to_regclass($1)::text`, table).Scan(&reg),
@@ -516,8 +516,6 @@ func TestSearch_FilteredInlineExists_MultiChunk(t *testing.T) {
 		{MessageID: 1, ChunkIndex: 1, Vector: unitVec(4, 2)},
 		{MessageID: 2, ChunkIndex: 0, Vector: unitVec(4, 1)},
 	}), "Upsert")
-	_, err = b.db.ExecContext(ctx, `DELETE FROM pending_embeddings WHERE generation_id = $1`, int64(gen))
-	require.NoError(t, err, "clear pending")
 
 	hits, err := b.Search(ctx, gen, unitVec(4, 0), 10, vector.Filter{SourceIDs: []int64{10}})
 	require.NoError(t, err, "Search")

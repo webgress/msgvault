@@ -236,34 +236,19 @@ func pickEmbedGeneration(ctx context.Context, backend vector.Backend, opts embed
 	}
 	if building != nil {
 		if building.Fingerprint == opts.Fingerprint {
-			// Re-run the initial seed if the prior CreateGeneration
-			// crashed between inserting the building row and committing
-			// the seed. Without this, a resume could "drain" zero
-			// pending rows and activate an unseeded generation.
-			err := backend.EnsureSeeded(ctx, building.ID)
-			switch {
-			case err == nil:
-				_, _ = fmt.Fprintf(opts.Stderr, "Resuming building generation %d (%s).\n",
-					building.ID, building.Fingerprint)
-				return building.ID, true, nil
-			case errors.Is(err, vector.ErrGenerationNotBuilding):
-				// Race: another actor (daemon, concurrent CLI, retire
-				// call) moved the generation out of 'building' between
-				// BuildingGeneration and EnsureSeeded. Fall through to
-				// the active-generation lookup rather than aborting
-				// with a fatal error — if the flip was an activation
-				// matching our fingerprint, that's exactly the
-				// generation we want to top up.
-				_, _ = fmt.Fprintf(opts.Stderr,
-					"Building generation %d changed state while resuming; re-resolving.\n",
-					building.ID)
-			default:
-				return 0, false, fmt.Errorf("ensure seeded: %w", err)
-			}
-		} else {
-			return 0, false, fmt.Errorf("in-progress rebuild has fingerprint=%q, config has %q — activate or retire it before running with a different model",
-				building.Fingerprint, opts.Fingerprint)
+			// Resume the matching build. Under scan-and-fill there is no
+			// seed pass to re-run on resume — the worker discovers work by
+			// scanning messages.embed_gen, so a crash before any embedding
+			// simply leaves the whole corpus needing work. If the build was
+			// already activated by a concurrent actor, the worker's scan is
+			// still harmless (covered rows are skipped) and the subsequent
+			// activation gate will report it is not building.
+			_, _ = fmt.Fprintf(opts.Stderr, "Resuming building generation %d (%s).\n",
+				building.ID, building.Fingerprint)
+			return building.ID, true, nil
 		}
+		return 0, false, fmt.Errorf("in-progress rebuild has fingerprint=%q, config has %q — activate or retire it before running with a different model",
+			building.Fingerprint, opts.Fingerprint)
 	}
 
 	active, err := vector.ResolveActiveForFingerprint(ctx, backend, opts.Fingerprint)
