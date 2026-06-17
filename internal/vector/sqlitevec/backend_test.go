@@ -160,6 +160,48 @@ func TestBackend_ActivateGeneration_CoverageGate(t *testing.T) {
 	assertpkg.Equal(t, vector.GenerationActive, genStateSV(t, b, gen), "now active")
 }
 
+// TestBackend_SingleTargetRebuild pins the single-target invariant: while
+// a new generation B builds, the active generation A keeps serving
+// (stale-but-correct), and B only becomes active once its coverage is
+// complete — at which point A is retired in the same swap. There is no
+// dual-write fan-out; the per-message embed_gen names exactly one target.
+func TestBackend_SingleTargetRebuild(t *testing.T) {
+	b, ctx := newBackendForTest(t)
+
+	// A: build, cover (force-activate to skip the gate for the one test
+	// message), and start serving.
+	genA, err := b.CreateGeneration(ctx, "model-a", 768, "")
+	requirepkg.NoError(t, err, "CreateGeneration A")
+	requirepkg.NoError(t, b.ActivateGeneration(ctx, genA, true), "activate A (force)")
+	active, err := b.ActiveGeneration(ctx)
+	requirepkg.NoError(t, err, "ActiveGeneration")
+	requirepkg.Equal(t, genA, active.ID, "A is serving")
+
+	// B: a new building generation for the same corpus. The message reads
+	// as missing for B (embed_gen still names A), but A keeps serving
+	// unchanged — stale-but-correct mid-rebuild.
+	genB, err := b.CreateGeneration(ctx, "model-b", 768, "")
+	requirepkg.NoError(t, err, "CreateGeneration B")
+	requirepkg.Equal(t, 1, missingCountSV(t, b, genB), "message missing for B mid-rebuild")
+	active, err = b.ActiveGeneration(ctx)
+	requirepkg.NoError(t, err, "ActiveGeneration mid-rebuild")
+	assertpkg.Equal(t, genA, active.ID, "A still serving while B builds")
+
+	// B's activation is refused until its coverage is complete.
+	requirepkg.Error(t, b.ActivateGeneration(ctx, genB, false), "B refused while incomplete")
+
+	// Cover the message for B (worker would do this after upsert), then
+	// activate B — the swap retires A and makes B the single serving gen.
+	_, err = b.mainDB.ExecContext(ctx, `UPDATE messages SET embed_gen = ? WHERE id = 1`, int64(genB))
+	requirepkg.NoError(t, err, "stamp embed_gen for B")
+	requirepkg.NoError(t, b.ActivateGeneration(ctx, genB, false), "activate B after coverage complete")
+
+	active, err = b.ActiveGeneration(ctx)
+	requirepkg.NoError(t, err, "ActiveGeneration after swap")
+	assertpkg.Equal(t, genB, active.ID, "B is the single serving gen after swap")
+	assertpkg.Equal(t, vector.GenerationRetired, genStateSV(t, b, genA), "A retired by the swap")
+}
+
 // singleRetiredGenSV returns the id of the one generation in state='retired',
 // failing if there is not exactly one. Used by the auto-retire RETURNING-id
 // test to prove the reaped id is the same row whose state flipped to retired.
