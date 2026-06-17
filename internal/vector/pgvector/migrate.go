@@ -50,7 +50,7 @@ func Migrate(ctx context.Context, db migrateExecer, defaultDim int, skipExtensio
 
 	// Wrap the schema apply AND the redundant-index drop in a single
 	// transaction that disables the pool-wide 30s statement_timeout
-	// (finding S1, mirroring EnsureVectorIndex/seedPending). Two reasons:
+	// (finding S1, mirroring EnsureVectorIndex). Two reasons:
 	//   - DROP INDEX takes an ACCESS EXCLUSIVE lock; on a busy serve daemon
 	//     the lock-wait alone can exceed 30s.
 	//   - On a legacy populated DB, schema.sql's `CREATE INDEX IF NOT EXISTS`
