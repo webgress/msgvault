@@ -58,13 +58,23 @@ func Open(ctx context.Context, opts Options) (*Backend, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate vectors.db: %w", err)
 	}
-	return &Backend{
+	b := &Backend{
 		db:       db,
 		mainDB:   opts.MainDB,
 		path:     opts.Path,
 		mainPath: opts.MainPath,
 		dim:      opts.Dimension,
-	}, nil
+	}
+	// One-time upgrade backfill (Package A): stamp embed_gen for messages
+	// already embedded under the active generation, so an upgraded v0.14–
+	// v0.15 archive does not read as entirely missing and trigger a full
+	// re-embed. Ledger-guarded, so it runs at most once. No-ops when the
+	// main DB handle is absent (management commands) or already applied.
+	if err := b.BackfillEmbedGenForUpgrade(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("embed_gen upgrade backfill: %w", err)
+	}
+	return b, nil
 }
 
 // Close releases the vectors.db handle.

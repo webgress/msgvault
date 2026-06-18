@@ -71,12 +71,21 @@ func Open(ctx context.Context, opts Options) (*Backend, error) {
 	if opts.DB == nil {
 		return nil, errors.New("pgvector.Open: Options.DB is required")
 	}
+	b := &Backend{db: opts.DB}
 	if !opts.SkipMigrate {
 		if err := Migrate(ctx, opts.DB, opts.Dimension, opts.SkipExtension); err != nil {
 			return nil, fmt.Errorf("pgvector migrate: %w", err)
 		}
+		// One-time upgrade backfill (Package A): stamp embed_gen for messages
+		// already embedded under the active generation so an upgraded archive
+		// is not reported as entirely missing (which would re-embed it all).
+		// Ledger-guarded, runs at most once. Skipped on the SkipMigrate
+		// (read-only) path, where writes are rejected anyway.
+		if err := b.BackfillEmbedGenForUpgrade(ctx); err != nil {
+			return nil, fmt.Errorf("embed_gen upgrade backfill: %w", err)
+		}
 	}
-	return &Backend{db: opts.DB}, nil
+	return b, nil
 }
 
 // Close is a no-op for the pgvector backend: the *sql.DB handle is
