@@ -137,14 +137,31 @@ type EmbedGenStamp struct {
 // partial stamp (the next scan re-finds any unstamped row and re-runs an
 // idempotent batch). Used by the embed worker's content read→stamp path; the
 // backfill path keeps the plain SetEmbedGen (it has no read→stamp window).
-func (s *Store) SetEmbedGenIfUnchanged(ctx context.Context, items []EmbedGenStamp, target int64) error {
+//
+// Returns the ids whose per-row UPDATE matched 0 rows — the CAS MISSES. A miss
+// means last_modified moved between the worker's content read and this stamp
+// (a concurrent repair/edit bumped it via the DB triggers), so the row was NOT
+// stamped and stays "needs embedding". The worker surfaces these (logs them and
+// excludes them from its success accounting) but does NOT hold the watermark
+// back: a missed row's last_modified moved (and its embed_gen may be NULL), so
+// the auto-backstop's watermark-ignoring full scan re-finds and re-embeds it
+// with the corrected content. A real driver error still aborts (returns err).
+func (s *Store) SetEmbedGenIfUnchanged(ctx context.Context, items []EmbedGenStamp, target int64) (missed []int64, err error) {
 	for _, it := range items {
 		q := `UPDATE messages SET embed_gen = ? WHERE id = ? AND last_modified = ?`
-		if _, err := s.db.ExecContext(ctx, q, target, it.ID, it.LastModified); err != nil {
-			return fmt.Errorf("set embed_gen if unchanged (id=%d): %w", it.ID, err)
+		res, err := s.db.ExecContext(ctx, q, target, it.ID, it.LastModified)
+		if err != nil {
+			return missed, fmt.Errorf("set embed_gen if unchanged (id=%d): %w", it.ID, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return missed, fmt.Errorf("rows affected (id=%d): %w", it.ID, err)
+		}
+		if n == 0 {
+			missed = append(missed, it.ID)
 		}
 	}
-	return nil
+	return missed, nil
 }
 
 // ResetEmbedGen clears embed_gen (sets it back to NULL) on the given

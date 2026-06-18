@@ -39,7 +39,10 @@ type WorkStore interface {
 	// (optimistic CAS). A row whose last_modified changed (a concurrent
 	// content edit bumped it via the DB triggers) is not stamped and is
 	// re-found by the next scan. Used by the scan-and-fill read→stamp path.
-	SetEmbedGenIfUnchanged(ctx context.Context, items []store.EmbedGenStamp, target int64) error
+	// Returns the ids whose UPDATE matched 0 rows (the CAS misses) so the
+	// worker can log them and exclude them from its success accounting; the
+	// watermark still advances and the backstop recovers them.
+	SetEmbedGenIfUnchanged(ctx context.Context, items []store.EmbedGenStamp, target int64) (missed []int64, err error)
 }
 
 // WorkerDeps bundles the collaborators a Worker needs. Backend, VectorsDB,
@@ -410,7 +413,8 @@ func (w *Worker) run(ctx context.Context, gen vector.GenerationID, backstop bool
 				if len(eb.empty) > 0 {
 					w.deps.Log.Warn("messages empty after preprocess", "gen", gen, "ids", eb.empty)
 				}
-				if serr := w.stampCovered(ctx, gen, skipIDs, eb.lastModified); serr != nil {
+				missed, serr := w.stampCovered(ctx, gen, skipIDs, eb.lastModified)
+				if serr != nil {
 					res.Failed += len(skipIDs)
 					w.deps.Log.Error("stamp skip set failed", "error", serr, "gen", gen, "ids", len(skipIDs))
 					consecutiveFailures++
@@ -421,8 +425,11 @@ func (w *Worker) run(ctx context.Context, gen vector.GenerationID, backstop bool
 					}
 					continue
 				}
-				completedRows += len(skipIDs)
-				w.reportProgress(completedRows, len(skipIDs), 0, time.Since(batchStart))
+				w.logCASMisses(gen, missed)
+				// Count only rows actually stamped (a CAS miss was not stamped).
+				stampedRows := len(skipIDs) - len(missed)
+				completedRows += stampedRows
+				w.reportProgress(completedRows, stampedRows, 0, time.Since(batchStart))
 			}
 			consecutiveFailures = 0
 			afterID = batchMax
@@ -457,7 +464,8 @@ func (w *Worker) run(ctx context.Context, gen vector.GenerationID, backstop bool
 		// crash before this stamp just re-does the batch next scan. Stamp
 		// the union so embedded and skip-marked rows both drop out together.
 		stampIDs := append(append([]int64(nil), eb.embeddedIDs...), skipIDs...)
-		if serr := w.stampCovered(ctx, gen, stampIDs, eb.lastModified); serr != nil {
+		missed, serr := w.stampCovered(ctx, gen, stampIDs, eb.lastModified)
+		if serr != nil {
 			res.Failed += len(eb.embeddedIDs)
 			w.deps.Log.Error("stamp embed_gen failed", "gen", gen, "ids", len(stampIDs), "error", serr)
 			consecutiveFailures++
@@ -470,6 +478,7 @@ func (w *Worker) run(ctx context.Context, gen vector.GenerationID, backstop bool
 			// (the upsert already ran, so re-embedding is idempotent).
 			continue
 		}
+		w.logCASMisses(gen, missed)
 
 		if len(eb.missing) > 0 {
 			w.deps.Log.Warn("messages missing from main DB", "gen", gen, "ids", eb.missing)
@@ -478,12 +487,30 @@ func (w *Worker) run(ctx context.Context, gen vector.GenerationID, backstop bool
 			w.deps.Log.Warn("messages empty after preprocess", "gen", gen, "ids", eb.empty)
 		}
 
-		res.Succeeded += len(eb.embeddedIDs)
+		// Only rows ACTUALLY stamped count as succeeded. A CAS miss (its
+		// last_modified moved between read and stamp) was not stamped, so it is
+		// excluded from Succeeded and the backstop will recover it. The set of
+		// missed ids is a subset of the embedded ids stamped via the CAS path
+		// (missing ids use the unconditional stamp and never miss), so the
+		// embedded count net of misses is the forward success for this batch.
+		missedEmbedded := countMembers(eb.embeddedIDs, missed)
+		succeeded := len(eb.embeddedIDs) - missedEmbedded
+		res.Succeeded += succeeded
 		consecutiveFailures = 0
+		// Advance the watermark exactly as before — to batchMax — even on a
+		// whole-batch CAS miss. Holding it back would head-of-line-block the
+		// drain; the backstop is the recovery path for missed rows. Because the
+		// watermark always advances, the drain still terminates (no no-progress
+		// loop) even when a batch makes no forward success.
 		afterID = batchMax
 		w.advanceWatermark(ctx, gen, batchMax, backstop)
 
-		batchProcessed := len(eb.embeddedIDs) + len(skipIDs)
+		// Count only rows actually stamped toward progress (CAS misses were not
+		// stamped). When EVERY embedded id missed CAS and there are no skips,
+		// this batch made no forward progress for result/progress accounting —
+		// but we keep scanning (the watermark advanced), so the drain drains.
+		stampedSkips := len(skipIDs) - countMembers(skipIDs, missed)
+		batchProcessed := succeeded + stampedSkips
 		completedRows += batchProcessed
 		batchChars := 0
 		for _, c := range eb.chunks {
@@ -823,13 +850,16 @@ func (w *Worker) downshiftDrain(
 			// Missing/empty singleton — skip-mark it.
 			skip := append(append([]int64(nil), eb.missing...), eb.empty...)
 			if len(skip) > 0 {
-				if serr := w.stampCovered(ctx, gen, skip, eb.lastModified); serr != nil {
+				missed, serr := w.stampCovered(ctx, gen, skip, eb.lastModified)
+				if serr != nil {
 					res.Failed += len(skip)
 					return embedded, stamped, contiguousStampedID, fmt.Errorf("stamp skip: %w", serr)
 				}
-				stamped += len(skip)
-				*completedRows += len(skip)
-				w.reportProgress(*completedRows, len(skip), 0, time.Since(batchStart))
+				w.logCASMisses(gen, missed)
+				stampedSkip := len(skip) - len(missed)
+				stamped += stampedSkip
+				*completedRows += stampedSkip
+				w.reportProgress(*completedRows, stampedSkip, 0, time.Since(batchStart))
 			}
 			if !brokeContiguity {
 				contiguousStampedID = id
@@ -846,13 +876,19 @@ func (w *Worker) downshiftDrain(
 			}
 			return embedded, stamped, contiguousStampedID, fmt.Errorf("upsert: %w", uerr)
 		}
-		if serr := w.stampCovered(ctx, gen, eb.embeddedIDs, eb.lastModified); serr != nil {
+		missed, serr := w.stampCovered(ctx, gen, eb.embeddedIDs, eb.lastModified)
+		if serr != nil {
 			return embedded, stamped, contiguousStampedID, fmt.Errorf("stamp embed_gen: %w", serr)
 		}
+		w.logCASMisses(gen, missed)
+		// A CAS miss on this singleton means its content changed since the
+		// read: it was not stamped and the backstop will recover it, so it does
+		// not count as embedded/stamped here.
+		stampedHere := len(eb.embeddedIDs) - len(missed)
 		res.Truncated += eb.truncated
-		embedded += len(eb.embeddedIDs)
-		stamped += len(eb.embeddedIDs)
-		*completedRows += len(eb.embeddedIDs)
+		embedded += stampedHere
+		stamped += stampedHere
+		*completedRows += stampedHere
 		if !brokeContiguity {
 			contiguousStampedID = id
 		}
@@ -860,7 +896,7 @@ func (w *Worker) downshiftDrain(
 		for _, c := range eb.chunks {
 			batchChars += c.SourceCharLen
 		}
-		w.reportProgress(*completedRows, len(eb.embeddedIDs), batchChars, time.Since(batchStart))
+		w.reportProgress(*completedRows, stampedHere, batchChars, time.Since(batchStart))
 	}
 
 	// Drain finished cleanly: every id is resolved (stamped, skip-marked, or
@@ -881,18 +917,25 @@ func (w *Worker) downshiftDrain(
 				"gen", gen, "id", id, "error", lastDeferredErr)
 		}
 		dropStart := time.Now()
-		// Deferred drops were fetched and embed-attempted, so each carries a
-		// last_modified token: CAS-stamp them so a row whose content changed
-		// since the read is re-found rather than dropped with stale content.
-		if serr := w.stampCovered(ctx, gen, deferredDrops, lm); serr != nil {
+		// Deferred drops 4xx'd inside embedBatch, which discards its result on an
+		// Embed error — so these ids are NOT in lm and do NOT carry a
+		// last_modified token. stampCovered therefore routes them to the
+		// unconditional SetEmbedGen path: a degraded message that the embedder
+		// rejects is dropped (stamped) regardless of concurrent edits. (lm is
+		// still passed for the leading singletons that DID embed and recorded a
+		// token; for those a CAS miss leaves the row for the backstop.)
+		missed, serr := w.stampCovered(ctx, gen, deferredDrops, lm)
+		if serr != nil {
 			res.Failed += len(deferredDrops)
 			// Some deferred drops are now unstamped; do not advance past the
 			// contiguous-stamped prefix.
 			return embedded, stamped, contiguousStampedID, fmt.Errorf("stamp drop: %w", serr)
 		}
-		stamped += len(deferredDrops)
-		*completedRows += len(deferredDrops)
-		w.reportProgress(*completedRows, len(deferredDrops), 0, time.Since(dropStart))
+		w.logCASMisses(gen, missed)
+		stampedDrops := len(deferredDrops) - len(missed)
+		stamped += stampedDrops
+		*completedRows += stampedDrops
+		w.reportProgress(*completedRows, stampedDrops, 0, time.Since(dropStart))
 		// All deferred drops are now stamped; the entire batch is resolved.
 		return embedded, stamped, safeAdvanceID, nil
 	}
@@ -921,11 +964,13 @@ func (w *Worker) downshiftDrain(
 //     unconditionally via SetEmbedGen — there is no content and no token to
 //     guard, and they must drop out of the scan so it can advance.
 //
-// A failure on either path is returned so the caller can apply its
-// consecutive-failure accounting; the two paths are independent (the CAS
-// stamp not finding a row is NOT an error — it returns nil with 0 rows
-// affected, which is exactly the intended race outcome).
-func (w *Worker) stampCovered(ctx context.Context, gen vector.GenerationID, ids []int64, lm map[int64]any) error {
+// Returns the CAS-MISS ids: rows whose optimistic-CAS UPDATE matched 0 rows
+// because last_modified moved between read and stamp (a concurrent repair/edit).
+// They were NOT stamped; the caller logs them and excludes them from success
+// accounting. The watermark still advances (the caller's job) and the backstop
+// recovers them. A missed CAS is NOT an error — only a real driver failure on
+// either path returns err, for the caller's consecutive-failure accounting.
+func (w *Worker) stampCovered(ctx context.Context, gen vector.GenerationID, ids []int64, lm map[int64]any) (missed []int64, err error) {
 	var cas []store.EmbedGenStamp
 	var plain []int64
 	for _, id := range ids {
@@ -936,16 +981,33 @@ func (w *Worker) stampCovered(ctx context.Context, gen vector.GenerationID, ids 
 		}
 	}
 	if len(cas) > 0 {
-		if err := w.deps.Store.SetEmbedGenIfUnchanged(ctx, cas, int64(gen)); err != nil {
-			return err
+		m, err := w.deps.Store.SetEmbedGenIfUnchanged(ctx, cas, int64(gen))
+		if err != nil {
+			return missed, err
 		}
+		missed = append(missed, m...)
 	}
 	if len(plain) > 0 {
 		if err := w.deps.Store.SetEmbedGen(ctx, plain, int64(gen)); err != nil {
-			return err
+			return missed, err
 		}
 	}
-	return nil
+	return missed, nil
+}
+
+// logCASMisses records the CAS-missed ids returned by stampCovered. A miss
+// means last_modified moved between the worker's content read and the stamp (a
+// concurrent repair/edit), so the row was not stamped. These rows are NOT lost:
+// their last_modified moved (embed_gen may be NULL), so the auto-backstop's
+// watermark-ignoring scan re-finds and re-embeds them with the corrected
+// content. The watermark is deliberately NOT held back (that would
+// head-of-line-block the drain); the backstop is the recovery mechanism.
+func (w *Worker) logCASMisses(gen vector.GenerationID, missed []int64) {
+	if len(missed) == 0 {
+		return
+	}
+	w.deps.Log.Info("embed: embed_gen CAS misses (concurrent edit); will be recovered by backstop",
+		"gen", gen, "count", len(missed), "ids", missed)
 }
 
 func (w *Worker) reportProgress(done, batchMsgs, batchChars int, batchElapsed time.Duration) {
@@ -960,6 +1022,27 @@ func (w *Worker) reportProgress(done, batchMsgs, batchChars int, batchElapsed ti
 		BatchElapsed: batchElapsed,
 		RunElapsed:   time.Since(w.runStart),
 	})
+}
+
+// countMembers returns how many ids in `set` also appear in `subset`. Used to
+// count how many of a batch's stamped ids were actually CAS misses (the missed
+// slice is a subset of the ids passed to stampCovered) so the worker can net
+// them out of its success/progress accounting.
+func countMembers(set, subset []int64) int {
+	if len(set) == 0 || len(subset) == 0 {
+		return 0
+	}
+	want := make(map[int64]struct{}, len(subset))
+	for _, id := range subset {
+		want[id] = struct{}{}
+	}
+	n := 0
+	for _, id := range set {
+		if _, ok := want[id]; ok {
+			n++
+		}
+	}
+	return n
 }
 
 // totalPieceChars sums the rune counts of every chunk in the batch, for

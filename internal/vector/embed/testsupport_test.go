@@ -100,16 +100,25 @@ func (s *testWorkStore) SetEmbedGen(ctx context.Context, ids []int64, target int
 
 // SetEmbedGenIfUnchanged mirrors store.Store.SetEmbedGenIfUnchanged: a
 // per-row optimistic-CAS stamp gated on last_modified, used by the worker's
-// content read→stamp path.
-func (s *testWorkStore) SetEmbedGenIfUnchanged(ctx context.Context, items []store.EmbedGenStamp, target int64) error {
+// content read→stamp path. Returns the ids whose UPDATE matched 0 rows (CAS
+// misses) so the worker can log them and exclude them from success accounting.
+func (s *testWorkStore) SetEmbedGenIfUnchanged(ctx context.Context, items []store.EmbedGenStamp, target int64) (missed []int64, err error) {
 	for _, it := range items {
-		if _, err := s.db.ExecContext(ctx,
+		res, err := s.db.ExecContext(ctx,
 			`UPDATE messages SET embed_gen = ? WHERE id = ? AND last_modified = ?`,
-			target, it.ID, it.LastModified); err != nil {
-			return err
+			target, it.ID, it.LastModified)
+		if err != nil {
+			return missed, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return missed, err
+		}
+		if n == 0 {
+			missed = append(missed, it.ID)
 		}
 	}
-	return nil
+	return missed, nil
 }
 
 // countMissing returns how many live messages still need embedding for

@@ -79,15 +79,24 @@ func (s *pgWorkStore) SetEmbedGen(ctx context.Context, ids []int64, target int64
 
 // SetEmbedGenIfUnchanged mirrors store.Store.SetEmbedGenIfUnchanged on the
 // PG test schema: a per-row optimistic-CAS stamp gated on last_modified.
-func (s *pgWorkStore) SetEmbedGenIfUnchanged(ctx context.Context, items []store.EmbedGenStamp, target int64) error {
+// Returns the ids whose UPDATE matched 0 rows (CAS misses).
+func (s *pgWorkStore) SetEmbedGenIfUnchanged(ctx context.Context, items []store.EmbedGenStamp, target int64) (missed []int64, err error) {
 	for _, it := range items {
-		if _, err := s.db.ExecContext(ctx,
+		res, err := s.db.ExecContext(ctx,
 			`UPDATE messages SET embed_gen = $1 WHERE id = $2 AND last_modified = $3`,
-			target, it.ID, it.LastModified); err != nil {
-			return err
+			target, it.ID, it.LastModified)
+		if err != nil {
+			return missed, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return missed, err
+		}
+		if n == 0 {
+			missed = append(missed, it.ID)
 		}
 	}
-	return nil
+	return missed, nil
 }
 
 func int64ArrayLiteral(ids []int64) string {
@@ -288,6 +297,20 @@ func pgLMOf(t *testing.T, db *sql.DB, id int64) string {
 	return s
 }
 
+// pgReadWatermark returns the persisted forward-scan watermark for gen on PG
+// (0 if absent).
+func pgReadWatermark(t *testing.T, db *sql.DB, gen int64) int64 {
+	t.Helper()
+	var id int64
+	err := db.QueryRow(
+		`SELECT watermark_id FROM embed_watermark WHERE generation_id = $1`, gen).Scan(&id)
+	if err == sql.ErrNoRows {
+		return 0
+	}
+	require.NoError(t, err, "pgReadWatermark")
+	return id
+}
+
 // TestWorkerPG_TriggersBumpLastModified verifies the PG trigger pair: a
 // message UPDATE and a message_bodies INSERT/UPDATE both move
 // messages.last_modified.
@@ -372,7 +395,7 @@ func TestWorkerPG_CASRepairRace(t *testing.T) {
 		LastModifiedExpr: "m.last_modified",
 		BatchSize:        1,
 	})
-	_, err = w.RunOnce(ctx, gen)
+	res, err := w.RunOnce(ctx, gen)
 	require.NoError(t, err, "RunOnce")
 
 	// CAS targeted the stale token; the row moved, so it is NOT stamped.
@@ -383,9 +406,15 @@ func TestWorkerPG_CASRepairRace(t *testing.T) {
 	assert.Equal(t, 1, pgCountMissing(t, db, int64(gen)), "raced row still needs embedding")
 	assert.NotEqual(t, token, pgLMOf(t, db, 1), "last_modified bumped by race")
 
+	// A CAS miss is not counted as a success, and the watermark still advances
+	// past the missed row (id 1) — the drain does not stick.
+	assert.Equal(t, 0, res.Succeeded, "CAS-missed row not counted in Succeeded")
+	assert.Equal(t, int64(1), pgReadWatermark(t, db, int64(gen)),
+		"watermark advances past the CAS-missed row")
+
 	// Recovery: backstop re-embeds with the corrected content.
 	client.preReturn = nil
-	res, err := w.RunBackstop(ctx, gen)
+	res, err = w.RunBackstop(ctx, gen)
 	require.NoError(t, err, "RunBackstop recovery")
 	assert.Equal(t, 1, res.Succeeded, "raced row re-embedded on recovery")
 	assert.Equal(t, 0, pgCountMissing(t, db, int64(gen)), "coverage complete after recovery")

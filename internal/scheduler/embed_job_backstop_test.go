@@ -61,15 +61,23 @@ func (s *e2eWorkStore) SetEmbedGen(ctx context.Context, ids []int64, target int6
 	return err
 }
 
-func (s *e2eWorkStore) SetEmbedGenIfUnchanged(ctx context.Context, items []store.EmbedGenStamp, target int64) error {
+func (s *e2eWorkStore) SetEmbedGenIfUnchanged(ctx context.Context, items []store.EmbedGenStamp, target int64) (missed []int64, err error) {
 	for _, it := range items {
-		if _, err := s.db.ExecContext(ctx,
+		res, err := s.db.ExecContext(ctx,
 			`UPDATE messages SET embed_gen = ? WHERE id = ? AND last_modified = ?`,
-			target, it.ID, it.LastModified); err != nil {
-			return err
+			target, it.ID, it.LastModified)
+		if err != nil {
+			return missed, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return missed, err
+		}
+		if n == 0 {
+			missed = append(missed, it.ID)
 		}
 	}
-	return nil
+	return missed, nil
 }
 
 // e2eCoverage satisfies EmbedCoverage from the live main DB so the

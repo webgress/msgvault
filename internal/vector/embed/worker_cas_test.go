@@ -3,8 +3,10 @@
 package embed
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -67,7 +69,7 @@ func TestWorker_CASRepairRace(t *testing.T) {
 	}
 
 	w := newTestWorker(f, 1)
-	_, err := w.RunOnce(ctx, f.BuildingGen)
+	res, err := w.RunOnce(ctx, f.BuildingGen)
 	require.NoError(t, err, "RunOnce")
 
 	// The CAS stamp targeted WHERE last_modified = T, but the row is now T2,
@@ -79,13 +81,21 @@ func TestWorker_CASRepairRace(t *testing.T) {
 	assert.Equal(t, 1, countMissing(t, f.MainDB, int64(f.BuildingGen)),
 		"raced row still needs embedding")
 
+	// A CAS miss is NOT counted as a success.
+	assert.Equal(t, 0, res.Succeeded, "CAS-missed row not counted in Succeeded")
+
+	// The watermark still advances to batchMax (the single scanned id) — the
+	// drain does not stick on the missed row; the backstop is the recovery.
+	assert.Equal(t, int64(1), readWatermark(t, f.VectorsDB, int64(f.BuildingGen)),
+		"watermark advances past the CAS-missed row")
+
 	// Confirm last_modified actually moved (the race really happened).
 	assert.NotEqual(t, tokenAtRead, lmOf(t, f.MainDB, 1), "last_modified bumped by race")
 
 	// Recovery: clear the preReturn race, then a backstop pass (scans from 0,
 	// ignoring the watermark) re-embeds the row with the corrected content.
 	f.FakeClient.preReturn = nil
-	res, err := w.RunBackstop(ctx, f.BuildingGen)
+	res, err = w.RunBackstop(ctx, f.BuildingGen)
 	require.NoError(t, err, "RunBackstop recovery")
 	assert.Equal(t, 1, res.Succeeded, "raced row re-embedded on recovery")
 	assert.Equal(t, 0, countMissing(t, f.MainDB, int64(f.BuildingGen)),
@@ -121,8 +131,10 @@ func TestWorker_CASRepairRace_OldCodeWouldFail(t *testing.T) {
 	_, err = f.MainDB.Exec(`UPDATE messages SET embed_gen = NULL WHERE id = 1`)
 	require.NoError(t, err, "reset for CAS check")
 	staleToken := "2000-01-01 00:00:00"
-	require.NoError(t, f.Store.SetEmbedGenIfUnchanged(ctx,
-		stamps(1, staleToken), int64(f.BuildingGen)), "CAS with stale token")
+	missed, err := f.Store.SetEmbedGenIfUnchanged(ctx,
+		stamps(1, staleToken), int64(f.BuildingGen))
+	require.NoError(t, err, "CAS with stale token")
+	assert.Equal(t, []int64{1}, missed, "stale-token CAS returns the missed id")
 	assert.Equal(t, 1, countMissing(t, f.MainDB, int64(f.BuildingGen)),
 		"NEW code: CAS with stale token leaves row needing embedding")
 }
@@ -150,6 +162,81 @@ func TestWorker_CASNormalPath(t *testing.T) {
 	}
 }
 
+// TestWorker_CASMissAccounting is the focused accounting regression for the
+// "surface CAS misses" change: in a batch where ONE row is raced (its
+// last_modified moves between read and stamp) and the others are not, the
+// worker must (a) NOT count the missed row in Succeeded, (b) LOG the missed id,
+// (c) still ADVANCE the watermark to batchMax (no head-of-line block), and (d)
+// recover the missed row on a subsequent RunBackstop.
+func TestWorker_CASMissAccounting(t *testing.T) {
+	ctx := context.Background()
+	f := newWorkerFixture(t, 2)
+
+	// Pin both rows' last_modified to a fixed far-past token (= what the worker
+	// captures at read time) so the raced bump is guaranteed to differ.
+	setBaselineLM(t, f.MainDB, 1)
+	setBaselineLM(t, f.MainDB, 2)
+
+	// Inject the race for ONLY message 1: after the worker scanned + read both
+	// rows' content (capturing last_modified), rewrite msg 1's body (bumps its
+	// last_modified via trigger; CAS for id 1 will miss) and reset its
+	// embed_gen. Message 2 is untouched and stamps normally.
+	f.FakeClient.preReturn = func() {
+		_, err := f.MainDB.Exec(
+			`UPDATE message_bodies SET body_text = 'corrected content' WHERE message_id = 1`)
+		require.NoError(t, err, "race: rewrite body of msg 1")
+		_, err = f.MainDB.Exec(`UPDATE messages SET embed_gen = NULL WHERE id = 1`)
+		require.NoError(t, err, "race: reset embed_gen of msg 1")
+	}
+
+	var logbuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logbuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	// Batch size 2 so both ids are read and stamped in one batch (one CAS miss,
+	// one success).
+	w := NewWorker(WorkerDeps{
+		Backend:   f.Backend,
+		VectorsDB: f.VectorsDB,
+		MainDB:    f.MainDB,
+		Store:     f.Store,
+		Client:    f.FakeClient,
+		BatchSize: 2,
+		Log:       logger,
+	})
+	res, err := w.RunOnce(ctx, f.BuildingGen)
+	require.NoError(t, err, "RunOnce")
+
+	// (a) Only the non-raced row counts as succeeded; the CAS miss does not.
+	assert.Equal(t, 1, res.Succeeded, "only the non-raced row counts as Succeeded")
+
+	// (b) The missed id is logged.
+	logs := logbuf.String()
+	assert.Contains(t, logs, "embed_gen CAS misses", "CAS miss is logged")
+	assert.Contains(t, logs, "count=1", "logs the miss count")
+
+	// (c) The watermark advanced to batchMax (id 2) despite the miss — the
+	// drain does not stick on the missed row.
+	assert.Equal(t, int64(2), readWatermark(t, f.VectorsDB, int64(f.BuildingGen)),
+		"watermark advances to batchMax despite the CAS miss")
+
+	// The raced row (1) is still missing; the clean row (2) is covered.
+	_, isNull := embedGenOf(t, f.MainDB, 1)
+	assert.True(t, isNull, "raced row 1 still needs embedding")
+	v2, isNull2 := embedGenOf(t, f.MainDB, 2)
+	assert.False(t, isNull2, "clean row 2 stamped")
+	assert.Equal(t, int64(f.BuildingGen), v2, "row 2 embed_gen")
+	assert.Equal(t, 1, countMissing(t, f.MainDB, int64(f.BuildingGen)),
+		"exactly the raced row remains")
+
+	// (d) A backstop pass (scans from 0, ignoring the watermark) recovers the
+	// CAS-missed row with its corrected content.
+	f.FakeClient.preReturn = nil
+	bres, err := w.RunBackstop(ctx, f.BuildingGen)
+	require.NoError(t, err, "RunBackstop recovery")
+	assert.Equal(t, 1, bres.Succeeded, "backstop re-embeds the CAS-missed row")
+	assert.Equal(t, 0, countMissing(t, f.MainDB, int64(f.BuildingGen)),
+		"coverage complete after backstop")
+}
+
 // TestWorker_CASSelfBumpDoesNotBlockStamp pins the self-bump invariant: the
 // stamp UPDATE itself fires the AFTER-UPDATE trigger and bumps last_modified,
 // but because the WHERE compares the PRE-trigger value the stamp still
@@ -159,8 +246,10 @@ func TestWorker_CASSelfBumpDoesNotBlockStamp(t *testing.T) {
 	f := newWorkerFixture(t, 1)
 	token := setBaselineLM(t, f.MainDB, 1)
 
-	require.NoError(t, f.Store.SetEmbedGenIfUnchanged(ctx,
-		stamps(1, token), int64(f.BuildingGen)), "CAS stamp")
+	missed, err := f.Store.SetEmbedGenIfUnchanged(ctx,
+		stamps(1, token), int64(f.BuildingGen))
+	require.NoError(t, err, "CAS stamp")
+	assert.Empty(t, missed, "self-bump stamp succeeds (no CAS miss)")
 
 	v, isNull := embedGenOf(t, f.MainDB, 1)
 	require.False(t, isNull, "row stamped despite self-bump")
