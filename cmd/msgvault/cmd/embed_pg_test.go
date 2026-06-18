@@ -34,9 +34,11 @@ func countEmbeddingRowsPG(t *testing.T, db *sql.DB, gen vector.GenerationID) int
 	return n
 }
 
-// seedGenWithEmbeddingsPG creates a building generation, upserts one chunk per
-// supplied message id (dim 4), and clears its pending queue so the management
-// commands treat it as a finished generation. Returns the generation id.
+// seedGenWithEmbeddingsPG creates a building generation and upserts one chunk
+// per supplied message id (dim 4). The consuming tests force-activate/retire
+// (force=true), bypassing the coverage gate, so no embed_gen stamping is
+// needed to make the management commands treat it as finished. Returns the
+// generation id.
 func seedGenWithEmbeddingsPG(t *testing.T, pgb *pgvector.Backend, ids ...int64) vector.GenerationID {
 	t.Helper()
 	ctx := context.Background()

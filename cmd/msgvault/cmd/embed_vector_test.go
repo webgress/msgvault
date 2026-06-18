@@ -20,7 +20,8 @@ import (
 )
 
 // openTestBackend opens a fresh in-memory-ish sqlitevec backend with a
-// single pre-seeded message so CreateGeneration has something to enqueue.
+// single pre-seeded message so the scan-and-fill worker has a message to
+// discover and embed.
 func openTestBackend(t *testing.T) *sqlitevec.Backend {
 	t.Helper()
 	ctx := context.Background()

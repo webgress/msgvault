@@ -575,8 +575,10 @@ func (s *Syncer) parseToModel(sourceID int64, raw *gmail.RawMessage, threadID st
 	}, nil
 }
 
-// persistMessage stores a parsed message and all related data. Returns
-// the internal message ID for hooks (e.g. vector-search enqueue).
+// persistMessage stores a parsed message and all related data, returning
+// the internal message ID to callers. No vector-search enqueue happens
+// here: persisted rows leave embed_gen NULL (column default) and the
+// scan-and-fill worker discovers them later.
 func (s *Syncer) persistMessage(data *messageData, labelMap map[string]int64) (int64, error) {
 	// Map Gmail label IDs to internal IDs
 	var labelIDs []int64
