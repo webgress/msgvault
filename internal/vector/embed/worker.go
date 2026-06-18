@@ -869,6 +869,11 @@ func (w *Worker) downshiftDrain(
 		if len(eb.chunks) == 0 {
 			// Missing/empty singleton — skip-mark it.
 			skip := append(append([]int64(nil), eb.missing...), eb.empty...)
+			// stampedThisID reports whether this singleton's skip-mark actually
+			// landed. Default true so the len(skip)==0 sub-case (nothing to
+			// skip-mark — should not normally happen here, but guard it) does
+			// NOT break contiguity: there is no unstamped row to strand.
+			stampedThisID := true
 			if len(skip) > 0 {
 				missed, serr := w.stampCovered(ctx, gen, skip, eb.lastModified)
 				if serr != nil {
@@ -880,9 +885,25 @@ func (w *Worker) downshiftDrain(
 				stamped += stampedSkip
 				*completedRows += stampedSkip
 				w.reportProgress(*completedRows, stampedSkip, 0, time.Since(batchStart))
+				// An empty singleton's skip-mark goes through the optimistic CAS
+				// (its last_modified token is captured at read time) and CAN miss
+				// when a concurrent edit moved last_modified — e.g. an empty
+				// message that just got real content via repair. A CAS miss leaves
+				// the row UNSTAMPED, so it must not be skipped past.
+				stampedThisID = stampedSkip > 0
 			}
-			if !brokeContiguity {
-				contiguousStampedID = id
+			// Advance the contiguous-stamped prefix only when this singleton was
+			// ACTUALLY stamped. A CAS-missed skip-mark (stampedThisID == false) is
+			// left unstamped and recovered by the backstop, so the watermark must
+			// not skip past it. Once a CAS miss breaks the prefix, latch
+			// brokeContiguity so a later stamped id cannot re-extend it over the
+			// unstamped gap.
+			if stampedThisID {
+				if !brokeContiguity {
+					contiguousStampedID = id
+				}
+			} else {
+				brokeContiguity = true
 			}
 			continue
 		}

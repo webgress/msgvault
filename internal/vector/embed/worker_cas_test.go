@@ -260,6 +260,116 @@ func TestWorker_CASSelfBumpDoesNotBlockStamp(t *testing.T) {
 	assert.NotEqual(t, token, lmOf(t, f.MainDB, 1), "self-bump moved last_modified")
 }
 
+// casMissStore wraps a WorkStore and forces a CAS miss for a designated id by
+// bumping that id's last_modified IMMEDIATELY BEFORE delegating to the real
+// optimistic-CAS stamp. This simulates a concurrent content edit (e.g. an empty
+// message that just got real content via repair) landing in the worker's
+// read→stamp window for an EMPTY singleton — whose skip-mark never calls the
+// embedder, so the FakeClient's preReturn/OnEmbed hooks cannot inject the race.
+type casMissStore struct {
+	WorkStore
+	db     *sql.DB
+	missID int64
+}
+
+func (s *casMissStore) SetEmbedGenIfUnchanged(ctx context.Context, items []store.EmbedGenStamp, target int64) (missed []int64, err error) {
+	for _, it := range items {
+		if it.ID == s.missID {
+			// Move last_modified off the worker's captured token so the CAS
+			// below matches 0 rows for this id (the concurrent-edit race).
+			_, err := s.db.ExecContext(ctx,
+				`UPDATE messages SET last_modified = '2099-01-01 00:00:00' WHERE id = ?`, it.ID)
+			if err != nil {
+				return missed, err
+			}
+		}
+	}
+	return s.WorkStore.SetEmbedGenIfUnchanged(ctx, items, target)
+}
+
+// TestWorker_Downshift_EmptySkipCASMissNotSkippedPastWatermark is the
+// fail-on-regression for the empty/skip-mark contiguity bug (Codex 129h
+// follow-up). Within a singleton drain, an EMPTY singleton (id 1) CAS-MISSES
+// its skip-mark (a concurrent edit moved last_modified between the worker's
+// content read and the stamp), and a later sibling (id 2) returns a genuine 4xx
+// while NOTHING embeds — so the drain takes the all-drop error/return path and
+// the caller advances the watermark to the drain's safeAdvanceID
+// (contiguousStampedID).
+//
+// PRE-FIX: the empty/skip branch advanced contiguousStampedID to the empty
+// singleton's id gated ONLY on !brokeContiguity — it ignored whether the
+// skip-mark actually stamped. A CAS-missed (unstamped) empty singleton therefore
+// extended the contiguous-stamped prefix, so the error-path safeAdvanceID
+// skipped PAST it: the watermark advanced to id 1, and a subsequent NORMAL
+// RunOnce (id > watermark) no longer re-found the unstamped row — only the
+// backstop's full scan from 0 could recover it (backstop-only recovery).
+//
+// POST-FIX: the branch mirrors the embed branch — it advances the prefix only
+// when the skip-mark ACTUALLY stamped, else latches brokeContiguity. The
+// CAS-missed empty singleton breaks the prefix, so safeAdvanceID stays below it;
+// the watermark does not skip past it and a normal RunOnce re-finds it.
+func TestWorker_Downshift_EmptySkipCASMissNotSkippedPastWatermark(t *testing.T) {
+	ctx := context.Background()
+	f := newWorkerFixture(t, 2)
+
+	// Make msg 1 EMPTY (no subject, blank body) so embedBatch reports it in
+	// `empty` and the singleton drain takes the len(eb.chunks)==0 skip branch.
+	_, err := f.MainDB.Exec(`UPDATE messages SET subject = NULL WHERE id = 1`)
+	require.NoError(t, err, "null subject of msg 1")
+	_, err = f.MainDB.Exec(`UPDATE message_bodies SET body_text = '' WHERE message_id = 1`)
+	require.NoError(t, err, "blank body of msg 1")
+
+	// Wrap the store so msg 1's skip-mark CAS misses (simulates a concurrent
+	// repair landing in the read→stamp window). msg 2 is untouched.
+	casStore := &casMissStore{WorkStore: f.Store, db: f.MainDB, missID: 1}
+
+	// Force the downshift, then a genuine 4xx for msg 2 with NOTHING embedded:
+	//   - the whole-batch embedBatch call (msg 2's chunk; msg 1 is empty) 4xxs;
+	//   - singleton msg 1 is empty → no Embed call → skip branch (CAS misses);
+	//   - singleton msg 2 4xxs → deferred; embeddedOK stays 0 → all-drop return.
+	f.FakeClient.OnEmbed = func(inputs []string) ([][]float32, error) {
+		return nil, fmt.Errorf("embed: HTTP 400: blocked content: %w", ErrPermanent4xx)
+	}
+
+	w := NewWorker(WorkerDeps{
+		Backend:                f.Backend,
+		VectorsDB:              f.VectorsDB,
+		MainDB:                 f.MainDB,
+		Store:                  casStore,
+		Client:                 f.FakeClient,
+		BatchSize:              2,
+		MaxConsecutiveFailures: 1, // abort after the single all-drop failure (no busy re-scan)
+	})
+
+	// The drain is an all-drop (embeddedOK==0): RunOnce returns the wrapped
+	// ErrPermanent4xx without advancing past the unstamped rows.
+	_, err = w.RunOnce(ctx, f.BuildingGen)
+	require.Error(t, err, "all-drop drain surfaces an error")
+
+	// THE INVARIANT: the watermark must NOT skip past the CAS-missed empty
+	// singleton (id 1). Pre-fix it advanced to 1 (stranding the row); post-fix
+	// it stays below 1 so a normal scan (id > watermark) re-finds it.
+	assert.Less(t, readWatermark(t, f.VectorsDB, int64(f.BuildingGen)), int64(1),
+		"watermark must not skip past the CAS-missed empty singleton")
+
+	// The empty singleton was NOT stamped (its skip-mark CAS-missed) and so
+	// still needs embedding — recoverable.
+	_, isNull1 := embedGenOf(t, f.MainDB, 1)
+	assert.True(t, isNull1, "CAS-missed empty singleton (msg 1) left unstamped")
+
+	// Concrete proof of re-discovery by a NORMAL (non-backstop) scan: with the
+	// 4xx cleared and the race no longer firing, a plain RunOnce re-finds msg 1
+	// (id > watermark) and skip-marks it. This is the behavior the bug broke —
+	// pre-fix the watermark sat at 1 and a normal RunOnce scanned id > 1 only,
+	// so msg 1 was reachable solely via the backstop.
+	f.FakeClient.OnEmbed = nil
+	casStore.missID = -1 // stop forcing the miss
+	_, err = w.RunOnce(ctx, f.BuildingGen)
+	require.NoError(t, err, "follow-up normal RunOnce")
+	_, isNull1After := embedGenOf(t, f.MainDB, 1)
+	assert.False(t, isNull1After, "normal RunOnce re-found and skip-marked msg 1 (not backstop-only)")
+}
+
 // TestWorker_Downshift_CASMissNotAllDrop is the fail-on-regression for the
 // downshift all-drop misclassification (Codex 129h). Within a singleton drain,
 // one message genuinely returns a permanent 4xx while ANOTHER embeds + upserts
