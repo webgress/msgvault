@@ -106,7 +106,27 @@ func fillFullCoverage(ctx context.Context, backend vector.Backend, row *embeddin
 	return nil
 }
 
+// ensureMainSchema opens the main DB and runs InitSchema so that an
+// upgraded SQLite archive (whose messages table predates the embed_gen
+// column) gets the column added before any management command reads
+// embed_gen via CoverageCounts. Mirrors the serve.go / runEmbed pattern.
+// Cheap and idempotent on an already-current schema; harmless on PG.
+func ensureMainSchema() error {
+	s, err := store.Open(cfg.DatabaseDSN())
+	if err != nil {
+		return fmt.Errorf("open main db: %w", err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.InitSchema(); err != nil {
+		return fmt.Errorf("init schema: %w", err)
+	}
+	return nil
+}
+
 func runEmbeddingsList(cmd *cobra.Command, _ []string) error {
+	if err := ensureMainSchema(); err != nil {
+		return err
+	}
 	db, rebind, closeDB, err := openEmbeddingsMetadataDB(cmd.Context())
 	if err != nil {
 		return err
@@ -179,6 +199,9 @@ func runEmbeddingsRetire(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := ensureMainSchema(); err != nil {
+		return err
+	}
 
 	db, rebind, closeDB, err := openEmbeddingsMetadataDB(cmd.Context())
 	if err != nil {
@@ -233,6 +256,9 @@ func runEmbeddingsRetire(cmd *cobra.Command, args []string) error {
 func runEmbeddingsActivate(cmd *cobra.Command, args []string) error {
 	gen, err := parseGenerationID(args[0])
 	if err != nil {
+		return err
+	}
+	if err := ensureMainSchema(); err != nil {
 		return err
 	}
 

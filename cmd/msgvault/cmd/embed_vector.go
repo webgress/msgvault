@@ -29,6 +29,15 @@ func runEmbed(cmd *cobra.Command) error {
 	}
 	defer func() { _ = s.Close() }()
 
+	// Auto-migrate the main schema before any embed_gen access. On an
+	// upgraded SQLite DB whose messages table predates the embed_gen
+	// column, InitSchema's LegacyColumnMigrations adds it; without this
+	// the backfill UPDATE and CoverageCounts below fail with "no such
+	// column: embed_gen". serve.go does the same before setupVectorFeatures.
+	if err := s.InitSchema(); err != nil {
+		return fmt.Errorf("init schema: %w", err)
+	}
+
 	var (
 		backend   vector.Backend
 		vectorsDB *sql.DB
