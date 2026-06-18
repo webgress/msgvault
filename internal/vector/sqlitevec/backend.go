@@ -366,13 +366,14 @@ func activateGateError(ctx context.Context, tx *sql.Tx, gen vector.GenerationID)
 	return fmt.Errorf("generation %d not in 'building' state", gen)
 }
 
-// RetireGeneration marks the given generation as retired and reaps its
-// queue rows in one transaction.
+// RetireGeneration marks the given generation as retired (a state flip
+// only). sqlitevec retains the retired generation's vectors (vec0 PARTITION
+// KEY isolation), so there is no queue to reap.
 //
 // Unless force is true, the state-flip UPDATE refuses to retire a generation
 // in state='active' (WHERE state != 'active'): if it affects zero rows the
 // active guard tripped, so the tx rolls back returning ErrRefuseRetireActive
-// WITHOUT reaping pending rows. SQLite serializes writers, so the guard and
+// leaving state unchanged. SQLite serializes writers, so the guard and
 // flip are atomic once inside the tx — closing the CLI's pre-flight TOCTOU so
 // a concurrent activation cannot retire the now-serving generation without
 // --force-active. force retires unconditionally (operator override).

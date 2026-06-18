@@ -353,7 +353,8 @@ func (w *Worker) run(ctx context.Context, gen vector.GenerationID, backstop bool
 				// past the unstamped straggler and the next RunOnce re-finds
 				// and retries it (idempotent). Without this, the watermark
 				// would advance to batchMax and the straggler would be
-				// stranded — the only recovery is the MANUAL-only backstop.
+				// stranded — recovered by the next backstop pass (manual
+				// `embeddings build --backstop` or the serve auto-backstop).
 				if embedded > 0 {
 					consecutiveFailures = 0
 				}

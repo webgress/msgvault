@@ -244,8 +244,8 @@ func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationI
 	defer func() { _ = tx.Rollback() }()
 
 	// Disable the pool-wide 30s statement_timeout for this tx: the auto-retire
-	// path below DELETEs the demoted generation's embeddings + pending rows,
-	// which are corpus-size on a large archive and can exceed the shared store
+	// path below DELETEs the demoted generation's embeddings, which are
+	// corpus-size on a large archive and can exceed the shared store
 	// pool's statement_timeout=30s, cancelling the activation at 30s and rolling
 	// it back (finding C1, S1 family). SET LOCAL is tx-scoped and auto-resets on
 	// commit/rollback, so the timeout cannot leak onto other connections. Must be
@@ -353,7 +353,7 @@ func activateGateError(ctx context.Context, tx *sql.Tx, gen vector.GenerationID,
 // Unless force is true, the state-flip UPDATE refuses to retire a generation
 // in state='active' (WHERE state != 'active'): if it affects zero rows the
 // active guard tripped, so the tx rolls back returning ErrRefuseRetireActive
-// WITHOUT touching embeddings or pending rows. The guard lives in the same tx
+// WITHOUT touching embeddings. The guard lives in the same tx
 // as the flip — closing the CLI's pre-flight TOCTOU so a concurrent
 // activation cannot delete the now-serving generation's embeddings without
 // --force-active. force retires unconditionally (operator override).
@@ -365,7 +365,7 @@ func (b *Backend) RetireGeneration(ctx context.Context, gen vector.GenerationID,
 	defer func() { _ = tx.Rollback() }()
 
 	// Disable the pool-wide 30s statement_timeout for this tx: the DELETEs below
-	// remove the retired generation's embeddings + pending rows, which are
+	// remove the retired generation's embeddings, which are
 	// corpus-size on a large archive and can exceed the shared store pool's
 	// statement_timeout=30s, cancelling the retire at 30s and rolling it back
 	// (finding C1, S1 family). SET LOCAL is tx-scoped and auto-resets on

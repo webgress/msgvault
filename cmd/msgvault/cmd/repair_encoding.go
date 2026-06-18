@@ -105,10 +105,10 @@ type repairStats struct {
 
 // repairEncoding runs all repair passes over s and returns the IDs of
 // messages whose embedding inputs (subject, body_text, or body_html)
-// were modified. Callers use that list to re-enqueue affected messages
-// for re-embedding so semantic search results don't stay stale against
-// the repaired text. Snippet-only repairs are NOT included because the
-// embedder doesn't read snippet.
+// were modified. Callers reset embed_gen to NULL (via s.ResetEmbedGen) on
+// those ids so the scan-and-fill worker re-embeds them and semantic search
+// results don't stay stale against the repaired text. Snippet-only repairs
+// are NOT included because the embedder doesn't read snippet.
 func repairEncoding(s *store.Store) (reembedNeededIDs []int64, err error) {
 	stats := &repairStats{}
 
@@ -264,9 +264,10 @@ func repairMessageFields(s *store.Store, stats *repairStats) (reembedNeededIDs [
 			}
 
 			// Any change to fields that feed the embedder (subject,
-			// body_text, body_html) invalidates prior embeddings and
-			// must trigger a re-enqueue. Snippet is not embedded, so
-			// snippet-only repairs are excluded.
+			// body_text, body_html) invalidates prior embeddings, so we
+			// reset embed_gen to NULL (via ResetEmbedGen) on these ids so
+			// the scan-and-fill worker re-embeds them. Snippet is not
+			// embedded, so snippet-only repairs are excluded.
 			if r.newSubject.Valid || r.newBody.Valid || r.newHTML.Valid {
 				reembedNeededIDs = append(reembedNeededIDs, r.id)
 			}
