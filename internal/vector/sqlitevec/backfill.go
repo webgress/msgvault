@@ -38,6 +38,15 @@ const backfillStampChunk = 500
 //     embedGenBackfillMigration). Check-then-run-then-mark. It must NOT run
 //     on every Open: re-running would clobber repair-encoding's NULL resets
 //     before they re-embed, and fight an in-progress rebuild.
+//     Accepted residual window: the check and the mark are NOT atomic across
+//     PROCESSES, so two concurrent first-opens of a freshly-upgraded DB
+//     (before either marks the ledger) can both run the backfill once; the
+//     second could re-stamp a row repair-encoding just reset to NULL. This
+//     window is ONE-SHOT (only at the first post-upgrade open, before the
+//     ledger is marked) and astronomically rare — accepted, not closed
+//     (operator decision): the mitigation is operational (run only one
+//     embedding process at a time; see README Vector Search). Within a single
+//     process the in-tx mark + EmbedJob single-flight lock prevent re-runs.
 //   - It lives in the VECTOR layer because the embeddings table is only
 //     reachable here (it is in vectors.db on SQLite, a separate *sql.DB
 //     from messages).
