@@ -76,6 +76,19 @@ func Open(ctx context.Context, opts Options) (*Backend, error) {
 		if err := Migrate(ctx, opts.DB, opts.Dimension, opts.SkipExtension); err != nil {
 			return nil, fmt.Errorf("pgvector migrate: %w", err)
 		}
+		// Orphaned-stamp reset (DB-recreate safety): clear embed_gen for any
+		// message whose stamp points to a generation id absent from
+		// index_generations. MUST run BEFORE BackfillEmbedGenForUpgrade. On PG
+		// messages and index_generations share one DB, so a true recreate means
+		// the whole DB was dropped (stamps and generations vanish together) —
+		// but the reset is kept for symmetry with sqlitevec and to defend
+		// against partial restores (e.g. messages restored, embeddings not).
+		// Not ledger-guarded: re-checks every writable Open; cheap + idempotent.
+		// Skipped here on the SkipMigrate (read-only) path, where writes are
+		// rejected anyway.
+		if err := b.resetOrphanedEmbedGen(ctx); err != nil {
+			return nil, fmt.Errorf("reset orphaned embed_gen: %w", err)
+		}
 		// One-time upgrade backfill (Package A): stamp embed_gen for messages
 		// already embedded under the active generation so an upgraded archive
 		// is not reported as entirely missing (which would re-embed it all).

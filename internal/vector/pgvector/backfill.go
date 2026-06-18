@@ -100,6 +100,44 @@ func (b *Backend) BackfillEmbedGenForUpgrade(ctx context.Context) error {
 	return b.markBackfillApplied(ctx)
 }
 
+// resetOrphanedEmbedGen clears messages.embed_gen for every message whose
+// stamp references a generation id that does NOT exist in index_generations
+// (an "orphaned" stamp). It runs on every WRITABLE Open BEFORE
+// BackfillEmbedGenForUpgrade.
+//
+// Why: this mirrors the sqlitevec safety net. On SQLite, index_generations
+// lives in a replaceable vectors.db and embed_gen lives in the durable
+// main.db, so a vectors.db wipe restarts gen ids at 1 while old stamps linger,
+// masking coverage and activating an empty index. On PG everything shares one
+// database, so a true recreate drops messages and index_generations together —
+// the orphan window only opens under a partial restore (e.g. messages restored
+// but embeddings/generations not). The reset is kept for symmetry and to
+// defend that partial-restore case.
+//
+// False-positive-proof: a stamp pointing to a still-existing generation row
+// (active, building, OR retired — retire only flips state, it does not delete
+// the row) is KEPT, so the normal activate/retire flow never trips this reset.
+// Only a vanished gen id triggers a clear.
+//
+// Single DB on PG: one UPDATE with a NOT IN subquery. `NOT IN (subquery)`
+// handles the empty case correctly in PostgreSQL (it degrades to "all rows"),
+// and index_generations.id is NOT NULL so the NULL-in-subquery pitfall cannot
+// arise.
+//
+// Guards (mirror BackfillEmbedGenForUpgrade / the Open SkipMigrate gate): the
+// caller (Open) skips this on the read-only SkipMigrate path. NOT
+// ledger-guarded: it re-checks every writable Open; cheap + idempotent (a
+// second run finds no orphans and updates nothing).
+func (b *Backend) resetOrphanedEmbedGen(ctx context.Context) error {
+	if _, err := b.db.ExecContext(ctx,
+		`UPDATE messages SET embed_gen = NULL
+		  WHERE embed_gen IS NOT NULL
+		    AND embed_gen NOT IN (SELECT id FROM index_generations)`); err != nil {
+		return fmt.Errorf("reset orphaned embed_gen: clear orphaned stamps: %w", err)
+	}
+	return nil
+}
+
 // backfillApplied reports whether the one-time backfill ledger row exists.
 func (b *Backend) backfillApplied(ctx context.Context) (bool, error) {
 	var n int

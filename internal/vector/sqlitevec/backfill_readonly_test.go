@@ -111,3 +111,59 @@ VALUES (1, 1, 1, 'm1', 'email');
 func vectorChunkOne() []vector.Chunk {
 	return []vector.Chunk{{MessageID: 1, ChunkIndex: 0, Vector: []float32{0, 0, 0, 1}}}
 }
+
+// TestResetOrphanedEmbedGen_ReadOnlyMainDB_Skipped is the read-only guard for
+// the orphaned-stamp reset (Codex 129c #1). The reset WRITES
+// messages.embed_gen, so a read-only main handle (MCP: store.OpenReadOnly,
+// _query_only=true) must SKIP it entirely — no write attempt, no error, stamps
+// untouched. Mirrors the backfill's b.readOnly guard.
+//
+// The setup leaves an ORPHANED stamp (embed_gen=99 with an empty
+// index_generations) so a writable Open WOULD reset it; the read-only Open
+// must not.
+func TestResetOrphanedEmbedGen_ReadOnlyMainDB_Skipped(t *testing.T) {
+	require.NoError(t, RegisterExtension(), "RegisterExtension")
+	ctx := context.Background()
+
+	dir := t.TempDir()
+	mainPath := filepath.Join(dir, "msgvault.db")
+	vecPath := filepath.Join(dir, "vectors.db")
+
+	// Build a real main DB with one live message whose embed_gen references a
+	// generation id that does NOT exist in the (empty) vectors.db
+	// index_generations — i.e. an orphaned stamp.
+	s, err := store.Open(mainPath)
+	require.NoError(t, err, "store.Open (rw)")
+	require.NoError(t, s.InitSchema(), "InitSchema")
+	_, err = s.DB().Exec(`
+INSERT INTO sources (id, source_type, identifier) VALUES (1, 'gmail', 'me@example.com');
+INSERT INTO conversations (id, source_id, conversation_type) VALUES (1, 1, 'email_thread');
+INSERT INTO messages (id, conversation_id, source_id, source_message_id, message_type, embed_gen)
+VALUES (1, 1, 1, 'm1', 'email', 99);
+`)
+	require.NoError(t, err, "seed message with orphaned embed_gen")
+	require.NoError(t, s.Close(), "close rw store")
+
+	// Reopen the main DB read-only, exactly as the MCP server does. Migrate
+	// will create an empty index_generations in vectors.db (read-write), so id
+	// 99 is orphaned; the reset would clear it on a WRITABLE open.
+	ro, err := store.OpenReadOnly(mainPath)
+	require.NoError(t, err, "store.OpenReadOnly")
+	defer func() { _ = ro.Close() }()
+
+	b, err := Open(ctx, Options{
+		Path:      vecPath,
+		MainPath:  mainPath,
+		Dimension: 4,
+		MainDB:    ro.DB(),
+		ReadOnly:  true,
+	})
+	require.NoError(t, err, "read-only Open must not error (reset skipped)")
+	defer func() { _ = b.Close() }()
+
+	// The orphaned stamp must be PRESERVED: a read-only Open writes nothing.
+	var v sql.NullInt64
+	require.NoError(t, ro.DB().QueryRow(`SELECT embed_gen FROM messages WHERE id = 1`).Scan(&v))
+	assert.True(t, v.Valid, "read-only Open must NOT reset the orphaned embed_gen")
+	assert.Equal(t, int64(99), v.Int64, "orphaned stamp unchanged under read-only Open")
+}

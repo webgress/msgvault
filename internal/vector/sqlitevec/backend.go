@@ -78,6 +78,18 @@ func Open(ctx context.Context, opts Options) (*Backend, error) {
 		dim:      opts.Dimension,
 		readOnly: opts.ReadOnly,
 	}
+	// Orphaned-stamp reset (vectors.db-recreate safety): clear embed_gen for
+	// any message whose stamp points to a generation id that no longer exists
+	// in index_generations. This MUST run BEFORE BackfillEmbedGenForUpgrade so
+	// a freshly recreated vectors.db (empty index_generations, ids restarting
+	// at 1) cannot reuse an old gen id whose stale stamps would mask coverage.
+	// Not ledger-guarded: a recreate can happen between any two process
+	// starts, so it re-checks on every writable Open (cheap + idempotent).
+	// Self-guards on b.mainDB == nil / b.readOnly exactly like the backfill.
+	if err := b.resetOrphanedEmbedGen(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("reset orphaned embed_gen: %w", err)
+	}
 	// One-time upgrade backfill (Package A): stamp embed_gen for messages
 	// already embedded under the active generation, so an upgraded v0.14–
 	// v0.15 archive does not read as entirely missing and trigger a full

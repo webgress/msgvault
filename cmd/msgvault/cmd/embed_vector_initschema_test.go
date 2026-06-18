@@ -42,6 +42,17 @@ VALUES (1, 1, 1, 'm1', 'email');
 	require.NoError(t, s.Close(), "close fixture store")
 }
 
+// dropEmbedGenColumn removes the embed_gen column from an existing main DB,
+// simulating the post-seed pre-upgrade shape used by the failure-mode arm of
+// the test. Kept separate from makeUpgradedMainDB so the seed (which needs a
+// real active generation) can run while embed_gen still exists, then drop it
+// just before the embed_gen-touching reopen.
+func dropEmbedGenColumn(t *testing.T, db *sql.DB) {
+	t.Helper()
+	_, err := db.Exec(`ALTER TABLE messages DROP COLUMN embed_gen`)
+	require.NoError(t, err, "drop embed_gen to simulate pre-upgrade schema")
+}
+
 // TestEmbed_UpgradedDBMissingEmbedGen_NeedsInitSchema is the regression
 // guard for Codex #2: the embeddings build/resume path (runEmbed) opened
 // the store but never called InitSchema, so on an upgraded DB whose
@@ -63,15 +74,27 @@ func TestEmbed_UpgradedDBMissingEmbedGen_NeedsInitSchema(t *testing.T) {
 	dir := t.TempDir()
 	mainPath := filepath.Join(dir, "msgvault.db")
 	vecPath := filepath.Join(dir, "vectors.db")
-	makeUpgradedMainDB(t, mainPath)
+	// Seed with embed_gen still PRESENT: store.Open + InitSchema leave the
+	// column in place. The seed backend Open below (which runs the orphaned-
+	// stamp reset + the upgrade backfill, both of which touch embed_gen) must
+	// succeed here — we drop the column only afterwards to reproduce the
+	// upgraded-but-not-reinitialized shape for the failing reopen.
+	sSeed, err := store.Open(mainPath)
+	require.NoError(t, err, "store.Open for fixture (column present)")
+	require.NoError(t, sSeed.InitSchema(), "InitSchema for fixture")
+	_, err = sSeed.DB().Exec(`
+INSERT INTO sources (id, source_type, identifier) VALUES (1, 'gmail', 'me@example.com');
+INSERT INTO conversations (id, source_id, conversation_type) VALUES (1, 1, 'email_thread');
+INSERT INTO messages (id, conversation_id, source_id, source_message_id, message_type)
+VALUES (1, 1, 1, 'm1', 'email');
+`)
+	require.NoError(t, err, "seed message")
 
-	mainRaw, err := sql.Open("sqlite3", mainPath)
-	require.NoError(t, err, "open main raw")
-	defer func() { _ = mainRaw.Close() }()
+	mainRaw := sSeed.DB()
 
 	// Seed an active generation that already embedded msg 1, then clear the
 	// backfill ledger so the next Open runs the real embed_gen-stamping
-	// backfill against the column-less messages table.
+	// backfill. embed_gen is present here, so the reset + backfill succeed.
 	seed, err := sqlitevec.Open(ctx, sqlitevec.Options{
 		Path: vecPath, MainPath: mainPath, Dimension: 4, MainDB: mainRaw,
 	})
@@ -86,16 +109,24 @@ func TestEmbed_UpgradedDBMissingEmbedGen_NeedsInitSchema(t *testing.T) {
 	_, err = mainRaw.Exec(`DELETE FROM applied_migrations WHERE name = 'embed_gen_backfill_active_v1'`)
 	require.NoError(t, err, "clear backfill ledger")
 
-	// Reopen: the backfill now tries to stamp messages.embed_gen, which does
-	// not exist on this upgraded schema → "no such column: embed_gen".
+	// Now reproduce the pre-upgrade shape: drop embed_gen. Msg 1 is stamped
+	// for the active gen, but the column no longer exists.
+	dropEmbedGenColumn(t, mainRaw)
+
+	// Reopen: the orphaned-stamp reset (which runs first) tries to read/clear
+	// messages.embed_gen, which does not exist on this upgraded schema →
+	// "no such column: embed_gen". (Were the reset to somehow pass, the
+	// backfill's embed_gen stamp would fail identically.) Either way the Open
+	// fails until runEmbed's InitSchema adds the column back.
 	reopen, err := sqlitevec.Open(ctx, sqlitevec.Options{
 		Path: vecPath, MainPath: mainPath, Dimension: 4, MainDB: mainRaw,
 	})
 	if err == nil {
 		_ = reopen.Close()
 	}
-	require.Error(t, err, "backfill must fail on a messages table lacking embed_gen")
+	require.Error(t, err, "open must fail on a messages table lacking embed_gen")
 	assert.Contains(t, err.Error(), "embed_gen", "failure should be the missing embed_gen column")
+	require.NoError(t, sSeed.Close(), "close seed store")
 
 	// --- 2. The fix: InitSchema first, then the embed path succeeds --------
 	dir3 := t.TempDir()

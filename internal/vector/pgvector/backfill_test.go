@@ -90,3 +90,102 @@ func TestBackfillEmbedGen_UpgradeStampsEmbeddedOnly(t *testing.T) {
 	_, isNull3Again := embedGenOf(t, db, 3)
 	assert.True(t, isNull3Again, "msg 3 still NULL after second backfill (ledger no-op)")
 }
+
+// TestResetOrphanedEmbedGen_RecreateScenario mirrors the sqlitevec recreate
+// test on PostgreSQL: messages carry stamps for a generation id that no longer
+// exists in index_generations (a partial restore — messages restored, the
+// generation row not). A writable Open must reset those orphaned stamps to NULL
+// so coverage reports them missing rather than masking an empty index.
+func TestResetOrphanedEmbedGen_RecreateScenario(t *testing.T) {
+	ctx := context.Background()
+	db := openPGTestDB(t)
+
+	for _, id := range []int64{1, 2} {
+		_, err := db.Exec(`INSERT INTO messages (id) VALUES ($1)`, id)
+		require.NoError(t, err, "insert message")
+	}
+
+	// Open (creates the empty index_generations), then stamp both messages
+	// for a generation id (99) that does not exist — the orphan condition.
+	b, err := Open(ctx, Options{DB: db, Dimension: 4})
+	require.NoError(t, err, "Open")
+	t.Cleanup(func() { _ = b.Close() })
+	_, err = db.ExecContext(ctx, `UPDATE messages SET embed_gen = 99`)
+	require.NoError(t, err, "stamp orphaned embed_gen=99")
+
+	// Re-open writable: the reset runs and clears the orphaned stamps.
+	b2, err := Open(ctx, Options{DB: db, Dimension: 4})
+	require.NoError(t, err, "re-Open (writable)")
+	t.Cleanup(func() { _ = b2.Close() })
+
+	for _, id := range []int64{1, 2} {
+		_, isNull := embedGenOf(t, db, id)
+		assert.Truef(t, isNull, "msg %d embed_gen reset to NULL (orphaned)", id)
+	}
+}
+
+// TestResetOrphanedEmbedGen_NoFalsePositive verifies the PG reset PRESERVES
+// stamps that reference a still-existing generation row (active or retired —
+// retire only flips state on PG, it does not delete the index_generations row).
+func TestResetOrphanedEmbedGen_NoFalsePositive(t *testing.T) {
+	ctx := context.Background()
+	db := openPGTestDB(t)
+
+	for _, id := range []int64{1, 2} {
+		_, err := db.Exec(`INSERT INTO messages (id) VALUES ($1)`, id)
+		require.NoError(t, err, "insert message")
+	}
+
+	b, err := Open(ctx, Options{DB: db, Dimension: 4})
+	require.NoError(t, err, "Open")
+	t.Cleanup(func() { _ = b.Close() })
+
+	gen, err := b.CreateGeneration(ctx, "fake", 4, "")
+	require.NoError(t, err, "CreateGeneration")
+	require.NoError(t, b.Upsert(ctx, gen, []vector.Chunk{
+		{MessageID: 1, Vector: []float32{1, 0, 0, 0}},
+		{MessageID: 2, Vector: []float32{0, 1, 0, 0}},
+	}), "Upsert")
+	_, err = db.ExecContext(ctx, `UPDATE messages SET embed_gen = $1`, int64(gen))
+	require.NoError(t, err, "stamp")
+	require.NoError(t, b.ActivateGeneration(ctx, gen, true), "Activate")
+
+	// Re-open writable: gen still exists, so its stamps must be preserved.
+	b2, err := Open(ctx, Options{DB: db, Dimension: 4})
+	require.NoError(t, err, "re-Open (writable)")
+	t.Cleanup(func() { _ = b2.Close() })
+
+	for _, id := range []int64{1, 2} {
+		v, isNull := embedGenOf(t, db, id)
+		assert.Falsef(t, isNull, "msg %d stamp preserved (gen still exists)", id)
+		assert.Equalf(t, int64(gen), v, "msg %d embed_gen preserved", id)
+	}
+}
+
+// TestResetOrphanedEmbedGen_SkipMigrate_Skipped verifies the orphaned-stamp
+// reset is suppressed on the read-only (SkipMigrate) Open path, where writes
+// are rejected. An orphaned stamp must be left untouched.
+func TestResetOrphanedEmbedGen_SkipMigrate_Skipped(t *testing.T) {
+	ctx := context.Background()
+	db := openPGTestDB(t)
+
+	_, err := db.Exec(`INSERT INTO messages (id) VALUES (1)`)
+	require.NoError(t, err, "insert message")
+
+	// Bring up the schema (index_generations etc.) via a writable Open, then
+	// stamp an orphaned embed_gen.
+	b, err := Open(ctx, Options{DB: db, Dimension: 4})
+	require.NoError(t, err, "Open (writable, migrate)")
+	t.Cleanup(func() { _ = b.Close() })
+	_, err = db.ExecContext(ctx, `UPDATE messages SET embed_gen = 99`)
+	require.NoError(t, err, "stamp orphaned embed_gen=99")
+
+	// SkipMigrate Open (MCP read-only path): the reset must be skipped.
+	b2, err := Open(ctx, Options{DB: db, Dimension: 4, SkipMigrate: true})
+	require.NoError(t, err, "Open (SkipMigrate) must not error")
+	t.Cleanup(func() { _ = b2.Close() })
+
+	v, isNull := embedGenOf(t, db, 1)
+	assert.False(t, isNull, "SkipMigrate Open must NOT reset the orphaned embed_gen")
+	assert.Equal(t, int64(99), v, "orphaned stamp unchanged under SkipMigrate Open")
+}

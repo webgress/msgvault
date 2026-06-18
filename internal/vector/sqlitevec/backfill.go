@@ -155,6 +155,112 @@ func (b *Backend) BackfillEmbedGenForUpgrade(ctx context.Context) error {
 	return b.markBackfillApplied(ctx)
 }
 
+// resetOrphanedEmbedGen clears messages.embed_gen for every main-DB message
+// whose stamp references a generation id that does NOT exist in
+// index_generations (an "orphaned" stamp). It runs on every WRITABLE Open
+// BEFORE BackfillEmbedGenForUpgrade.
+//
+// Why: index_generations.id AUTOINCREMENTs inside the REPLACEABLE vectors.db,
+// while embed_gen stamps live in the durable main.db. If a user deletes and
+// recreates vectors.db but keeps main.db, the fresh index_generations restarts
+// ids at 1 while main.db still carries old stamps (e.g. embed_gen=1). A later
+// rebuild then reuses gen id 1, the coverage scan predicate
+// (embed_gen IS NULL OR embed_gen <> target) treats those stale stamps as
+// already-covered, coverage reaches missing==0, and an EMPTY index is
+// activated — search returns nothing while coverage claims done. Clearing
+// orphaned stamps before any rebuild can reuse id 1 closes that hole.
+//
+// This is the precise, false-positive-proof form of the operator's
+// "recreate-detection reset": a stamp pointing to a STILL-EXISTING generation
+// row (active, building, OR retired — retire only flips state, it does not
+// delete the row) is KEPT. So the normal activate/retire flow, where a rebuild
+// re-stamps live messages to the new active gen and the old gen's row is merely
+// marked retired, never trips this reset. Only a genuinely vanished gen id
+// (vectors.db recreated/wiped) triggers a clear.
+//
+// Cross-DB on SQLite: the valid gen-id set comes from vectors.db (b.db); the
+// reset runs against main.db (b.mainDB). When the valid set is EMPTY (recreated
+// vectors.db), the predicate degrades to "all non-NULL stamps" — handled
+// explicitly because `NOT IN ()` is a SQL pitfall. The valid set is tiny (a
+// handful of generations), so a literal IN-list is fine.
+//
+// Guards (mirror BackfillEmbedGenForUpgrade): no-op when the main handle is
+// absent (management commands) or read-only (MCP). NOT ledger-guarded: a
+// recreate can happen between any two process starts, so this must re-check
+// every writable Open. It is cheap and idempotent — a second run finds no
+// orphans and updates nothing.
+func (b *Backend) resetOrphanedEmbedGen(ctx context.Context) error {
+	if b.mainDB == nil {
+		// Management commands open the backend without the main handle.
+		return nil
+	}
+	if b.readOnly {
+		// Read-only main handle (MCP): the reset WRITES messages.embed_gen,
+		// which the query-only handle rejects. Skip — a write-path process
+		// (serve, embeddings CLI) performs the reset instead. Mirrors the
+		// backfill's b.readOnly guard.
+		return nil
+	}
+
+	// A main DB without applied_migrations is not a real msgvault store (e.g.
+	// a hand-rolled test fixture, or a DB opened before the store schema ran);
+	// such a fixture also lacks the embed_gen column. Skip the reset entirely
+	// rather than fail Open — mirrors BackfillEmbedGenForUpgrade's identical
+	// guard so the two open-time steps gate the same way.
+	hasLedger, err := mainTableExists(ctx, b.mainDB, "applied_migrations")
+	if err != nil {
+		return err
+	}
+	if !hasLedger {
+		return nil
+	}
+
+	// Collect the set of valid generation ids from vectors.db.
+	rows, err := b.db.QueryContext(ctx, `SELECT id FROM index_generations`)
+	if err != nil {
+		return fmt.Errorf("reset orphaned embed_gen: list generation ids: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var validIDs []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return fmt.Errorf("reset orphaned embed_gen: scan generation id: %w", err)
+		}
+		validIDs = append(validIDs, id)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("reset orphaned embed_gen: iterate generation ids: %w", err)
+	}
+
+	// Empty valid set (recreated/empty vectors.db): every non-NULL stamp is
+	// orphaned. `NOT IN ()` is a SQL pitfall, so special-case it to a plain
+	// "clear all non-NULL stamps" UPDATE.
+	if len(validIDs) == 0 {
+		if _, err := b.mainDB.ExecContext(ctx,
+			`UPDATE messages SET embed_gen = NULL WHERE embed_gen IS NOT NULL`); err != nil {
+			return fmt.Errorf("reset orphaned embed_gen: clear all stamps: %w", err)
+		}
+		return nil
+	}
+
+	// Non-empty valid set: clear only stamps that fall outside it. The set is
+	// tiny, so a literal IN-list is well under SQLite's bind limit.
+	placeholders := make([]string, len(validIDs))
+	args := make([]any, len(validIDs))
+	for i, id := range validIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	q := `UPDATE messages SET embed_gen = NULL
+	       WHERE embed_gen IS NOT NULL
+	         AND embed_gen NOT IN (` + strings.Join(placeholders, ",") + `)`
+	if _, err := b.mainDB.ExecContext(ctx, q, args...); err != nil {
+		return fmt.Errorf("reset orphaned embed_gen: clear orphaned stamps: %w", err)
+	}
+	return nil
+}
+
 // backfillApplied reports whether the one-time backfill ledger row exists
 // in main.db. A missing applied_migrations table (older main schema) is
 // treated as "not applied" — the table is created by the store schema, so
