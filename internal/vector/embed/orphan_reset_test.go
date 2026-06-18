@@ -41,19 +41,7 @@ func newOrphanFixture(t *testing.T, n int) *orphanFixture {
 	require.NoError(t, err, "open main")
 	t.Cleanup(func() { _ = mainDB.Close() })
 
-	schema := `
-CREATE TABLE messages (
-    id INTEGER PRIMARY KEY,
-    subject TEXT,
-    deleted_at DATETIME,
-    deleted_from_source_at DATETIME,
-    embed_gen INTEGER
-);
-CREATE TABLE message_bodies (
-    message_id INTEGER PRIMARY KEY,
-    body_text TEXT,
-    body_html TEXT
-);
+	schema := testMainSchema + `
 CREATE TABLE applied_migrations (
     name TEXT PRIMARY KEY,
     applied_at DATETIME DEFAULT CURRENT_TIMESTAMP

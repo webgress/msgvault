@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"go.kenn.io/msgvault/internal/mime"
+	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
 )
 
@@ -30,8 +31,15 @@ type WorkStore interface {
 	// for target (embed_gen IS NULL OR embed_gen <> target), scanning
 	// forward from afterID in id order.
 	ScanForEmbedding(ctx context.Context, target int64, afterID int64, limit int) ([]int64, error)
-	// SetEmbedGen stamps embed_gen=target on ids (idempotent).
+	// SetEmbedGen stamps embed_gen=target on ids (idempotent). Used by the
+	// BACKFILL path, which has no content read→stamp window to guard.
 	SetEmbedGen(ctx context.Context, ids []int64, target int64) error
+	// SetEmbedGenIfUnchanged stamps embed_gen=target on each item ONLY if
+	// its last_modified still equals the value captured at content-read time
+	// (optimistic CAS). A row whose last_modified changed (a concurrent
+	// content edit bumped it via the DB triggers) is not stamped and is
+	// re-found by the next scan. Used by the scan-and-fill read→stamp path.
+	SetEmbedGenIfUnchanged(ctx context.Context, items []store.EmbedGenStamp, target int64) error
 }
 
 // WorkerDeps bundles the collaborators a Worker needs. Backend, VectorsDB,
@@ -62,7 +70,20 @@ type WorkerDeps struct {
 	// must wire in (&store.PostgreSQLDialect{}).Rebind so the embed_runs,
 	// watermark, and body-fetch statements run on pgx.
 	Rebind func(string) string
-	Log    *slog.Logger
+	// LastModifiedExpr is the SELECT expression embedBatch uses to read each
+	// message's last_modified CAS token. It MUST scan into a value that
+	// round-trips by exact equality when bound back into the CAS UPDATE's
+	// `WHERE last_modified = ?`:
+	//   - SQLite: "CAST(m.last_modified AS TEXT)" — the CAST defeats
+	//     go-sqlite3's DATETIME→time.Time auto-coercion (which reformats the
+	//     value and breaks equality); the worker scans a string and binds the
+	//     same string back.
+	//   - PostgreSQL: "m.last_modified" — pgx scans/binds time.Time, equality
+	//     holds.
+	// Zero value defaults to the SQLite CAST form (the default backend); the
+	// pgvector caller sets "m.last_modified".
+	LastModifiedExpr string
+	Log              *slog.Logger
 	// TotalPending is the work depth at run start, used by a Progress
 	// callback (if any) to report percent done and ETA. Zero disables
 	// the denominator — Progress still fires but leaves ETA empty.
@@ -100,8 +121,12 @@ type Worker struct {
 	// rebind translates ?-placeholders to the driver's native form for
 	// queries the worker issues directly against MainDB (embedBatch's
 	// IN-clause). nil is normalized to the identity.
-	rebind   func(string) string
-	runStart time.Time // valid only during a RunOnce call
+	rebind func(string) string
+	// lastModifiedExpr is the SELECT expression for the last_modified CAS
+	// token (see WorkerDeps.LastModifiedExpr). Normalized to the SQLite CAST
+	// form when the dep is empty.
+	lastModifiedExpr string
+	runStart         time.Time // valid only during a RunOnce call
 }
 
 // NewWorker constructs a Worker, applying defaults for BatchSize (32),
@@ -120,7 +145,13 @@ func NewWorker(d WorkerDeps) *Worker {
 	if rebind == nil {
 		rebind = func(q string) string { return q }
 	}
-	return &Worker{deps: d, wm: NewWatermark(d.VectorsDB, rebind), rebind: rebind}
+	lmExpr := d.LastModifiedExpr
+	if lmExpr == "" {
+		// Default to the SQLite CAST form (the default backend); pgvector
+		// callers set "m.last_modified".
+		lmExpr = "CAST(m.last_modified AS TEXT)"
+	}
+	return &Worker{deps: d, wm: NewWatermark(d.VectorsDB, rebind), rebind: rebind, lastModifiedExpr: lmExpr}
 }
 
 // RunResult summarizes the outcome of RunOnce.
@@ -379,7 +410,7 @@ func (w *Worker) run(ctx context.Context, gen vector.GenerationID, backstop bool
 				if len(eb.empty) > 0 {
 					w.deps.Log.Warn("messages empty after preprocess", "gen", gen, "ids", eb.empty)
 				}
-				if serr := w.deps.Store.SetEmbedGen(ctx, skipIDs, int64(gen)); serr != nil {
+				if serr := w.stampCovered(ctx, gen, skipIDs, eb.lastModified); serr != nil {
 					res.Failed += len(skipIDs)
 					w.deps.Log.Error("stamp skip set failed", "error", serr, "gen", gen, "ids", len(skipIDs))
 					consecutiveFailures++
@@ -426,7 +457,7 @@ func (w *Worker) run(ctx context.Context, gen vector.GenerationID, backstop bool
 		// crash before this stamp just re-does the batch next scan. Stamp
 		// the union so embedded and skip-marked rows both drop out together.
 		stampIDs := append(append([]int64(nil), eb.embeddedIDs...), skipIDs...)
-		if serr := w.deps.Store.SetEmbedGen(ctx, stampIDs, int64(gen)); serr != nil {
+		if serr := w.stampCovered(ctx, gen, stampIDs, eb.lastModified); serr != nil {
 			res.Failed += len(eb.embeddedIDs)
 			w.deps.Log.Error("stamp embed_gen failed", "gen", gen, "ids", len(stampIDs), "error", serr)
 			consecutiveFailures++
@@ -489,6 +520,10 @@ type embedBatchResult struct {
 	missing     []int64
 	empty       []int64
 	truncated   int
+	// lastModified maps each FETCHED id (embedded or empty) to the CAS token
+	// captured at read time. Missing ids are absent (they have no row, so
+	// there is nothing to CAS-stamp — they are skip-marked unconditionally).
+	lastModified map[int64]any
 }
 
 // embedBatch fetches subject/body for ids, preprocesses each, calls the
@@ -504,10 +539,10 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 		args[i] = id
 	}
 	query := w.rebind(fmt.Sprintf(`
-        SELECT m.id, COALESCE(m.subject, ''), COALESCE(mb.body_text, ''), COALESCE(mb.body_html, '')
+        SELECT m.id, COALESCE(m.subject, ''), COALESCE(mb.body_text, ''), COALESCE(mb.body_html, ''), %s
           FROM messages m
           LEFT JOIN message_bodies mb ON mb.message_id = m.id
-         WHERE m.id IN (%s)`, strings.Join(placeholders, ",")))
+         WHERE m.id IN (%s)`, w.lastModifiedExpr, strings.Join(placeholders, ",")))
 
 	rows, err := w.deps.MainDB.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -518,12 +553,20 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 	var msgs []msgText
 	var empty []int64
 	fetched := make(map[int64]struct{}, len(ids))
+	// lastModified holds the per-message CAS token captured at read time,
+	// keyed by id. The worker binds the EXACT value scanned here back into
+	// the CAS stamp's WHERE last_modified = ?, so a concurrent content edit
+	// that bumped last_modified between this read and the stamp blocks the
+	// stamp (0 rows) and the row is re-found next scan.
+	lastModified := make(map[int64]any, len(ids))
 	for rows.Next() {
 		var id int64
 		var subject, bodyText, bodyHTML string
-		if err := rows.Scan(&id, &subject, &bodyText, &bodyHTML); err != nil {
+		var lm any
+		if err := rows.Scan(&id, &subject, &bodyText, &bodyHTML, &lm); err != nil {
 			return embedBatchResult{}, fmt.Errorf("scan message row: %w", err)
 		}
+		lastModified[id] = lm
 		// Fall back to HTML-to-text when the plaintext body is empty —
 		// HTML-only messages would otherwise get subject-only embeddings
 		// and have materially worse semantic recall.
@@ -574,7 +617,7 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 	if len(msgs) == 0 {
 		// All scanned ids are missing/empty — return an empty result (no
 		// chunks, no error). Caller skip-marks them.
-		return embedBatchResult{missing: missing, empty: empty}, nil
+		return embedBatchResult{missing: missing, empty: empty, lastModified: lastModified}, nil
 	}
 
 	// Chunk every message into windows of at most MaxInputChars runes.
@@ -687,11 +730,12 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 		}
 	}
 	return embedBatchResult{
-		chunks:      chunks,
-		embeddedIDs: embeddedIDs,
-		missing:     missing,
-		empty:       empty,
-		truncated:   truncated,
+		chunks:       chunks,
+		embeddedIDs:  embeddedIDs,
+		missing:      missing,
+		empty:        empty,
+		truncated:    truncated,
+		lastModified: lastModified,
 	}, nil
 }
 
@@ -732,6 +776,12 @@ func (w *Worker) downshiftDrain(
 ) (embedded int, stamped int, safeAdvanceID int64, err error) {
 	var deferredDrops []int64
 	var lastDeferredErr error
+	// lm accumulates last_modified CAS tokens across the singleton fetches so
+	// the end-of-drain deferred-drop stamp can CAS rows whose content is
+	// unchanged. A deferred-drop id whose embedBatch ERRORED (embedder
+	// rejected it) has no token here and falls back to an unconditional
+	// stamp in stampCovered — acceptable for the already-degraded 4xx path.
+	lm := make(map[int64]any, len(ids))
 	// contiguousStampedID tracks the highest id with an unbroken
 	// stamped-from-the-start prefix. The first time an id is left unresolved
 	// (a deferred 4xx, or a non-4xx error return) brokeContiguity latches
@@ -765,11 +815,15 @@ func (w *Worker) downshiftDrain(
 			// watermark past it; the next RunOnce re-finds it.
 			return embedded, stamped, contiguousStampedID, e
 		}
+		// Carry forward the CAS token for this fetched id.
+		for k, v := range eb.lastModified {
+			lm[k] = v
+		}
 		if len(eb.chunks) == 0 {
 			// Missing/empty singleton — skip-mark it.
 			skip := append(append([]int64(nil), eb.missing...), eb.empty...)
 			if len(skip) > 0 {
-				if serr := w.deps.Store.SetEmbedGen(ctx, skip, int64(gen)); serr != nil {
+				if serr := w.stampCovered(ctx, gen, skip, eb.lastModified); serr != nil {
 					res.Failed += len(skip)
 					return embedded, stamped, contiguousStampedID, fmt.Errorf("stamp skip: %w", serr)
 				}
@@ -792,7 +846,7 @@ func (w *Worker) downshiftDrain(
 			}
 			return embedded, stamped, contiguousStampedID, fmt.Errorf("upsert: %w", uerr)
 		}
-		if serr := w.deps.Store.SetEmbedGen(ctx, eb.embeddedIDs, int64(gen)); serr != nil {
+		if serr := w.stampCovered(ctx, gen, eb.embeddedIDs, eb.lastModified); serr != nil {
 			return embedded, stamped, contiguousStampedID, fmt.Errorf("stamp embed_gen: %w", serr)
 		}
 		res.Truncated += eb.truncated
@@ -827,7 +881,10 @@ func (w *Worker) downshiftDrain(
 				"gen", gen, "id", id, "error", lastDeferredErr)
 		}
 		dropStart := time.Now()
-		if serr := w.deps.Store.SetEmbedGen(ctx, deferredDrops, int64(gen)); serr != nil {
+		// Deferred drops were fetched and embed-attempted, so each carries a
+		// last_modified token: CAS-stamp them so a row whose content changed
+		// since the read is re-found rather than dropped with stale content.
+		if serr := w.stampCovered(ctx, gen, deferredDrops, lm); serr != nil {
 			res.Failed += len(deferredDrops)
 			// Some deferred drops are now unstamped; do not advance past the
 			// contiguous-stamped prefix.
@@ -850,6 +907,45 @@ func (w *Worker) downshiftDrain(
 	// unstamped deferred ids are not skipped.
 	return embedded, stamped, contiguousStampedID, fmt.Errorf("downshift all-drop: every singleton returned non-retryable 4xx (left %d row(s) unstamped): %w",
 		len(deferredDrops), lastDeferredErr)
+}
+
+// stampCovered stamps embed_gen=gen for ids, choosing per id between an
+// optimistic-CAS stamp and an unconditional one based on whether a
+// last_modified token was captured for that id at content-read time:
+//
+//   - ids present in lm (fetched: embedded or empty-after-preprocess) are
+//     CAS-stamped via SetEmbedGenIfUnchanged — if a concurrent content edit
+//     bumped last_modified between read and now, the stamp matches 0 rows and
+//     the row stays "needs embedding" for the next scan (the repair-race fix).
+//   - ids absent from lm (missing: no row in messages) are stamped
+//     unconditionally via SetEmbedGen — there is no content and no token to
+//     guard, and they must drop out of the scan so it can advance.
+//
+// A failure on either path is returned so the caller can apply its
+// consecutive-failure accounting; the two paths are independent (the CAS
+// stamp not finding a row is NOT an error — it returns nil with 0 rows
+// affected, which is exactly the intended race outcome).
+func (w *Worker) stampCovered(ctx context.Context, gen vector.GenerationID, ids []int64, lm map[int64]any) error {
+	var cas []store.EmbedGenStamp
+	var plain []int64
+	for _, id := range ids {
+		if tok, ok := lm[id]; ok {
+			cas = append(cas, store.EmbedGenStamp{ID: id, LastModified: tok})
+		} else {
+			plain = append(plain, id)
+		}
+	}
+	if len(cas) > 0 {
+		if err := w.deps.Store.SetEmbedGenIfUnchanged(ctx, cas, int64(gen)); err != nil {
+			return err
+		}
+	}
+	if len(plain) > 0 {
+		if err := w.deps.Store.SetEmbedGen(ctx, plain, int64(gen)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (w *Worker) reportProgress(done, batchMsgs, batchChars int, batchElapsed time.Duration) {

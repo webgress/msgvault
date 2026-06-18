@@ -52,8 +52,14 @@ func setupVectorFeatures(ctx context.Context, mainStore *store.Store, mainPath s
 	// features on PostgreSQL the same way `msgvault embed` does. SQLite's
 	// Rebind is identity so the SQLite path is unchanged.
 	var dialect store.Dialect = &store.SQLiteDialect{}
+	// lastModifiedExpr is the dialect-correct SELECT expression for the embed
+	// worker's last_modified CAS token. SQLite needs CAST(... AS TEXT) to
+	// defeat go-sqlite3's DATETIME→time.Time coercion (which would break
+	// round-trip equality); PG uses the bare column.
+	lastModifiedExpr := "CAST(m.last_modified AS TEXT)"
 	if store.IsPostgresURL(mainPath) {
 		dialect = &store.PostgreSQLDialect{}
+		lastModifiedExpr = "m.last_modified"
 	}
 
 	var (
@@ -134,8 +140,9 @@ func setupVectorFeatures(ctx context.Context, mainStore *store.Store, mainPath s
 		BatchSize:     cfg.Vector.Embeddings.BatchSize,
 		// Rebind makes the worker's body-fetch + watermark SQL run on pgx.
 		// SQLiteDialect.Rebind is identity, so the SQLite path is unchanged.
-		Rebind: dialect.Rebind,
-		Log:    logger,
+		Rebind:           dialect.Rebind,
+		LastModifiedExpr: lastModifiedExpr,
+		Log:              logger,
 	})
 
 	engine := hybrid.NewEngine(backend, mainDB, client, hybrid.Config{

@@ -43,6 +43,11 @@ func runEmbed(cmd *cobra.Command) error {
 		vectorsDB *sql.DB
 		closeFn   func() error
 		rebind    func(string) string
+		// lastModifiedExpr is the dialect-correct SELECT expression for the
+		// embed worker's last_modified CAS token. SQLite needs CAST(... AS
+		// TEXT) to defeat go-sqlite3's DATETIME→time.Time coercion (which
+		// would break round-trip equality); PG uses the bare column.
+		lastModifiedExpr = "CAST(m.last_modified AS TEXT)"
 	)
 	if s.IsPostgreSQL() {
 		// pgvector embeddings live in the same Postgres database as
@@ -61,6 +66,7 @@ func runEmbed(cmd *cobra.Command) error {
 		vectorsDB = pgb.DB()
 		closeFn = pgb.Close
 		rebind = (&store.PostgreSQLDialect{}).Rebind
+		lastModifiedExpr = "m.last_modified"
 	} else {
 		if err := sqlitevec.RegisterExtension(); err != nil {
 			return fmt.Errorf("register sqlite-vec: %w", err)
@@ -130,11 +136,12 @@ func runEmbed(cmd *cobra.Command) error {
 			StripURLTracking:   cfg.Vector.Preprocess.StripURLTrackingEnabled(),
 			CollapseWhitespace: cfg.Vector.Preprocess.CollapseWhitespaceEnabled(),
 		},
-		MaxInputChars: cfg.Vector.Embeddings.MaxInputChars,
-		BatchSize:     cfg.Vector.Embeddings.BatchSize,
-		Rebind:        rebind,
-		TotalPending:  totalPending,
-		Progress:      newProgressPrinter(errOut, totalPending, cfg.Vector.Embeddings.ETAWindow),
+		MaxInputChars:    cfg.Vector.Embeddings.MaxInputChars,
+		BatchSize:        cfg.Vector.Embeddings.BatchSize,
+		Rebind:           rebind,
+		LastModifiedExpr: lastModifiedExpr,
+		TotalPending:     totalPending,
+		Progress:         newProgressPrinter(errOut, totalPending, cfg.Vector.Embeddings.ETAWindow),
 	})
 
 	var res embed.RunResult

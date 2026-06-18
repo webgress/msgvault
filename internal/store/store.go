@@ -723,6 +723,25 @@ func (s *Store) InitSchema() error {
 		}
 	}
 
+	// Backfill last_modified for rows that predate the column. SQLite cannot
+	// ADD COLUMN with a non-constant default, so the legacy ADD COLUMN above
+	// leaves existing rows NULL; this one-shot UPDATE sets them to
+	// CURRENT_TIMESTAMP so the embed worker's CAS token is a comparable value
+	// (a NULL token would never satisfy `last_modified = ?` and the row would
+	// loop "needs embedding" forever). Idempotent and portable: on a fresh
+	// DB (or PostgreSQL, whose ADD COLUMN ... DEFAULT CURRENT_TIMESTAMP
+	// backfills automatically) no rows are NULL, so this is a no-op. Run
+	// under runMaintenance so the full-table UPDATE on a large archive is not
+	// cut off by the pool-wide statement_timeout (no-op reset on SQLite).
+	if err := s.runMaintenance(context.Background(), func(ctx context.Context, tx *loggedTx) error {
+		_, err := tx.ExecContext(ctx,
+			`UPDATE messages SET last_modified = `+s.dialect.Now()+
+				` WHERE last_modified IS NULL`)
+		return err
+	}); err != nil {
+		return fmt.Errorf("backfill last_modified: %w", err)
+	}
+
 	// Create FTS indexes that depend on columns just added by the legacy
 	// migrations (PostgreSQL's GIN index on messages.search_fts). No-op on
 	// SQLite. Must run after the migration loop above. [cr2-10]
@@ -735,6 +754,17 @@ func (s *Store) InitSchema() error {
 		return s.dialect.EnsureFTSIndex(tx)
 	}); err != nil {
 		return fmt.Errorf("ensure FTS index: %w", err)
+	}
+
+	// Create the last_modified maintenance triggers. Must run after the
+	// migration loop above adds the last_modified column on legacy DBs.
+	// SQLite is a no-op here (its triggers ride schema.sql); PostgreSQL
+	// creates them idempotently. Run under runMaintenance for consistency
+	// with EnsureFTSIndex (no statement_timeout cap on the DDL).
+	if err := s.runMaintenance(context.Background(), func(ctx context.Context, tx *loggedTx) error {
+		return s.dialect.EnsureTriggers(tx)
+	}); err != nil {
+		return fmt.Errorf("ensure last_modified triggers: %w", err)
 	}
 
 	// Drop the obsolete partial index over messages needing embedding. It was

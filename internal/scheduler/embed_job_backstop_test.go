@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector/embed"
 	"go.kenn.io/msgvault/internal/vector/sqlitevec"
 )
@@ -58,6 +59,17 @@ func (s *e2eWorkStore) SetEmbedGen(ctx context.Context, ids []int64, target int6
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE messages SET embed_gen = ? WHERE id IN (`+strings.Join(ph, ",")+`)`, args...)
 	return err
+}
+
+func (s *e2eWorkStore) SetEmbedGenIfUnchanged(ctx context.Context, items []store.EmbedGenStamp, target int64) error {
+	for _, it := range items {
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE messages SET embed_gen = ? WHERE id = ? AND last_modified = ?`,
+			target, it.ID, it.LastModified); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // e2eCoverage satisfies EmbedCoverage from the live main DB so the
@@ -120,10 +132,27 @@ func TestEmbedJob_Backstop_RecoversSubWatermarkStraggler(t *testing.T) {
 	_, err = mainDB.Exec(`
 CREATE TABLE messages (
     id INTEGER PRIMARY KEY, subject TEXT,
-    deleted_at DATETIME, deleted_from_source_at DATETIME, embed_gen INTEGER);
+    deleted_at DATETIME, deleted_from_source_at DATETIME, embed_gen INTEGER,
+    last_modified DATETIME DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE message_bodies (
     message_id INTEGER PRIMARY KEY, body_text TEXT, body_html TEXT);
-CREATE TABLE applied_migrations (name TEXT PRIMARY KEY, applied_at DATETIME);`)
+CREATE TABLE applied_migrations (name TEXT PRIMARY KEY, applied_at DATETIME);
+CREATE TRIGGER trg_messages_last_modified
+AFTER UPDATE ON messages FOR EACH ROW
+WHEN OLD.last_modified = NEW.last_modified
+BEGIN
+    UPDATE messages SET last_modified = CURRENT_TIMESTAMP WHERE id = NEW.id;
+END;
+CREATE TRIGGER trg_message_bodies_last_modified_upd
+AFTER UPDATE ON message_bodies FOR EACH ROW
+BEGIN
+    UPDATE messages SET last_modified = CURRENT_TIMESTAMP WHERE id = NEW.message_id;
+END;
+CREATE TRIGGER trg_message_bodies_last_modified_ins
+AFTER INSERT ON message_bodies FOR EACH ROW
+BEGIN
+    UPDATE messages SET last_modified = CURRENT_TIMESTAMP WHERE id = NEW.message_id;
+END;`)
 	require.NoError(t, err, "schema")
 	const n = 4
 	for i := 1; i <= n; i++ {
@@ -147,10 +176,11 @@ CREATE TABLE applied_migrations (name TEXT PRIMARY KEY, applied_at DATETIME);`)
 	require.NoError(t, err, "open vectors handle")
 	t.Cleanup(func() { _ = vecDB.Close() })
 
-	store := &e2eWorkStore{db: mainDB}
+	ws := &e2eWorkStore{db: mainDB}
 	worker := embed.NewWorker(embed.WorkerDeps{
 		Backend: backend, VectorsDB: vecDB, MainDB: mainDB,
-		Store: store, Client: &e2eClient{dim: 4}, BatchSize: 8,
+		Store: ws, Client: &e2eClient{dim: 4}, BatchSize: 8,
+		LastModifiedExpr: "CAST(m.last_modified AS TEXT)",
 	})
 
 	// Drain the corpus fully via the worker so every message is embedded +

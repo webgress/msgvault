@@ -97,6 +97,56 @@ func (s *Store) SetEmbedGen(ctx context.Context, ids []int64, target int64) erro
 	return nil
 }
 
+// EmbedGenStamp pairs a message id with the last_modified token captured
+// when the worker read that message's content. SetEmbedGenIfUnchanged
+// stamps embed_gen only while last_modified still equals this value.
+//
+// LastModified is carried as an opaque `any` so the worker can round-trip
+// whatever the driver scanned without the store needing a backend-specific
+// type: on SQLite the worker scans CAST(last_modified AS TEXT) into a string
+// (defeating go-sqlite3's DATETIME→time.Time coercion, which would otherwise
+// reformat the value and break equality on the round-trip) and binds the same
+// string back; on PostgreSQL it scans a time.Time and binds the same
+// time.Time back. The WHERE comparison runs entirely server-side against the
+// stored value.
+type EmbedGenStamp struct {
+	ID           int64
+	LastModified any
+}
+
+// SetEmbedGenIfUnchanged stamps embed_gen = target on each message, but
+// ONLY if its last_modified still equals the value captured at content-read
+// time (optimistic CAS). A message whose last_modified changed between read
+// and stamp — e.g. repair-encoding (or any concurrent content edit) rewrote
+// its text, which the DB triggers reflected by bumping last_modified — is
+// NOT stamped (its UPDATE matches 0 rows); it stays "needs embedding" and is
+// re-found and re-embedded with the corrected content on the next scan. This
+// closes the read→stamp race that an unconditional stamp would lose by
+// marking the row embedded-with-stale-content.
+//
+// The worker's own stamp UPDATE bumps last_modified via the AFTER-UPDATE
+// trigger (SQLite) / leaves it unchanged (PG BEFORE trigger only fires when
+// last_modified is unchanged AND no explicit set — here embed_gen is the only
+// change, so the SQLite trigger fires and re-stamps last_modified). Either
+// way the WHERE matches the PRE-trigger value, so a legitimate stamp still
+// succeeds; only a value that changed BEFORE this UPDATE ran blocks it.
+//
+// Each row is a separate UPDATE because every message carries a distinct
+// last_modified token. Statements are not wrapped in one transaction: each is
+// independently correct, and the cross-DB worker contract already tolerates a
+// partial stamp (the next scan re-finds any unstamped row and re-runs an
+// idempotent batch). Used by the embed worker's content read→stamp path; the
+// backfill path keeps the plain SetEmbedGen (it has no read→stamp window).
+func (s *Store) SetEmbedGenIfUnchanged(ctx context.Context, items []EmbedGenStamp, target int64) error {
+	for _, it := range items {
+		q := `UPDATE messages SET embed_gen = ? WHERE id = ? AND last_modified = ?`
+		if _, err := s.db.ExecContext(ctx, q, target, it.ID, it.LastModified); err != nil {
+			return fmt.Errorf("set embed_gen if unchanged (id=%d): %w", it.ID, err)
+		}
+	}
+	return nil
+}
+
 // ResetEmbedGen clears embed_gen (sets it back to NULL) on the given
 // message ids, marking them as needing embedding again. Used by
 // repair-encoding after rewriting a message's text so the scan-and-fill

@@ -12,14 +12,50 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/sqlitevec"
 )
 
+// testMainSchema is the minimal main-DB schema the worker reads, including
+// the last_modified column + the database-maintained triggers that bump it on
+// any message change or body insert/update — mirroring production schema.sql
+// so the CAS round-trip and trigger behavior are exercised in tests.
+const testMainSchema = `
+CREATE TABLE messages (
+    id INTEGER PRIMARY KEY,
+    subject TEXT,
+    deleted_at DATETIME,
+    deleted_from_source_at DATETIME,
+    embed_gen INTEGER,
+    last_modified DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE message_bodies (
+    message_id INTEGER PRIMARY KEY,
+    body_text TEXT,
+    body_html TEXT
+);
+CREATE TRIGGER trg_messages_last_modified
+AFTER UPDATE ON messages FOR EACH ROW
+WHEN OLD.last_modified = NEW.last_modified
+BEGIN
+    UPDATE messages SET last_modified = CURRENT_TIMESTAMP WHERE id = NEW.id;
+END;
+CREATE TRIGGER trg_message_bodies_last_modified_upd
+AFTER UPDATE ON message_bodies FOR EACH ROW
+BEGIN
+    UPDATE messages SET last_modified = CURRENT_TIMESTAMP WHERE id = NEW.message_id;
+END;
+CREATE TRIGGER trg_message_bodies_last_modified_ins
+AFTER INSERT ON message_bodies FOR EACH ROW
+BEGIN
+    UPDATE messages SET last_modified = CURRENT_TIMESTAMP WHERE id = NEW.message_id;
+END;`
+
 // testWorkStore is a minimal WorkStore backed by the test main DB. It
 // mirrors store.ScanForEmbedding / store.SetEmbedGen against the test's
 // `messages` table (which carries id, subject, deleted_at,
-// deleted_from_source_at, embed_gen).
+// deleted_from_source_at, embed_gen, last_modified).
 type testWorkStore struct {
 	db *sql.DB
 }
@@ -60,6 +96,20 @@ func (s *testWorkStore) SetEmbedGen(ctx context.Context, ids []int64, target int
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE messages SET embed_gen = ? WHERE id IN (`+strings.Join(ph, ",")+`)`, args...)
 	return err
+}
+
+// SetEmbedGenIfUnchanged mirrors store.Store.SetEmbedGenIfUnchanged: a
+// per-row optimistic-CAS stamp gated on last_modified, used by the worker's
+// content read→stamp path.
+func (s *testWorkStore) SetEmbedGenIfUnchanged(ctx context.Context, items []store.EmbedGenStamp, target int64) error {
+	for _, it := range items {
+		if _, err := s.db.ExecContext(ctx,
+			`UPDATE messages SET embed_gen = ? WHERE id = ? AND last_modified = ?`,
+			target, it.ID, it.LastModified); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // countMissing returns how many live messages still need embedding for
@@ -112,20 +162,7 @@ func newWorkerFixture(t *testing.T, n int) *workerFixture {
 	require.NoError(t, err, "open main")
 	t.Cleanup(func() { _ = mainDB.Close() })
 
-	schema := `
-CREATE TABLE messages (
-    id INTEGER PRIMARY KEY,
-    subject TEXT,
-    deleted_at DATETIME,
-    deleted_from_source_at DATETIME,
-    embed_gen INTEGER
-);
-CREATE TABLE message_bodies (
-    message_id INTEGER PRIMARY KEY,
-    body_text TEXT,
-    body_html TEXT
-);`
-	_, err = mainDB.Exec(schema)
+	_, err = mainDB.Exec(testMainSchema)
 	require.NoError(t, err, "schema")
 	for i := 1; i <= n; i++ {
 		_, err := mainDB.Exec(

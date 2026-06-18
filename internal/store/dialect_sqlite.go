@@ -225,6 +225,11 @@ func (d *SQLiteDialect) FTSRebuildSchema(q querier) error {
 // not a post-migration step (cr2-10).
 func (d *SQLiteDialect) EnsureFTSIndex(querier) error { return nil }
 
+// EnsureTriggers is a no-op for SQLite: the last_modified triggers are
+// `CREATE TRIGGER IF NOT EXISTS` in schema.sql, which InitSchema re-execs
+// idempotently on every open (fresh and existing DBs alike).
+func (d *SQLiteDialect) EnsureTriggers(querier) error { return nil }
+
 // LegacyColumnMigrations returns the ALTER TABLE ADD COLUMN statements that
 // bring older SQLite databases up to the current schema. IsDuplicateColumnError
 // silences these when the column already exists (idempotent migrations).
@@ -248,6 +253,16 @@ func (d *SQLiteDialect) LegacyColumnMigrations() []ColumnMigration {
 		// correct — the scan-and-fill worker (and backstop) will embed and
 		// stamp them. No backfill.
 		{`ALTER TABLE messages ADD COLUMN embed_gen INTEGER`, "embed_gen"},
+		// last_modified: row-level last-modified watermark, the embed
+		// worker's optimistic-CAS token. SQLite rejects a non-constant
+		// DEFAULT in ADD COLUMN ("Cannot add a column with non-constant
+		// default"), so the column is added with no default (existing rows
+		// get NULL) and InitSchema's backfillLastModified follows up with a
+		// one-shot `UPDATE ... SET last_modified = CURRENT_TIMESTAMP WHERE
+		// last_modified IS NULL` so the CAS token is a comparable value
+		// (NULL would never match `last_modified = ?`). Fresh DBs keep the
+		// CREATE TABLE default in schema.sql, which IS allowed.
+		{`ALTER TABLE messages ADD COLUMN last_modified DATETIME`, "last_modified"},
 	}
 }
 
