@@ -471,15 +471,19 @@ func (f *fakeBackend) EnsureSeeded(_ context.Context, _ vector.GenerationID) err
 
 // fakeRunner records calls to satisfy EmbedRunner.
 type fakeRunner struct {
-	mu            sync.Mutex
-	reclaimErr    error
-	reclaimCalls  int
-	runErr        error
-	runCalls      int
-	lastRunGen    vector.GenerationID
-	runOnceResult embed.RunResult
-	runDoneOnce   sync.Once
-	runDone       chan struct{} // optional: closed after first RunOnce
+	mu             sync.Mutex
+	reclaimErr     error
+	reclaimCalls   int
+	runErr         error
+	runCalls       int
+	lastRunGen     vector.GenerationID
+	runOnceResult  embed.RunResult
+	backstopErr    error
+	backstopCalls  int
+	lastBackstop   vector.GenerationID
+	backstopResult embed.RunResult
+	runDoneOnce    sync.Once
+	runDone        chan struct{} // optional: closed after first RunOnce
 }
 
 func (r *fakeRunner) ReclaimStale(ctx context.Context) (int, error) {
@@ -503,10 +507,24 @@ func (r *fakeRunner) RunOnce(ctx context.Context, gen vector.GenerationID) (embe
 	return res, err
 }
 
+func (r *fakeRunner) RunBackstop(ctx context.Context, gen vector.GenerationID) (embed.RunResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.backstopCalls++
+	r.lastBackstop = gen
+	return r.backstopResult, r.backstopErr
+}
+
 func (r *fakeRunner) calls() (reclaim, run int, lastGen vector.GenerationID) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.reclaimCalls, r.runCalls, r.lastRunGen
+}
+
+func (r *fakeRunner) backstops() (n int, lastGen vector.GenerationID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.backstopCalls, r.lastBackstop
 }
 
 // ---------- EmbedJob tests ----------
@@ -755,6 +773,100 @@ func TestEmbedJob_Run_PostActivationEnqueueDrainsOnNextRun(t *testing.T) {
 	assert.Len(backend.activations(), 1, "activations (only first activation)")
 }
 
+// TestEmbedJob_Run_BackstopRunsOnFirstTick verifies the auto-backstop is
+// woven into the existing embed job: on the first tick (lastBackstop zero)
+// it runs a full backstop on the same target as RunOnce.
+func TestEmbedJob_Run_BackstopRunsOnFirstTick(t *testing.T) {
+	backend := &fakeBackend{active: vector.Generation{ID: 5, State: vector.GenerationActive}}
+	runner := &fakeRunner{}
+	job := &EmbedJob{Worker: runner, Backend: backend}
+
+	job.Run(context.Background())
+
+	_, run, runGen := runner.calls()
+	assertpkg.Equal(t, 1, run, "RunOnce calls")
+	n, bsGen := runner.backstops()
+	assertpkg.Equal(t, 1, n, "RunBackstop calls on first tick")
+	assertpkg.Equal(t, runGen, bsGen, "backstop targets the same generation as RunOnce")
+}
+
+// TestEmbedJob_Run_BackstopGatedByInterval verifies the ~daily gating: a
+// second tick within BackstopInterval does NOT run another backstop (only
+// RunOnce), and a tick after the interval elapses runs one again.
+func TestEmbedJob_Run_BackstopGatedByInterval(t *testing.T) {
+	backend := &fakeBackend{active: vector.Generation{ID: 5, State: vector.GenerationActive}}
+	runner := &fakeRunner{}
+	now := time.Now()
+	clock := &now
+	job := &EmbedJob{
+		Worker:           runner,
+		Backend:          backend,
+		BackstopInterval: 24 * time.Hour,
+		Now:              func() time.Time { return *clock },
+	}
+
+	// Tick 1: backstop runs (first tick).
+	job.Run(context.Background())
+	n, _ := runner.backstops()
+	assertpkg.Equal(t, 1, n, "tick 1: backstop runs")
+
+	// Tick 2, only 1h later: within interval -> only RunOnce, no backstop.
+	*clock = now.Add(1 * time.Hour)
+	job.Run(context.Background())
+	n, _ = runner.backstops()
+	assertpkg.Equal(t, 1, n, "tick 2 (within interval): no extra backstop")
+	_, run, _ := runner.calls()
+	assertpkg.Equal(t, 2, run, "tick 2: RunOnce still runs")
+
+	// Tick 3, 25h after the last backstop: interval elapsed -> backstop runs.
+	*clock = now.Add(25 * time.Hour)
+	job.Run(context.Background())
+	n, _ = runner.backstops()
+	assertpkg.Equal(t, 2, n, "tick 3 (interval elapsed): backstop runs again")
+}
+
+// TestEmbedJob_Run_BackstopDisabled verifies a negative BackstopInterval
+// disables the auto-backstop entirely (only RunOnce runs).
+func TestEmbedJob_Run_BackstopDisabled(t *testing.T) {
+	backend := &fakeBackend{active: vector.Generation{ID: 5, State: vector.GenerationActive}}
+	runner := &fakeRunner{}
+	job := &EmbedJob{Worker: runner, Backend: backend, BackstopInterval: -1}
+
+	job.Run(context.Background())
+
+	n, _ := runner.backstops()
+	assertpkg.Equal(t, 0, n, "backstop disabled: no RunBackstop")
+	_, run, _ := runner.calls()
+	assertpkg.Equal(t, 1, run, "RunOnce still runs")
+}
+
+// TestEmbedJob_Run_BackstopFailureNotFatal verifies a backstop error is
+// logged but does not block the rest of the cycle, and lastBackstop is not
+// advanced (so the next tick retries).
+func TestEmbedJob_Run_BackstopFailureRetries(t *testing.T) {
+	backend := &fakeBackend{active: vector.Generation{ID: 5, State: vector.GenerationActive}}
+	runner := &fakeRunner{backstopErr: errors.New("boom")}
+	now := time.Now()
+	clock := &now
+	job := &EmbedJob{
+		Worker:  runner,
+		Backend: backend,
+		Now:     func() time.Time { return *clock },
+	}
+
+	// Tick 1: backstop attempted, fails.
+	job.Run(context.Background())
+	n, _ := runner.backstops()
+	assertpkg.Equal(t, 1, n, "tick 1: backstop attempted")
+
+	// Tick 2 immediately after: because the failure did not advance
+	// lastBackstop, the backstop is retried (lastBackstop still zero).
+	runner.backstopErr = nil
+	job.Run(context.Background())
+	n, _ = runner.backstops()
+	assertpkg.Equal(t, 2, n, "tick 2: backstop retried after prior failure")
+}
+
 // fakeCoverage satisfies EmbedCoverage for the activation-gate tests:
 // it reports a fixed number of live messages still needing embedding.
 type fakeCoverage struct {
@@ -788,6 +900,10 @@ func (r *slowRunner) RunOnce(context.Context, vector.GenerationID) (embed.RunRes
 	if r.release != nil {
 		<-r.release
 	}
+	return embed.RunResult{}, nil
+}
+
+func (r *slowRunner) RunBackstop(context.Context, vector.GenerationID) (embed.RunResult, error) {
 	return embed.RunResult{}, nil
 }
 

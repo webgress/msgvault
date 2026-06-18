@@ -5,15 +5,25 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"time"
 
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/embed"
 )
 
+// defaultBackstopInterval is how often the daemon embed job runs a full
+// watermark-ignoring backstop pass when BackstopInterval is left zero.
+const defaultBackstopInterval = 24 * time.Hour
+
 // EmbedRunner is the subset of *embed.Worker that EmbedJob needs.
 // Tests satisfy it with a fake.
 type EmbedRunner interface {
 	RunOnce(ctx context.Context, gen vector.GenerationID) (embed.RunResult, error)
+	// RunBackstop performs a full-scan pass that ignores the per-generation
+	// watermark, recovering below-watermark stragglers (repair-encoding
+	// resets, transient errors, crashes). Idempotent: already-covered rows
+	// are skipped by the scan predicate.
+	RunBackstop(ctx context.Context, gen vector.GenerationID) (embed.RunResult, error)
 	ReclaimStale(ctx context.Context) (int, error)
 }
 
@@ -64,6 +74,25 @@ type EmbedJob struct {
 	// is still refused.
 	Fingerprint string
 
+	// BackstopInterval controls how often Run also performs a full
+	// watermark-ignoring backstop pass (RunBackstop) in addition to the
+	// per-tick RunOnce. The backstop recovers below-watermark stragglers
+	// (repair-encoding NULL resets, transient errors, crashes) that the
+	// incremental scan skips. Zero uses defaultBackstopInterval (24h).
+	// A negative value disables the auto-backstop entirely.
+	BackstopInterval time.Duration
+
+	// Now returns the current time; overridable in tests to drive the
+	// backstop interval deterministically. nil uses time.Now.
+	Now func() time.Time
+
+	// lastBackstop is the time the most recent backstop ran, used to gate
+	// the next one by BackstopInterval. In-memory (not persisted): a daemon
+	// restart resets it, so the first tick after a restart runs one extra
+	// backstop — harmless because RunBackstop is idempotent. Read/written
+	// only while the running lock is held, so it needs no separate guard.
+	lastBackstop time.Time
+
 	// running guards against overlapping Run calls (cron fires while a
 	// post-sync hook is still draining, etc). sync.Mutex.TryLock gives
 	// us "skip if busy" without serializing a queue of waiters.
@@ -112,6 +141,17 @@ func (j *EmbedJob) Run(ctx context.Context) {
 		"truncated", res.Truncated,
 	)
 
+	// Periodic full backstop (~once per BackstopInterval). RunOnce only
+	// scans forward from the per-gen watermark, so below-watermark
+	// stragglers (repair-encoding NULL resets, transient errors, crashes)
+	// are otherwise only recovered by the manual `embeddings build
+	// --backstop`. Weaving it into this existing job gives `msgvault serve`
+	// users that recovery for free. The backstop reuses the same
+	// scan/embed/stamp path with the cursor pinned at 0, in modest
+	// non-locking batches, and is idempotent (already-covered rows are
+	// skipped) so it never re-embeds stamped messages.
+	j.maybeRunBackstop(ctx, target, log)
+
 	if !isBuilding {
 		return
 	}
@@ -151,6 +191,45 @@ func (j *EmbedJob) Run(ctx context.Context) {
 		return
 	}
 	log.Info("embed: building generation activated", "gen", target)
+}
+
+// maybeRunBackstop runs a full watermark-ignoring backstop pass on gen when
+// BackstopInterval has elapsed since the last one, then records the time.
+// Called with the running lock held (from Run), so lastBackstop needs no
+// separate guard. A negative BackstopInterval disables it; zero defaults to
+// 24h. A backstop failure is logged, not fatal — the next interval retries.
+func (j *EmbedJob) maybeRunBackstop(ctx context.Context, gen vector.GenerationID, log *slog.Logger) {
+	interval := j.BackstopInterval
+	if interval < 0 {
+		return // explicitly disabled
+	}
+	if interval == 0 {
+		interval = defaultBackstopInterval
+	}
+	now := time.Now
+	if j.Now != nil {
+		now = j.Now
+	}
+	t := now()
+	// First run (lastBackstop zero) always runs a backstop; thereafter gate
+	// by the interval.
+	if !j.lastBackstop.IsZero() && t.Sub(j.lastBackstop) < interval {
+		return
+	}
+	res, err := j.Worker.RunBackstop(ctx, gen)
+	if err != nil {
+		log.Warn("embed backstop failed", "gen", gen, "error", err)
+		// Do not advance lastBackstop on failure so the next tick retries.
+		return
+	}
+	j.lastBackstop = t
+	log.Info("embed backstop complete",
+		"gen", gen,
+		"scanned", res.Claimed,
+		"succeeded", res.Succeeded,
+		"failed", res.Failed,
+		"truncated", res.Truncated,
+	)
 }
 
 // pickTarget returns the generation to drain plus an isBuilding flag

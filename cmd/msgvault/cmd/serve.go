@@ -199,11 +199,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Only when vector search is enabled and wired.
 	if vf != nil {
 		embedJob := &scheduler.EmbedJob{
-			Worker:      vf.Worker,
-			Backend:     vf.Backend,
-			Store:       s,
-			Fingerprint: vf.Cfg.GenerationFingerprint(),
-			Log:         logger,
+			Worker:           vf.Worker,
+			Backend:          vf.Backend,
+			Store:            s,
+			Fingerprint:      vf.Cfg.GenerationFingerprint(),
+			BackstopInterval: vf.Cfg.Embed.BackstopInterval,
+			Log:              logger,
 		}
 		schedule := cfg.Vector.Embed.Schedule.Cron
 		if err := sched.SetEmbedJob(
