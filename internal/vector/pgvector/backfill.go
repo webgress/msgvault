@@ -4,6 +4,7 @@ package pgvector
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 
@@ -67,7 +68,8 @@ func (b *Backend) BackfillEmbedGenForUpgrade(ctx context.Context) error {
 	// Resolve the active generation. No active generation means nothing to
 	// backfill — but we still mark the migration applied so a later
 	// just-activated generation does not retroactively trigger a backfill
-	// that re-stamps rows repair-encoding may have reset.
+	// that re-stamps rows repair-encoding may have reset. A lone ledger
+	// INSERT is trivially atomic, so it runs directly (no transaction).
 	//
 	// Intentional scope limit: only the ACTIVE generation is backfilled. Any
 	// BUILDING generation that existed pre-upgrade is left unstamped — a
@@ -78,15 +80,35 @@ func (b *Backend) BackfillEmbedGenForUpgrade(ctx context.Context) error {
 	active, err := b.ActiveGeneration(ctx)
 	if err != nil {
 		if errors.Is(err, vector.ErrNoActiveGeneration) {
-			return b.markBackfillApplied(ctx)
+			return b.markBackfillAppliedExec(ctx, b.db)
 		}
 		return fmt.Errorf("backfill: resolve active generation: %w", err)
 	}
 
+	// Atomicity (Codex 129d #2/#3): the embed_gen stamp UPDATE and the
+	// ledger mark must be all-or-nothing. messages and applied_migrations
+	// share b.db, so a single transaction covers both. If the process
+	// crashes (or any error occurs) after the UPDATE but before the mark, an
+	// autocommit pair would leave the ledger UNMARKED while embed_gen was
+	// already stamped → the supposedly one-time backfill re-runs on the next
+	// Open and clobbers any NULL resets repair-encoding made in the interim.
+	// Wrapping both in one tx makes a crash leave the DB exactly pre-backfill
+	// (no stamps, no mark), so the next Open re-runs cleanly.
+	tx, err := b.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("backfill: begin tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
 	// Stamp embed_gen=active for messages with an embedding row under the
 	// active generation, only where embed_gen is still NULL (never overwrite
 	// a row stamped for another generation).
-	if _, err := b.db.ExecContext(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`UPDATE messages SET embed_gen = $1
 		  WHERE embed_gen IS NULL
 		    AND EXISTS (
@@ -97,7 +119,15 @@ func (b *Backend) BackfillEmbedGenForUpgrade(ctx context.Context) error {
 		return fmt.Errorf("backfill: stamp embed_gen: %w", err)
 	}
 
-	return b.markBackfillApplied(ctx)
+	if err := b.markBackfillAppliedExec(ctx, tx); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("backfill: commit tx: %w", err)
+	}
+	committed = true
+	return nil
 }
 
 // resetOrphanedEmbedGen clears messages.embed_gen for every message whose
@@ -149,10 +179,20 @@ func (b *Backend) backfillApplied(ctx context.Context) (bool, error) {
 	return n > 0, nil
 }
 
-// markBackfillApplied records the one-time backfill in the ledger. ON
-// CONFLICT DO NOTHING keeps it idempotent under a concurrent Open.
-func (b *Backend) markBackfillApplied(ctx context.Context) error {
-	if _, err := b.db.ExecContext(ctx,
+// execer is the subset of *sql.DB / *sql.Tx the ledger mark needs, so
+// markBackfillAppliedExec can run either directly (lone INSERT, the
+// no-active-gen path) or inside the backfill transaction (alongside the
+// embed_gen UPDATE, for atomicity).
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// markBackfillAppliedExec records the one-time backfill in the ledger via
+// the given execer. ON CONFLICT DO NOTHING keeps it idempotent under a
+// concurrent Open. Pass b.db for a standalone mark, or the backfill tx so
+// the mark commits atomically with the embed_gen UPDATE.
+func (b *Backend) markBackfillAppliedExec(ctx context.Context, ex execer) error {
+	if _, err := ex.ExecContext(ctx,
 		`INSERT INTO applied_migrations (name) VALUES ($1) ON CONFLICT DO NOTHING`,
 		embedGenBackfillMigration); err != nil {
 		return fmt.Errorf("backfill: mark ledger: %w", err)

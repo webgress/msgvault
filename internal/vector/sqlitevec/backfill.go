@@ -105,13 +105,17 @@ func (b *Backend) BackfillEmbedGenForUpgrade(ctx context.Context) error {
 	active, err := b.ActiveGeneration(ctx)
 	if err != nil {
 		if errors.Is(err, vector.ErrNoActiveGeneration) {
-			return b.markBackfillApplied(ctx)
+			// No work to stamp; a lone ledger INSERT is trivially atomic, so
+			// it runs directly on main.db (no transaction needed).
+			return b.markBackfillApplied(ctx, b.mainDB)
 		}
 		return fmt.Errorf("backfill: resolve active generation: %w", err)
 	}
 
 	// Distinct message ids that already have an embedding row for the active
-	// generation, read from vectors.db.
+	// generation, read from vectors.db. This cross-DB read stays OUTSIDE the
+	// main.db transaction below: it is read-only and targets a different
+	// *sql.DB handle, so it cannot participate in the main.db tx.
 	rows, err := b.db.QueryContext(ctx,
 		`SELECT DISTINCT message_id FROM embeddings WHERE generation_id = ?`,
 		int64(active.ID))
@@ -131,9 +135,30 @@ func (b *Backend) BackfillEmbedGenForUpgrade(ctx context.Context) error {
 		return fmt.Errorf("backfill: iterate embedded message ids: %w", err)
 	}
 
+	// Atomicity (Codex 129d #2/#3): the embed_gen stamp UPDATE(s) and the
+	// ledger mark must be all-or-nothing. messages and applied_migrations
+	// both live in main.db, so a single transaction covers every chunk plus
+	// the mark. Without it, a crash (or error) after some chunks but before
+	// the mark would leave the ledger UNMARKED while embed_gen rows were
+	// already stamped → the one-time backfill re-runs on the next Open and
+	// clobbers any NULL resets repair-encoding made in the interim. With one
+	// tx, a partial-chunk failure rolls back EVERY chunk and the mark, so the
+	// migration stays unmarked and the next Open re-runs cleanly from scratch.
+	tx, err := b.mainDB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("backfill: begin tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
 	// Stamp embed_gen=active for those ids on main.db, but only where it is
 	// still NULL — never overwrite a row already stamped for a different
-	// generation. Chunked to stay under the bind limit.
+	// generation. Chunked to stay under the bind limit; ALL chunks run on the
+	// same tx.
 	for start := 0; start < len(ids); start += backfillStampChunk {
 		end := min(start+backfillStampChunk, len(ids))
 		chunk := ids[start:end]
@@ -147,12 +172,20 @@ func (b *Backend) BackfillEmbedGenForUpgrade(ctx context.Context) error {
 		q := `UPDATE messages SET embed_gen = ?
 		       WHERE embed_gen IS NULL
 		         AND id IN (` + strings.Join(placeholders, ",") + `)`
-		if _, err := b.mainDB.ExecContext(ctx, q, args...); err != nil {
+		if _, err := tx.ExecContext(ctx, q, args...); err != nil {
 			return fmt.Errorf("backfill: stamp embed_gen: %w", err)
 		}
 	}
 
-	return b.markBackfillApplied(ctx)
+	if err := b.markBackfillApplied(ctx, tx); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("backfill: commit tx: %w", err)
+	}
+	committed = true
+	return nil
 }
 
 // resetOrphanedEmbedGen clears messages.embed_gen for every main-DB message
@@ -276,10 +309,20 @@ func (b *Backend) backfillApplied(ctx context.Context) (bool, error) {
 	return n > 0, nil
 }
 
-// markBackfillApplied records the one-time backfill in main.db's ledger.
-// INSERT OR IGNORE keeps it idempotent under a concurrent Open.
-func (b *Backend) markBackfillApplied(ctx context.Context) error {
-	if _, err := b.mainDB.ExecContext(ctx,
+// execer is the subset of *sql.DB / *sql.Tx the ledger mark needs, so
+// markBackfillApplied can run either directly on main.db (lone INSERT, the
+// no-active-gen path) or inside the backfill transaction (alongside the
+// chunked embed_gen UPDATEs, for atomicity).
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// markBackfillApplied records the one-time backfill in main.db's ledger via
+// the given execer. INSERT OR IGNORE keeps it idempotent under a concurrent
+// Open. Pass b.mainDB for a standalone mark, or the backfill tx so the mark
+// commits atomically with the embed_gen UPDATEs.
+func (b *Backend) markBackfillApplied(ctx context.Context, ex execer) error {
+	if _, err := ex.ExecContext(ctx,
 		`INSERT OR IGNORE INTO applied_migrations (name) VALUES (?)`,
 		embedGenBackfillMigration); err != nil {
 		return fmt.Errorf("backfill: mark ledger: %w", err)

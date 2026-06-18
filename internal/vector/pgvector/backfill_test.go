@@ -91,6 +91,94 @@ func TestBackfillEmbedGen_UpgradeStampsEmbeddedOnly(t *testing.T) {
 	assert.True(t, isNull3Again, "msg 3 still NULL after second backfill (ledger no-op)")
 }
 
+// TestBackfillEmbedGen_StampAndMarkAtomic_RollbackOnMarkFailure is the
+// PostgreSQL companion to the sqlitevec atomicity guard (Codex 129d #2/#3):
+// the embed_gen stamp UPDATE and the applied_migrations ledger mark must be
+// ONE transaction. messages and applied_migrations share b.db on PG, so a
+// single tx covers both.
+//
+// Fault injection: a BEFORE INSERT trigger on applied_migrations RAISEs an
+// exception when the backfill ledger row is inserted, so the mark step fails
+// AFTER the embed_gen UPDATE has run inside the same tx. If atomic, the UPDATE
+// must be ROLLED BACK (embed_gen stays NULL) and the ledger must stay UNMARKED,
+// so a later clean backfill re-runs and completes.
+func TestBackfillEmbedGen_StampAndMarkAtomic_RollbackOnMarkFailure(t *testing.T) {
+	ctx := context.Background()
+	db := openPGTestDB(t)
+	_, err := db.Exec(`CREATE TABLE applied_migrations (
+		name TEXT PRIMARY KEY,
+		applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+	)`)
+	require.NoError(t, err, "create applied_migrations")
+
+	_, err = db.Exec(`INSERT INTO messages (id) VALUES (1)`)
+	require.NoError(t, err, "insert message")
+
+	b, err := Open(ctx, Options{DB: db, Dimension: 4})
+	require.NoError(t, err, "Open")
+	t.Cleanup(func() { _ = b.Close() })
+
+	gen, err := b.CreateGeneration(ctx, "fake", 4, "")
+	require.NoError(t, err, "CreateGeneration")
+	require.NoError(t, b.Upsert(ctx, gen, []vector.Chunk{
+		{MessageID: 1, Vector: []float32{1, 0, 0, 0}},
+	}), "Upsert")
+	require.NoError(t, b.ActivateGeneration(ctx, gen, true), "Activate")
+
+	// Pre-upgrade state: embed_gen NULL, ledger cleared (Open already marked
+	// it when no gen existed).
+	_, err = db.ExecContext(ctx, `UPDATE messages SET embed_gen = NULL`)
+	require.NoError(t, err, "reset embed_gen")
+	_, err = db.ExecContext(ctx,
+		`DELETE FROM applied_migrations WHERE name = $1`, embedGenBackfillMigration)
+	require.NoError(t, err, "clear ledger")
+
+	// Install a fault that makes ONLY the ledger mark fail. The embed_gen
+	// UPDATE on messages still succeeds, so a non-atomic implementation would
+	// leave embed_gen stamped while the ledger stays unmarked.
+	_, err = db.Exec(`CREATE FUNCTION zz_fail_backfill_mark() RETURNS trigger AS $fn$
+		BEGIN
+			IF NEW.name = '` + embedGenBackfillMigration + `' THEN
+				RAISE EXCEPTION 'injected backfill mark failure';
+			END IF;
+			RETURN NEW;
+		END;
+		$fn$ LANGUAGE plpgsql`)
+	require.NoError(t, err, "create fault function")
+	_, err = db.Exec(`CREATE TRIGGER zz_fail_backfill_mark
+		BEFORE INSERT ON applied_migrations
+		FOR EACH ROW EXECUTE FUNCTION zz_fail_backfill_mark()`)
+	require.NoError(t, err, "install fault trigger")
+
+	err = b.BackfillEmbedGenForUpgrade(ctx)
+	require.Error(t, err, "backfill must surface the injected ledger-mark failure")
+	assert.Contains(t, err.Error(), "injected backfill mark failure")
+
+	// Atomicity: the stamp must have been ROLLED BACK with the failed mark.
+	_, isNull := embedGenOf(t, db, 1)
+	assert.True(t, isNull,
+		"embed_gen must be rolled back to NULL when the ledger mark fails (atomic)")
+	var marked int
+	require.NoError(t, db.QueryRow(
+		`SELECT COUNT(*) FROM applied_migrations WHERE name = $1`,
+		embedGenBackfillMigration).Scan(&marked))
+	assert.Equal(t, 0, marked, "ledger must stay unmarked when the backfill tx rolls back")
+
+	// Recovery: remove the fault and re-run. The migration was never marked,
+	// so the one-time backfill re-runs cleanly and now completes.
+	_, err = db.Exec(`DROP TRIGGER zz_fail_backfill_mark ON applied_migrations`)
+	require.NoError(t, err, "drop fault trigger")
+	require.NoError(t, b.BackfillEmbedGenForUpgrade(ctx), "clean re-run must succeed")
+
+	v, isNull := embedGenOf(t, db, 1)
+	assert.False(t, isNull, "embed_gen stamped after clean re-run")
+	assert.Equal(t, int64(gen), v, "embed_gen references the active generation")
+	require.NoError(t, db.QueryRow(
+		`SELECT COUNT(*) FROM applied_migrations WHERE name = $1`,
+		embedGenBackfillMigration).Scan(&marked))
+	assert.Equal(t, 1, marked, "ledger marked after clean re-run")
+}
+
 // TestResetOrphanedEmbedGen_RecreateScenario mirrors the sqlitevec recreate
 // test on PostgreSQL: messages carry stamps for a generation id that no longer
 // exists in index_generations (a partial restore — messages restored, the
