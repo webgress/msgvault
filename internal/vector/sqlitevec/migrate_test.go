@@ -322,6 +322,33 @@ func TestMigrate_CreatesDimensionSpecificVecTable(t *testing.T) {
 	assertpkg.NoError(t, err, "vectors_vec_d1024 not created")
 }
 
+// TestMigrate_DropsDeadPendingEmbeddings pins FIX D (#7/#8): a legacy
+// vectors.db carrying the dead pending_embeddings queue table must have it
+// dropped on Migrate. The scan-and-fill design replaced the seed queue with
+// a live messages.embed_gen scan, so the table is never read or written.
+func TestMigrate_DropsDeadPendingEmbeddings(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "vectors.db")
+	db := openTestDB(t, path)
+	t.Cleanup(func() { _ = db.Close() })
+
+	// Stand up a legacy pending_embeddings table before migrating.
+	_, err := db.ExecContext(ctx, `CREATE TABLE pending_embeddings (
+		generation_id INTEGER NOT NULL,
+		message_id    INTEGER NOT NULL
+	)`)
+	requirepkg.NoError(t, err, "create legacy pending_embeddings")
+
+	requirepkg.NoError(t, Migrate(ctx, db, 768), "migrate")
+
+	exists, err := tableExists(ctx, db, "pending_embeddings")
+	requirepkg.NoError(t, err, "probe pending_embeddings")
+	assertpkg.False(t, exists, "pending_embeddings must be dropped on upgrade")
+
+	// Idempotent on a fresh DB (no pending_embeddings present).
+	requirepkg.NoError(t, Migrate(ctx, db, 768), "second migrate (idempotent)")
+}
+
 func openTestDB(t *testing.T, path string) *sql.DB {
 	t.Helper()
 	requirepkg.NoError(t, RegisterExtension(), "register")

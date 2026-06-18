@@ -22,11 +22,15 @@ func TestEmbeddingsCommandRegistration(t *testing.T) {
 	require.Equal("build", buildCmd.Name())
 	require.NotNil(buildCmd.Flags().Lookup("full-rebuild"))
 	require.NotNil(buildCmd.Flags().Lookup("yes"))
+	require.NotNil(buildCmd.Flags().Lookup("backstop"))
 
 	resumeCmd, _, err := rootCmd.Find([]string{"embeddings", "resume"})
 	require.NoError(err)
 	require.Equal("resume", resumeCmd.Name())
 	require.Nil(resumeCmd.Flags().Lookup("full-rebuild"))
+	// FIX D (#2): --backstop is now available on resume too, so operators
+	// can do a watermark-ignoring straggler sweep without --full-rebuild.
+	require.NotNil(resumeCmd.Flags().Lookup("backstop"))
 
 	listCmd, _, err := rootCmd.Find([]string{"embeddings", "list"})
 	require.NoError(err)
@@ -50,6 +54,41 @@ func TestEmbeddingsCommandRegistration(t *testing.T) {
 	require.NotEmpty(legacyCmd.Deprecated)
 	require.NotNil(legacyCmd.Flags().Lookup("full-rebuild"))
 	require.NotNil(legacyCmd.Flags().Lookup("yes"))
+}
+
+// TestRunEmbeddingsResume_PreservesBackstopFlag pins FIX D (#2): resume
+// forces incremental mode (saves/restores embedFullRebuild + embedYes) but
+// must leave embedBackstop exactly as the operator set it, so
+// `embeddings resume --backstop` actually runs a backstop pass.
+func TestRunEmbeddingsResume_PreservesBackstopFlag(t *testing.T) {
+	assert := assertpkg.New(t)
+
+	// Save and restore all three globals so the test is hermetic.
+	oldFull, oldYes, oldBackstop := embedFullRebuild, embedYes, embedBackstop
+	t.Cleanup(func() { embedFullRebuild, embedYes, embedBackstop = oldFull, oldYes, oldBackstop })
+
+	// Operator state: full-rebuild on (resume must clear it), backstop on
+	// (resume must NOT touch it). Point at an empty config so the run errors
+	// out early (vector disabled) without needing a real backend.
+	embedFullRebuild = true
+	embedYes = false
+	embedBackstop = true
+	oldCfg := cfg
+	cfg = &config.Config{}
+	t.Cleanup(func() { cfg = oldCfg })
+
+	cmd := embeddingsResumeCmd
+	oldCtx := cmd.Context()
+	cmd.SetContext(context.Background())
+	t.Cleanup(func() { cmd.SetContext(oldCtx) })
+
+	// Errors because vector is not enabled — that's fine; we only assert the
+	// flag-preservation contract of runEmbeddingsResume.
+	_ = runEmbeddingsResume(cmd, nil)
+
+	assert.True(embedBackstop, "resume must NOT clobber embedBackstop")
+	assert.True(embedFullRebuild, "resume must restore embedFullRebuild to its prior value")
+	assert.False(embedYes, "resume must restore embedYes to its prior value")
 }
 
 func TestListEmbeddingGenerationsIncludesActiveAndBuilding(t *testing.T) {

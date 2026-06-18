@@ -28,7 +28,9 @@ var embeddingsResumeCmd = &cobra.Command{
 	Long: `Resume or top up the current vector embedding generation.
 If a matching generation is building, this embeds any messages still
 needing embedding for it and activates it when complete. Otherwise it
-embeds any messages still needing embedding for the active generation.`,
+embeds any messages still needing embedding for the active generation.
+Pass --backstop for a full-scan pass that ignores the per-generation
+watermark, catching any straggler messages the incremental scan skipped.`,
 	RunE: runEmbeddingsResume,
 }
 var embeddingsListCmd = &cobra.Command{
@@ -96,6 +98,8 @@ func runEmbeddingsResume(cmd *cobra.Command, args []string) error {
 
 func init() {
 	embedCmd.Deprecated = "use 'msgvault embeddings build' instead"
+	embeddingsResumeCmd.Flags().BoolVar(&embedBackstop, "backstop", false,
+		"Full-scan pass that ignores the per-generation watermark, catching any straggler messages the incremental scan skipped (idempotent)")
 	embeddingsRetireCmd.Flags().BoolVar(&embeddingsRetireYes, "yes", false, "Skip confirmation prompt")
 	embeddingsRetireCmd.Flags().BoolVar(&embeddingsRetireForceActive, "force-active", false, "Allow retiring the active generation")
 	embeddingsActivateCmd.Flags().BoolVar(&embeddingsActivateYes, "yes", false, "Skip confirmation prompt")

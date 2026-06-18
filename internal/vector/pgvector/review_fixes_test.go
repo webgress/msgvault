@@ -222,6 +222,32 @@ func TestMigrate_DropsPreExistingGenMsgIndex(t *testing.T) {
 		"re-migrate must drop the legacy idx_embeddings_gen_msg")
 }
 
+// TestMigrate_DropsDeadPendingEmbeddings pins FIX D (#7/#8): a legacy DB
+// carrying the dead pending_embeddings queue table must have it dropped on
+// Migrate. The scan-and-fill design replaced the seed queue with a live
+// messages.embed_gen scan, so the table is never read or written.
+func TestMigrate_DropsDeadPendingEmbeddings(t *testing.T) {
+	db := openPGTestDB(t)
+	ctx := context.Background()
+	require.NoError(t, Migrate(ctx, db, 0, false), "first Migrate")
+
+	// Stand up a legacy pending_embeddings table, then re-migrate.
+	_, err := db.ExecContext(ctx, `CREATE TABLE pending_embeddings (
+		generation_id BIGINT NOT NULL,
+		message_id    BIGINT NOT NULL
+	)`)
+	require.NoError(t, err, "create legacy pending_embeddings")
+	var reg *string
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT to_regclass('pending_embeddings')::text`).Scan(&reg))
+	require.NotNil(t, reg, "legacy table should exist before re-migrate")
+
+	require.NoError(t, Migrate(ctx, db, 0, false), "second Migrate")
+	require.NoError(t, db.QueryRowContext(ctx,
+		`SELECT to_regclass('pending_embeddings')::text`).Scan(&reg))
+	assert.Nil(t, reg, "re-migrate must drop the dead pending_embeddings table")
+}
+
 // TestMigrate_SkipExtension (V5 / finding B3) asserts that the skipExtension
 // flag is HONORED — not merely that the schema objects exist (which would also
 // be true for an impl that ignored the flag and ran the harmless
