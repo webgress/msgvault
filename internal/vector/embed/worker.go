@@ -22,10 +22,12 @@ type EmbeddingClient interface {
 }
 
 // WorkStore is the subset of *store.Store the worker uses to find work
-// and stamp coverage against the MAIN db. Defined here (rather than
-// importing internal/store) to keep the embed package decoupled and the
-// worker easy to fake in tests, mirroring the func-injection style the
-// queue/enqueuer used. *store.Store satisfies this implicitly.
+// and stamp coverage against the MAIN db. It is a narrow interface — only
+// the few methods the worker actually calls — so the embed package depends
+// on just that surface and the worker is easy to fake in tests, mirroring
+// the func-injection style the queue/enqueuer used. *store.Store satisfies
+// it implicitly. (The package still imports internal/store for the shared
+// EmbedGenStamp type used by SetEmbedGenIfUnchanged.)
 type WorkStore interface {
 	// ScanForEmbedding returns up to limit live message ids needing work
 	// for target (embed_gen IS NULL OR embed_gen <> target), scanning
@@ -330,16 +332,16 @@ func (w *Worker) run(ctx context.Context, gen vector.GenerationID, backstop bool
 				// unstamped (endpoint-wide failure can't be ruled out).
 				w.deps.Log.Info("embed: downshifting to BatchSize=1 to drain failing batch",
 					"gen", gen, "batch_size", len(ids))
-				embedded, stamped, safeAdvanceID, drainErr := w.downshiftDrain(ctx, gen, ids, &res, &completedRows)
+				embedded, embeddedOK, stamped, safeAdvanceID, drainErr := w.downshiftDrain(ctx, gen, ids, &res, &completedRows)
 				res.Succeeded += embedded
 				if drainErr != nil {
 					w.deps.Log.Info("embed: downshift drain returned error",
 						"gen", gen, "batch_size", len(ids),
-						"embedded", embedded, "stamped", stamped, "error", drainErr)
+						"embedded", embedded, "embedded_ok", embeddedOK, "stamped", stamped, "error", drainErr)
 				} else {
 					w.deps.Log.Info("embed: downshift drain complete; resuming configured batch size",
 						"gen", gen, "batch_size", len(ids),
-						"embedded", embedded, "stamped", stamped)
+						"embedded", embedded, "embedded_ok", embeddedOK, "stamped", stamped)
 				}
 
 				// Forward progress resets the cap and advances the cursor —
@@ -355,7 +357,14 @@ func (w *Worker) run(ctx context.Context, gen vector.GenerationID, backstop bool
 				// would advance to batchMax and the straggler would be
 				// stranded — recovered by the next backstop pass (manual
 				// `embeddings build --backstop` or the serve auto-backstop).
-				if embedded > 0 {
+				//
+				// Reset the failure cap on embeddedOK (the endpoint embedded +
+				// upserted something this drain), NOT on `embedded` (which only
+				// counts CAS-stamped singletons). A singleton that embedded but
+				// CAS-missed its stamp proves the endpoint is healthy, so a
+				// recurring CAS miss must not be able to trip the
+				// misconfig/abort cap.
+				if embeddedOK > 0 {
 					consecutiveFailures = 0
 				}
 				if safeAdvanceID > afterID {
@@ -775,7 +784,17 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 // unstamped so a misconfigured endpoint does not silently lose work).
 //
 // Returns:
-//   - embedded: count of singletons that successfully embedded.
+//   - embedded: count of singletons that successfully embedded AND CAS-stamped
+//     their embed_gen (a singleton that embedded+upserted but whose CAS stamp
+//     missed is excluded — it is recovered by the backstop). This feeds
+//     res.Succeeded / progress.
+//   - embeddedOK: count of singletons that successfully embedded + upserted,
+//     REGARDLESS of whether the subsequent CAS stamp landed. This is the
+//     endpoint-health signal: if the endpoint demonstrably embedded something
+//     this drain (embeddedOK > 0), any sibling 4xxs are message-specific drops,
+//     not an endpoint-wide outage — even when those embeds CAS-missed and so
+//     contributed nothing to `embedded`. The caller resets the
+//     consecutive-failure counter on embeddedOK > 0.
 //   - stamped:  count of ids whose embed_gen was stamped (embedded +
 //     confirmed message-specific drops). When this is > 0 the caller may
 //     advance the scan cursor; when it is 0 the deferred ids are left
@@ -801,7 +820,7 @@ func (w *Worker) downshiftDrain(
 	ids []int64,
 	res *RunResult,
 	completedRows *int,
-) (embedded int, stamped int, safeAdvanceID int64, err error) {
+) (embedded int, embeddedOK int, stamped int, safeAdvanceID int64, err error) {
 	var deferredDrops []int64
 	var lastDeferredErr error
 	// lm accumulates last_modified CAS tokens across the singleton fetches so
@@ -821,7 +840,7 @@ func (w *Worker) downshiftDrain(
 	for _, id := range ids {
 		select {
 		case <-ctx.Done():
-			return embedded, stamped, contiguousStampedID, ctx.Err()
+			return embedded, embeddedOK, stamped, contiguousStampedID, ctx.Err()
 		default:
 		}
 
@@ -841,7 +860,7 @@ func (w *Worker) downshiftDrain(
 			// Non-4xx (transient) error: this id is left UNSTAMPED. Return the
 			// contiguous-stamped id so the caller does not advance the
 			// watermark past it; the next RunOnce re-finds it.
-			return embedded, stamped, contiguousStampedID, e
+			return embedded, embeddedOK, stamped, contiguousStampedID, e
 		}
 		// Carry forward the CAS token for this fetched id.
 		for k, v := range eb.lastModified {
@@ -854,7 +873,7 @@ func (w *Worker) downshiftDrain(
 				missed, serr := w.stampCovered(ctx, gen, skip, eb.lastModified)
 				if serr != nil {
 					res.Failed += len(skip)
-					return embedded, stamped, contiguousStampedID, fmt.Errorf("stamp skip: %w", serr)
+					return embedded, embeddedOK, stamped, contiguousStampedID, fmt.Errorf("stamp skip: %w", serr)
 				}
 				w.logCASMisses(gen, missed)
 				stampedSkip := len(skip) - len(missed)
@@ -873,13 +892,19 @@ func (w *Worker) downshiftDrain(
 				// benign sentinel; remaining singletons would observe the same
 				// state. Do not stamp (the gen is going away).
 				w.deps.Log.Info("embed: generation retired mid-drain; stopping", "gen", gen, "id", id)
-				return embedded, stamped, contiguousStampedID, fmt.Errorf("upsert: %w", uerr)
+				return embedded, embeddedOK, stamped, contiguousStampedID, fmt.Errorf("upsert: %w", uerr)
 			}
-			return embedded, stamped, contiguousStampedID, fmt.Errorf("upsert: %w", uerr)
+			return embedded, embeddedOK, stamped, contiguousStampedID, fmt.Errorf("upsert: %w", uerr)
 		}
+		// The endpoint demonstrably embedded + upserted this singleton. Count it
+		// toward endpoint health NOW, before the CAS stamp result — a stamp that
+		// later misses (a concurrent edit moved last_modified) does not mean the
+		// endpoint failed, so it must not be able to misclassify this drain as an
+		// endpoint-wide all-drop.
+		embeddedOK++
 		missed, serr := w.stampCovered(ctx, gen, eb.embeddedIDs, eb.lastModified)
 		if serr != nil {
-			return embedded, stamped, contiguousStampedID, fmt.Errorf("stamp embed_gen: %w", serr)
+			return embedded, embeddedOK, stamped, contiguousStampedID, fmt.Errorf("stamp embed_gen: %w", serr)
 		}
 		w.logCASMisses(gen, missed)
 		// A CAS miss on this singleton means its content changed since the
@@ -890,8 +915,17 @@ func (w *Worker) downshiftDrain(
 		embedded += stampedHere
 		stamped += stampedHere
 		*completedRows += stampedHere
-		if !brokeContiguity {
-			contiguousStampedID = id
+		// Advance the contiguous-stamped prefix only when this singleton was
+		// ACTUALLY stamped. A CAS-missed singleton (stampedHere == 0) is left
+		// unstamped and recovered by the backstop, so the watermark must not skip
+		// past it. Once a CAS miss breaks the prefix, latch brokeContiguity so a
+		// later stamped id cannot re-extend it over the unstamped gap.
+		if stampedHere > 0 {
+			if !brokeContiguity {
+				contiguousStampedID = id
+			}
+		} else {
+			brokeContiguity = true
 		}
 		batchChars := 0
 		for _, c := range eb.chunks {
@@ -907,12 +941,16 @@ func (w *Worker) downshiftDrain(
 
 	// Decide deferred-drop fate.
 	if len(deferredDrops) == 0 {
-		return embedded, stamped, safeAdvanceID, nil
+		return embedded, embeddedOK, stamped, safeAdvanceID, nil
 	}
-	if embedded > 0 {
-		// Endpoint works for some messages, so the 4xxs are
-		// message-specific (oversize input, malformed input, etc.).
-		// Stamp them so they drop out of future scans.
+	if embeddedOK > 0 {
+		// The endpoint demonstrably embedded something this drain, so the 4xxs
+		// are message-specific (oversize input, malformed input, etc.) — NOT an
+		// endpoint-wide outage. Key on embeddedOK (successful embed+upsert) and
+		// not `embedded` (successful CAS stamp): a singleton that embedded but
+		// CAS-missed its stamp still proves the endpoint is healthy, and must
+		// not let a genuine 4xx sibling be misclassified as an all-drop.
+		// Stamp the deferred 4xxs so they drop out of future scans.
 		for _, id := range deferredDrops {
 			w.deps.Log.Warn("stamping (dropping) message after singleton 4xx",
 				"gen", gen, "id", id, "error", lastDeferredErr)
@@ -930,7 +968,7 @@ func (w *Worker) downshiftDrain(
 			res.Failed += len(deferredDrops)
 			// Some deferred drops are now unstamped; do not advance past the
 			// contiguous-stamped prefix.
-			return embedded, stamped, contiguousStampedID, fmt.Errorf("stamp drop: %w", serr)
+			return embedded, embeddedOK, stamped, contiguousStampedID, fmt.Errorf("stamp drop: %w", serr)
 		}
 		w.logCASMisses(gen, missed)
 		stampedDrops := len(deferredDrops) - len(missed)
@@ -938,18 +976,18 @@ func (w *Worker) downshiftDrain(
 		*completedRows += stampedDrops
 		w.reportProgress(*completedRows, stampedDrops, 0, time.Since(dropStart))
 		// All deferred drops are now stamped; the entire batch is resolved.
-		return embedded, stamped, safeAdvanceID, nil
+		return embedded, embeddedOK, stamped, safeAdvanceID, nil
 	}
-	// embedded == 0. We can't distinguish endpoint-wide failure from a
-	// batch where every message just happened to be unembeddable. Leave
-	// the deferred ids UNSTAMPED so a misconfigured endpoint does not
-	// silently drop work, and return the wrapped 4xx so the caller
-	// surfaces it. The unstamped ids are re-found on the next scan; if the
-	// underlying problem persists, the consecutive-failure cap eventually
-	// trips with the same 4xx body. Advance only past the contiguous
-	// stamped prefix (the leading missing/empty skips, if any) so the
-	// unstamped deferred ids are not skipped.
-	return embedded, stamped, contiguousStampedID, fmt.Errorf("downshift all-drop: every singleton returned non-retryable 4xx (left %d row(s) unstamped): %w",
+	// embeddedOK == 0. The endpoint embedded nothing this drain, so we can't
+	// distinguish an endpoint-wide failure from a batch where every message
+	// just happened to be unembeddable. Leave the deferred ids UNSTAMPED so a
+	// misconfigured endpoint does not silently drop work, and return the
+	// wrapped 4xx so the caller surfaces it. The unstamped ids are re-found on
+	// the next scan; if the underlying problem persists, the
+	// consecutive-failure cap eventually trips with the same 4xx body. Advance
+	// only past the contiguous stamped prefix (the leading missing/empty skips,
+	// if any) so the unstamped deferred ids are not skipped.
+	return embedded, embeddedOK, stamped, contiguousStampedID, fmt.Errorf("downshift all-drop: every singleton returned non-retryable 4xx (left %d row(s) unstamped): %w",
 		len(deferredDrops), lastDeferredErr)
 }
 

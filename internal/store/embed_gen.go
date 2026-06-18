@@ -124,12 +124,17 @@ type EmbedGenStamp struct {
 // closes the read→stamp race that an unconditional stamp would lose by
 // marking the row embedded-with-stale-content.
 //
-// The worker's own stamp UPDATE bumps last_modified via the AFTER-UPDATE
-// trigger (SQLite) / leaves it unchanged (PG BEFORE trigger only fires when
-// last_modified is unchanged AND no explicit set — here embed_gen is the only
-// change, so the SQLite trigger fires and re-stamps last_modified). Either
-// way the WHERE matches the PRE-trigger value, so a legitimate stamp still
-// succeeds; only a value that changed BEFORE this UPDATE ran blocks it.
+// The worker's own stamp UPDATE bumps last_modified on BOTH backends via
+// their triggers: this UPDATE sets only embed_gen (not last_modified), so the
+// SQLite AFTER-UPDATE trigger fires (its WHEN OLD.last_modified = NEW... holds)
+// and re-stamps last_modified, and the PG BEFORE-UPDATE trigger fires too (its
+// WHEN OLD.last_modified IS NOT DISTINCT FROM NEW... holds) and sets
+// last_modified = CURRENT_TIMESTAMP. The WHERE comparison matches against the
+// PRE-trigger value, so a legitimate stamp still affects exactly 1 row (it is
+// NOT a CAS miss); only a value that changed BEFORE this UPDATE ran blocks it.
+// The post-stamp bump is correctness-neutral: once embed_gen = target the row
+// is terminal/covered and excluded by the scan predicate, so no later scan
+// re-finds it on account of the bumped last_modified.
 //
 // Each row is a separate UPDATE because every message carries a distinct
 // last_modified token. Statements are not wrapped in one transaction: each is

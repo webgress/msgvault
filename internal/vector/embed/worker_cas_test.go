@@ -6,7 +6,9 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -256,4 +258,108 @@ func TestWorker_CASSelfBumpDoesNotBlockStamp(t *testing.T) {
 	assert.Equal(t, int64(f.BuildingGen), v, "embed_gen set")
 	// The stamp's own UPDATE bumped last_modified off the baseline.
 	assert.NotEqual(t, token, lmOf(t, f.MainDB, 1), "self-bump moved last_modified")
+}
+
+// TestWorker_Downshift_CASMissNotAllDrop is the fail-on-regression for the
+// downshift all-drop misclassification (Codex 129h). Within a singleton drain,
+// one message genuinely returns a permanent 4xx while ANOTHER embeds + upserts
+// successfully but CAS-MISSES its stamp (a concurrent content edit bumped
+// last_modified between the worker's read and its stamp).
+//
+// PRE-FIX: downshiftDrain counted only CAS-STAMPED singletons toward
+// `embedded`, and classified endpoint health on `embedded > 0`. The
+// embedded-but-CAS-missed singleton contributed 0 to `embedded`, so with a
+// genuine-4xx sibling the drain saw embedded==0 and misclassified a HEALTHY
+// endpoint as an endpoint-wide all-drop: it left the genuine 4xx UNSTAMPED and
+// returned the wrapped ErrPermanent4xx. RunOnce then did NOT reset
+// consecutiveFailures (it keyed on embedded>0) nor advance the cursor, so the
+// next scan re-found the same batch, re-downshifted, and tripped the
+// consecutive-failure cap — a SPURIOUS abort of an otherwise-fine endpoint.
+//
+// POST-FIX: the drain tracks embeddedOK (successful embed+upsert regardless of
+// the CAS outcome) and classifies endpoint health on it, so the genuine 4xx is
+// treated as a message-specific drop (stamped), the failure cap is reset, and
+// RunOnce completes without aborting. The CAS-missed row stays recoverable
+// (embed_gen still NULL, picked up by the backstop).
+func TestWorker_Downshift_CASMissNotAllDrop(t *testing.T) {
+	ctx := context.Background()
+	f := newWorkerFixture(t, 2)
+
+	// Pin msg 1's last_modified to a fixed far-past token so the mid-embed
+	// body rewrite is guaranteed to bump it to a different value (the CAS
+	// miss). msg 2 is the genuine 4xx; its last_modified does not matter
+	// (the 4xx path stamps it unconditionally).
+	setBaselineLM(t, f.MainDB, 1)
+
+	// Downshift orchestration:
+	//   - the whole-batch call (len(inputs) > 1) 4xxs, forcing the downshift;
+	//   - singleton msg 1 (text contains "body 1") embeds OK, but inside the
+	//     embed call we rewrite its body — bumping last_modified via the
+	//     trigger so the worker's subsequent CAS stamp MISSES;
+	//   - singleton msg 2 (text contains "body 2") returns a genuine 4xx.
+	f.FakeClient.OnEmbed = func(inputs []string) ([][]float32, error) {
+		if len(inputs) > 1 {
+			return nil, fmt.Errorf("embed: HTTP 400: batch too long: %w", ErrPermanent4xx)
+		}
+		if strings.Contains(inputs[0], "body 2") {
+			return nil, fmt.Errorf("embed: HTTP 400: blocked content: %w", ErrPermanent4xx)
+		}
+		// msg 1: race a content edit in BETWEEN the worker's read (which
+		// captured last_modified) and its stamp, so the CAS stamp misses.
+		_, err := f.MainDB.Exec(
+			`UPDATE message_bodies SET body_text = 'corrected content' WHERE message_id = 1`)
+		require.NoError(t, err, "race: rewrite body of msg 1")
+		v := make([]float32, f.FakeClient.dim)
+		v[0] = 1
+		return [][]float32{v}, nil
+	}
+
+	var logbuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logbuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	// MaxConsecutiveFailures=2 so the spurious abort would trip quickly under
+	// the pre-fix logic (the all-drop misclassification re-occurs every scan).
+	w := NewWorker(WorkerDeps{
+		Backend:                f.Backend,
+		VectorsDB:              f.VectorsDB,
+		MainDB:                 f.MainDB,
+		Store:                  f.Store,
+		Client:                 f.FakeClient,
+		BatchSize:              2,
+		MaxConsecutiveFailures: 2,
+		Log:                    logger,
+	})
+
+	// (a)+(b): RunOnce must NOT abort — the genuine 4xx is a message-specific
+	// drop, not an endpoint-wide all-drop, and the failure cap is reset because
+	// the endpoint embedded something (embeddedOK > 0).
+	_, err := w.RunOnce(ctx, f.BuildingGen)
+	require.NoError(t, err, "RunOnce must not abort (healthy endpoint, not an all-drop)")
+
+	// The genuine-4xx row (msg 2) was stamp-dropped, NOT left unstamped.
+	v2, isNull2 := embedGenOf(t, f.MainDB, 2)
+	assert.False(t, isNull2, "genuine 4xx row (msg 2) stamp-dropped (message-specific)")
+	assert.Equal(t, int64(f.BuildingGen), v2, "msg 2 embed_gen = target")
+
+	// (c): the CAS-missed row (msg 1) is NOT stamped — it remains recoverable
+	// (embed_gen still NULL), to be picked up by the backstop. The drain must
+	// not have stranded it as "covered".
+	_, isNull1 := embedGenOf(t, f.MainDB, 1)
+	assert.True(t, isNull1, "CAS-missed row (msg 1) left unstamped (recoverable)")
+
+	// Exactly the CAS-missed row remains needing embedding.
+	assert.Equal(t, 1, countMissing(t, f.MainDB, int64(f.BuildingGen)),
+		"only the CAS-missed row remains")
+
+	// The CAS miss was logged (proves the race really happened and was handled
+	// as a miss, not silently stamped).
+	assert.Contains(t, logbuf.String(), "embed_gen CAS misses", "CAS miss logged")
+
+	// Recovery: the backstop (full scan from 0, ignoring the watermark)
+	// re-embeds the CAS-missed row with its corrected content.
+	f.FakeClient.OnEmbed = nil
+	bres, err := w.RunBackstop(ctx, f.BuildingGen)
+	require.NoError(t, err, "RunBackstop recovery")
+	assert.Equal(t, 1, bres.Succeeded, "backstop re-embeds the CAS-missed row")
+	assert.Equal(t, 0, countMissing(t, f.MainDB, int64(f.BuildingGen)),
+		"coverage complete after backstop")
 }
