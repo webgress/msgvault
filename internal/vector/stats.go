@@ -55,9 +55,10 @@ type BuildingSummary struct {
 	Progress  Progress     `json:"progress"`
 }
 
-// Progress reports the build-queue position for a generation. Done is
-// the count of already-embedded messages; Total is Done plus the
-// currently-pending queue depth.
+// Progress reports embedding coverage for a generation under scan-and-fill
+// (there is no build/pending queue). Done is the count of already-embedded
+// messages; Total is Done plus the live messages still missing an embedding
+// for the generation (embed_gen <> gen), i.e. the coverage denominator.
 type Progress struct {
 	Done  int64 `json:"done"`
 	Total int64 `json:"total"`

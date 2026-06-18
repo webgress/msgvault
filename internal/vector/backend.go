@@ -155,9 +155,11 @@ type Backend interface {
 	// missing-coverage vs not-building.
 	ActivateGeneration(ctx context.Context, gen GenerationID, force bool) error
 
-	// RetireGeneration marks gen as retired, deleting its embeddings on
-	// backends that share an index graph (pgvector) and reaping its pending
-	// queue rows. Unless force is true, the state-flip UPDATE refuses to
+	// RetireGeneration marks gen as retired (a state flip on its
+	// index_generations row), and on backends that share an index graph
+	// (pgvector) also deletes the generation's embeddings so the shared HNSW
+	// graph stays generation-clean. (There is no pending queue to reap under
+	// scan-and-fill.) Unless force is true, the state-flip UPDATE refuses to
 	// retire a generation in state='active', returning ErrRefuseRetireActive
 	// WITHOUT deleting anything; the guard is enforced atomically inside the
 	// retire transaction so a concurrent activation between a caller's
