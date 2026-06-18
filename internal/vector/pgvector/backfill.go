@@ -57,6 +57,20 @@ func (b *Backend) BackfillEmbedGenForUpgrade(ctx context.Context) error {
 		return nil
 	}
 
+	// Robustness guard (mirrors resetOrphanedEmbedGen and the SQLite side):
+	// the stamp UPDATE writes messages.embed_gen, so a DB whose messages table
+	// predates the embed_gen column (a partial restore, or a writable Open that
+	// ran before store.InitSchema added the column) must skip rather than fail
+	// Open. The column is added by PostgreSQLDialect.LegacyColumnMigrations and
+	// is present on any store created via the full schema.
+	hasCol, err := messagesHasEmbedGen(ctx, b.db)
+	if err != nil {
+		return err
+	}
+	if !hasCol {
+		return nil
+	}
+
 	applied, err := b.backfillApplied(ctx)
 	if err != nil {
 		return err
@@ -159,6 +173,23 @@ func (b *Backend) BackfillEmbedGenForUpgrade(ctx context.Context) error {
 // ledger-guarded: it re-checks every writable Open; cheap + idempotent (a
 // second run finds no orphans and updates nothing).
 func (b *Backend) resetOrphanedEmbedGen(ctx context.Context) error {
+	// Robustness guard (mirrors the SQLite resetOrphanedEmbedGen, which skips
+	// when applied_migrations is absent because "such a fixture also lacks the
+	// embed_gen column"): the reset UPDATE writes messages.embed_gen, so a DB
+	// whose messages table predates the embed_gen column must skip rather than
+	// fail Open with `column "embed_gen" does not exist (SQLSTATE 42703)`. This
+	// happens on a partial restore, or when a writable Open (e.g. `msgvault
+	// search --vector` via search_vector.go) runs before store.InitSchema has
+	// added the column. The column is added by
+	// PostgreSQLDialect.LegacyColumnMigrations and is present on any store
+	// created via the full schema.
+	hasCol, err := messagesHasEmbedGen(ctx, b.db)
+	if err != nil {
+		return err
+	}
+	if !hasCol {
+		return nil
+	}
 	if _, err := b.db.ExecContext(ctx,
 		`UPDATE messages SET embed_gen = NULL
 		  WHERE embed_gen IS NOT NULL
@@ -166,6 +197,23 @@ func (b *Backend) resetOrphanedEmbedGen(ctx context.Context) error {
 		return fmt.Errorf("reset orphaned embed_gen: clear orphaned stamps: %w", err)
 	}
 	return nil
+}
+
+// messagesHasEmbedGen reports whether the messages table has an embed_gen
+// column. Used by resetOrphanedEmbedGen and BackfillEmbedGenForUpgrade to
+// no-op rather than fail Open when the column is absent (a DB whose messages
+// predates the column, or a writable Open before store.InitSchema ran). A
+// missing messages table also reports false. Mirrors the SQLite side's
+// table-existence guard.
+func messagesHasEmbedGen(ctx context.Context, db *sql.DB) (bool, error) {
+	var n int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM information_schema.columns
+		  WHERE table_name = 'messages' AND column_name = 'embed_gen'
+		    AND table_schema = ANY (current_schemas(false))`).Scan(&n); err != nil {
+		return false, fmt.Errorf("probe messages.embed_gen column: %w", err)
+	}
+	return n > 0, nil
 }
 
 // backfillApplied reports whether the one-time backfill ledger row exists.
