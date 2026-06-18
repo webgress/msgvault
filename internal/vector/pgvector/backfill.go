@@ -68,6 +68,13 @@ func (b *Backend) BackfillEmbedGenForUpgrade(ctx context.Context) error {
 	// backfill — but we still mark the migration applied so a later
 	// just-activated generation does not retroactively trigger a backfill
 	// that re-stamps rows repair-encoding may have reset.
+	//
+	// Intentional scope limit: only the ACTIVE generation is backfilled. Any
+	// BUILDING generation that existed pre-upgrade is left unstamped — a
+	// resumed rebuild idempotently re-embeds that bounded portion (scan-and-
+	// fill skips already-covered rows), so the cost is small and one-time.
+	// Per-generation backfill complexity is not worth it for a single-user
+	// tool.
 	active, err := b.ActiveGeneration(ctx)
 	if err != nil {
 		if errors.Is(err, vector.ErrNoActiveGeneration) {

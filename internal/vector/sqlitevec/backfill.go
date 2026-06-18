@@ -95,6 +95,13 @@ func (b *Backend) BackfillEmbedGenForUpgrade(ctx context.Context) error {
 	// upgrade time is the only one whose pre-existing embeddings predate the
 	// embed_gen column; generations created after upgrade are stamped by the
 	// worker as it embeds.
+	//
+	// Intentional scope limit: only the ACTIVE generation is backfilled. Any
+	// BUILDING generation that existed pre-upgrade is left unstamped — a
+	// resumed rebuild idempotently re-embeds that bounded portion (scan-and-
+	// fill skips already-covered rows), so the cost is small and one-time.
+	// Per-generation backfill complexity is not worth it for a single-user
+	// tool.
 	active, err := b.ActiveGeneration(ctx)
 	if err != nil {
 		if errors.Is(err, vector.ErrNoActiveGeneration) {

@@ -280,12 +280,11 @@ func runEmbeddingsActivate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("generation %d fingerprint=%q does not match config=%q; pass --force to activate anyway",
 			gen, row.Fingerprint, expected)
 	}
-	// The coverage/seeded gate is enforced inside
-	// backend.ActivateGeneration (atomically on PG; via a Go pre-check on
-	// SQLite). We still surface a friendly pre-flight error here (against
-	// the main-DB coverage) so the common case fails fast before opening a
-	// backend connection and before prompting — but the backend's gate is
-	// the authoritative guarantee.
+	// The coverage gate is enforced inside backend.ActivateGeneration
+	// (atomically on PG; via a Go pre-check on SQLite). We still surface a
+	// friendly pre-flight error here (against the main-DB coverage) so the
+	// common case fails fast before opening a backend connection and before
+	// prompting — but the backend's gate is the authoritative guarantee.
 	if !embeddingsActivateForce {
 		if err := fillCoverage(cmd.Context(), &row); err != nil {
 			return err
@@ -314,11 +313,11 @@ func runEmbeddingsActivate(cmd *cobra.Command, args []string) error {
 	// Route through the vector backend so the auto-retire of the previously
 	// active generation deletes its embeddings on PG (the same delete-on-retire
 	// invariant as the retire path). The backend's ActivateGeneration requires
-	// the target to be in 'building' state, enforces the seeded/no-pending gate
-	// ATOMICALLY with the state flip (unless force), and auto-retires the prior
-	// active generation in one transaction. The fingerprint check above is the
-	// only gate the backend cannot make (it does not know the config
-	// fingerprint); the pending/seeded gate is owned by the backend.
+	// the target to be in 'building' state, enforces the coverage (no-missing)
+	// gate ATOMICALLY with the state flip (unless force), and auto-retires the
+	// prior active generation in one transaction. The fingerprint check above
+	// is the only gate the backend cannot make (it does not know the config
+	// fingerprint); the coverage gate is owned by the backend.
 	backend, closeBackend, err := openEmbeddingsBackend(cmd.Context())
 	if err != nil {
 		return err

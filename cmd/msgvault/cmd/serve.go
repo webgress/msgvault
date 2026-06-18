@@ -158,9 +158,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	getOAuthMgr := oauthManagerCache()
 
-	// Create sync function for the scheduler. vf is captured and used
-	// inside runScheduledSync to wire the embed enqueuer into each
-	// per-run Syncer; it is nil when vector search is disabled.
+	// Create sync function for the scheduler. vf is captured and threaded
+	// into runScheduledSync; under scan-and-fill the Syncer no longer needs
+	// an enqueuer — newly-ingested messages get embed_gen = NULL by column
+	// default and the embed worker discovers them on its next run. vf is nil
+	// when vector search is disabled.
 	syncFunc := func(ctx context.Context, email string) error {
 		return runScheduledSync(ctx, email, s, getOAuthMgr, vf)
 	}
@@ -384,9 +386,10 @@ func (a *schedulerAdapter) Status() []api.AccountStatus {
 // dispatch is by source_type: Gmail accounts run an incremental sync
 // using the Gmail History API; IMAP accounts run a full sync (already
 // deduplicated by message-id at the store layer, since IMAP has no
-// equivalent history API). When vf is non-nil (vector search enabled),
-// the Syncer is configured to enqueue newly-ingested message IDs into
-// the embedding pipeline so subsequent embed runs pick them up.
+// equivalent history API). vf is threaded through for vector-search
+// wiring; under scan-and-fill there is no enqueue step — newly-ingested
+// messages get embed_gen = NULL by column default, so subsequent embed
+// runs discover and pick them up by scanning.
 //
 // The identifier passed in is whatever the scheduler holds — for
 // Gmail this is the email address, for IMAP it's the full
