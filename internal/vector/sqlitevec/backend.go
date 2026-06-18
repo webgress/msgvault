@@ -32,6 +32,14 @@ type Options struct {
 	MainPath  string  // filesystem path to msgvault.db; required for FusedSearch
 	Dimension int     // default dimension for EnsureVectorTable at open
 	MainDB    *sql.DB // handle to the main msgvault.db
+	// ReadOnly indicates the main DB handle (MainDB) was opened read-only
+	// — e.g. the MCP server's store.OpenReadOnly (_query_only=true). When
+	// set, Open SKIPS BackfillEmbedGenForUpgrade, which would otherwise
+	// WRITE messages.embed_gen + applied_migrations through the read-only
+	// main handle and fail. This mirrors pgvector.Options.SkipMigrate's
+	// read-only guard. Migrate still runs because it only writes vectors.db,
+	// which is opened read-write regardless.
+	ReadOnly bool
 }
 
 // Backend implements vector.Backend and vector.FusingBackend against a
@@ -42,6 +50,10 @@ type Backend struct {
 	path     string  // filesystem path to vectors.db
 	mainPath string  // filesystem path to msgvault.db (for ATTACH)
 	dim      int
+	// readOnly is true when mainDB was opened read-only (MCP). The
+	// one-time upgrade backfill self-guards on it so it never writes
+	// through the read-only main handle. See Options.ReadOnly.
+	readOnly bool
 }
 
 // Open opens vectors.db, runs migrations, and retains the main database
@@ -64,12 +76,16 @@ func Open(ctx context.Context, opts Options) (*Backend, error) {
 		path:     opts.Path,
 		mainPath: opts.MainPath,
 		dim:      opts.Dimension,
+		readOnly: opts.ReadOnly,
 	}
 	// One-time upgrade backfill (Package A): stamp embed_gen for messages
 	// already embedded under the active generation, so an upgraded v0.14–
 	// v0.15 archive does not read as entirely missing and trigger a full
 	// re-embed. Ledger-guarded, so it runs at most once. No-ops when the
-	// main DB handle is absent (management commands) or already applied.
+	// main DB handle is absent (management commands), already applied, or
+	// the main handle is read-only (MCP) — the backfill self-guards on
+	// b.readOnly so it never WRITES through a query-only main handle. Migrate
+	// above still ran: it only writes vectors.db, which is read-write here.
 	if err := b.BackfillEmbedGenForUpgrade(ctx); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("embed_gen upgrade backfill: %w", err)

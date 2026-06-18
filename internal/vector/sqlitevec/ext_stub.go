@@ -36,6 +36,7 @@ type Options struct {
 	MainPath  string
 	Dimension int
 	MainDB    *sql.DB
+	ReadOnly  bool
 }
 
 // Backend is the stub backend type for builds without sqlite_vec.

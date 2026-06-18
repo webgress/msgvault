@@ -59,6 +59,15 @@ func (b *Backend) BackfillEmbedGenForUpgrade(ctx context.Context) error {
 		// they never run the backfill.
 		return nil
 	}
+	if b.readOnly {
+		// The main handle was opened read-only (MCP: store.OpenReadOnly,
+		// _query_only=true). The backfill WRITES messages.embed_gen and the
+		// applied_migrations ledger, which the query-only handle rejects.
+		// Skip it entirely — mirrors pgvector's SkipMigrate read-only guard.
+		// A write-path process (serve, embeddings CLI) runs the backfill
+		// instead.
+		return nil
+	}
 
 	// A main DB without applied_migrations is not a real msgvault store
 	// (e.g. a hand-rolled test fixture or a DB opened before the store
