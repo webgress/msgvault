@@ -128,6 +128,40 @@ func TestBackend_ActivateGeneration_CoverageGate(t *testing.T) {
 	require.NoError(t, b.ActivateGeneration(ctx, gen, false), "activate after coverage complete")
 }
 
+// TestBackend_ActivateGeneration_LifecycleErrorBeforeCoverage pins FIX A:
+// activating an unknown or non-building generation WITHOUT --force returns
+// the lifecycle error (unknown generation / not in 'building' state), NOT
+// the misleading "messages needing embedding" coverage error. The coverage
+// predicate (embed_gen <> gen) is true for an unknown gen id, so
+// activateGateError must check existence + 'building' state before coverage.
+// The seeded test message (id=1) stays unembedded so the coverage gate WOULD
+// trip if checked first.
+func TestBackend_ActivateGeneration_LifecycleErrorBeforeCoverage(t *testing.T) {
+	b, ctx, _ := newBackendForTest(t)
+
+	// (a) Unknown gen id: lifecycle error (ErrUnknownGeneration), not coverage.
+	err := b.ActivateGeneration(ctx, vector.GenerationID(999), false)
+	require.Error(t, err, "activating unknown gen must fail")
+	assert.ErrorIs(t, err, vector.ErrUnknownGeneration,
+		"unknown gen must return ErrUnknownGeneration, not coverage error")
+	assert.NotContains(t, err.Error(), "needing embedding",
+		"unknown gen must NOT surface the coverage error")
+
+	// (b) Non-building (retired) gen id: lifecycle error, not coverage.
+	gen, err := b.CreateGeneration(ctx, "m", 768, "")
+	require.NoError(t, err, "Create")
+	require.NoError(t, b.ActivateGeneration(ctx, gen, true), "force-activate to bypass coverage")
+	require.NoError(t, b.RetireGeneration(ctx, gen, true), "force-retire to reach non-building state")
+	require.Equal(t, string(vector.GenerationRetired), genState(t, b, gen), "precondition: gen retired")
+
+	err = b.ActivateGeneration(ctx, gen, false)
+	require.Error(t, err, "activating retired gen must fail")
+	assert.Contains(t, err.Error(), "not in 'building' state",
+		"retired gen must return the not-building lifecycle error")
+	assert.NotContains(t, err.Error(), "needing embedding",
+		"retired gen must NOT surface the coverage error")
+}
+
 // TestBackend_ActivateGeneration_NullSeededAtActivatesWithCoverage mirrors
 // the sqlitevec FIX A test: a legacy/crashed generation with seeded_at
 // NULL must still activate WITHOUT --force as long as coverage is complete

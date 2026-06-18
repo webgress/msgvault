@@ -304,17 +304,12 @@ func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationI
 }
 
 // activateGateError re-reads gen inside the activation tx to return a
-// precise reason the gated promote affected zero rows: messages still
-// needing embedding, unknown generation, or not in 'building' state.
+// precise reason the gated promote affected zero rows. The existence +
+// 'building'-state lifecycle check runs FIRST: an unknown/non-building gen
+// also satisfies the coverage predicate (embed_gen <> gen is true for an
+// unknown gen id), so checking coverage first would surface the misleading
+// "messages needing embedding" error instead of the real lifecycle reason.
 func activateGateError(ctx context.Context, tx *sql.Tx, gen vector.GenerationID, force bool) error {
-	var missing bool
-	if err := tx.QueryRowContext(ctx,
-		`SELECT `+missingForGenExistsClause("$1"), int64(gen)).Scan(&missing); err != nil {
-		return fmt.Errorf("check coverage for generation %d: %w", gen, err)
-	}
-	if missing && !force {
-		return fmt.Errorf("generation %d still has messages needing embedding; run `msgvault embeddings resume` or pass --force", gen)
-	}
 	var state vector.GenerationState
 	if err := tx.QueryRowContext(ctx,
 		`SELECT state FROM index_generations WHERE id = $1`, int64(gen)).Scan(&state); err != nil {
@@ -323,7 +318,24 @@ func activateGateError(ctx context.Context, tx *sql.Tx, gen vector.GenerationID,
 		}
 		return fmt.Errorf("lookup generation %d: %w", gen, err)
 	}
-	return fmt.Errorf("generation %d not in 'building' state", gen)
+	if state != vector.GenerationBuilding {
+		return fmt.Errorf("generation %d not in 'building' state", gen)
+	}
+	// Gen exists and is building, so the only remaining reason the gated
+	// promote affected zero rows is the coverage term.
+	var missing bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT `+missingForGenExistsClause("$1"), int64(gen)).Scan(&missing); err != nil {
+		return fmt.Errorf("check coverage for generation %d: %w", gen, err)
+	}
+	if missing && !force {
+		return fmt.Errorf("generation %d still has messages needing embedding; run `msgvault embeddings resume` or pass --force", gen)
+	}
+	// Gen reads as building with full coverage yet the gated UPDATE still
+	// matched no rows: a concurrent transaction must have flipped its state
+	// between the promote and this re-read. Surface it rather than reporting a
+	// phantom gate.
+	return fmt.Errorf("activate generation %d: gated promote affected no rows (state=%q)", gen, state)
 }
 
 // RetireGeneration marks the given generation as retired and DELETEs its

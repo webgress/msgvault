@@ -160,6 +160,41 @@ func TestBackend_ActivateGeneration_CoverageGate(t *testing.T) {
 	assertpkg.Equal(t, vector.GenerationActive, genStateSV(t, b, gen), "now active")
 }
 
+// TestBackend_ActivateGeneration_LifecycleErrorBeforeCoverage pins FIX A:
+// activating an unknown or non-building generation WITHOUT --force returns
+// the lifecycle error (unknown generation / not in 'building' state), NOT
+// the misleading "messages needing embedding" coverage error. The coverage
+// predicate (embed_gen IS NULL OR embed_gen <> gen) is true for an unknown
+// gen id, so the lifecycle check must run first. The seeded test message
+// (id=1) stays unembedded so the coverage gate WOULD trip if checked first.
+func TestBackend_ActivateGeneration_LifecycleErrorBeforeCoverage(t *testing.T) {
+	b, ctx := newBackendForTest(t)
+	requirepkg.Equal(t, 1, missingCountSV(t, b, vector.GenerationID(999)),
+		"precondition: coverage gate would trip for any gen (message unembedded)")
+
+	// (a) Unknown gen id: lifecycle error (ErrUnknownGeneration), not coverage.
+	err := b.ActivateGeneration(ctx, vector.GenerationID(999), false)
+	requirepkg.Error(t, err, "activating unknown gen must fail")
+	assertpkg.ErrorIs(t, err, vector.ErrUnknownGeneration,
+		"unknown gen must return ErrUnknownGeneration, not coverage error")
+	assertpkg.NotContains(t, err.Error(), "needing embedding",
+		"unknown gen must NOT surface the coverage error")
+
+	// (b) Non-building (retired) gen id: lifecycle error, not coverage.
+	gen, err := b.CreateGeneration(ctx, "m", 768, "")
+	requirepkg.NoError(t, err, "CreateGeneration")
+	requirepkg.NoError(t, b.ActivateGeneration(ctx, gen, true), "force-activate to bypass coverage")
+	requirepkg.NoError(t, b.RetireGeneration(ctx, gen, true), "force-retire to reach non-building state")
+	requirepkg.Equal(t, vector.GenerationRetired, genStateSV(t, b, gen), "precondition: gen retired")
+
+	err = b.ActivateGeneration(ctx, gen, false)
+	requirepkg.Error(t, err, "activating retired gen must fail")
+	assertpkg.Contains(t, err.Error(), "not in 'building' state",
+		"retired gen must return the not-building lifecycle error")
+	assertpkg.NotContains(t, err.Error(), "needing embedding",
+		"retired gen must NOT surface the coverage error")
+}
+
 // TestBackend_SingleTargetRebuild pins the single-target invariant: while
 // a new generation B builds, the active generation A keeps serving
 // (stale-but-correct), and B only becomes active once its coverage is

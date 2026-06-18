@@ -275,6 +275,28 @@ func (b *Backend) hasMissingForGen(ctx context.Context, gen vector.GenerationID)
 // ActivateGeneration atomically retires the current active generation
 // (if any) and promotes `gen` to active.
 func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationID, force bool) error {
+	// Lifecycle pre-check: verify gen exists AND is in 'building' state
+	// BEFORE the coverage pre-check below. The coverage predicate
+	// (embed_gen IS NULL OR embed_gen <> gen) is true for an unknown gen id,
+	// so an unknown/non-building gen would otherwise surface the misleading
+	// "messages needing embedding" coverage error instead of the real
+	// lifecycle error. The vectors.db tx's gated UPDATE re-derives this
+	// invariant atomically (via activateGateError); this read-only lookup
+	// just orders the errors correctly. Force does not bypass it — a force
+	// activation of an unknown/non-building gen is still a lifecycle error,
+	// matching the tx's WHERE id = ? AND state = 'building' clause.
+	var state vector.GenerationState
+	if err := b.db.QueryRowContext(ctx,
+		`SELECT state FROM index_generations WHERE id = ?`, int64(gen)).Scan(&state); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: %d", vector.ErrUnknownGeneration, gen)
+		}
+		return fmt.Errorf("lookup generation %d: %w", gen, err)
+	}
+	if state != vector.GenerationBuilding {
+		return fmt.Errorf("generation %d not in 'building' state", gen)
+	}
+
 	// Coverage pre-check (R2): refuse to activate a generation that still
 	// has live messages needing embedding, unless force. Cross-DB on
 	// SQLite, so it runs here as a Go pre-check before the vectors.db tx;
