@@ -144,14 +144,15 @@ type Backend interface {
 
 	// ActivateGeneration atomically retires the current active generation
 	// (if any, deleting its embeddings on backends that share an index
-	// graph) and promotes gen to active. The promotion enforces, inside the
-	// same transaction as the state flip, that gen is in state='building'
-	// and — unless force is true — that gen has finished seeding
-	// (seeded_at IS NOT NULL) and has zero pending embedding rows. force
-	// bypasses the seeded/pending gate (operator `--force`); the gate stays
-	// atomic so a concurrent enqueue cannot slip a pending row in between a
-	// caller's pre-check and the flip. On a gate failure the backend returns
-	// a precise error distinguishing pending vs unseeded vs not-building.
+	// graph) and promotes gen to active. The promotion enforces that gen is
+	// in state='building' and — unless force is true — that gen has full
+	// coverage (no live message still needs embedding for it, i.e.
+	// missing==0). On PG the coverage gate is folded into the same
+	// transaction as the state flip; on SQLite (cross-DB) it is a Go
+	// pre-check before the flip, with the full-scan backstop covering the
+	// TOCTOU window. force bypasses the coverage gate (operator `--force`).
+	// On a gate failure the backend returns a precise error distinguishing
+	// missing-coverage vs not-building.
 	ActivateGeneration(ctx context.Context, gen GenerationID, force bool) error
 
 	// RetireGeneration marks gen as retired, deleting its embeddings on

@@ -269,10 +269,6 @@ func runEmbeddingsActivate(cmd *cobra.Command, args []string) error {
 				gen, row.MissingCount)
 		}
 	}
-	if row.SeededAt == nil && !embeddingsActivateForce {
-		return fmt.Errorf("generation %d has not finished seeding; run `msgvault embeddings resume` or pass --force",
-			gen)
-	}
 
 	active, hasActive, err := activeEmbeddingGeneration(cmd.Context(), db, rebind)
 	if err != nil {

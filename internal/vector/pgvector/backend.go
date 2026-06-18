@@ -92,9 +92,10 @@ func (b *Backend) DB() *sql.DB { return b.db }
 // CreateGeneration allocates a new building generation. Under the
 // scan-and-fill design there is no pending_embeddings seed: the embed
 // worker populates the generation by scanning messages whose embed_gen
-// does not yet match it. seeded_at is stamped at creation (it no longer
-// gates a seed pass; kept so the activation gate's historical shape stays
-// valid). Mirrors the sqlitevec semantics (§5.1): if a building row with
+// does not yet match it. seeded_at is stamped at creation as harmless
+// vestigial metadata (it no longer gates a seed pass and no longer gates
+// activation; coverage is the real gate). Mirrors the sqlitevec semantics
+// (§5.1): if a building row with
 // the same fingerprint already exists, returns its id so a crashed
 // rebuild can resume; a mismatched fingerprint surfaces
 // vector.ErrBuildingInProgress.
@@ -133,10 +134,10 @@ func (b *Backend) claimOrInsertBuilding(ctx context.Context, model string, dim i
 		return id, false, nil
 	}
 
-	// seeded_at is stamped at creation: scan-and-fill has no separate seed
-	// pass, but the activation gate still references seeded_at IS NOT NULL,
-	// so keep it set so a building generation can always activate once its
-	// coverage is complete (R5).
+	// seeded_at is stamped at creation as harmless vestigial metadata:
+	// scan-and-fill has no separate seed pass, and activation no longer
+	// gates on it (coverage is the real gate). Kept only so the column is
+	// populated for legacy display.
 	var newID int64
 	err := b.db.QueryRowContext(ctx,
 		`INSERT INTO index_generations
@@ -262,13 +263,14 @@ func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationI
 	// embedding for gen (embed_gen <> gen). On PG messages and the
 	// generation lifecycle share one database, so the gate is folded into
 	// the activation UPDATE — fully atomic with the state flip, no TOCTOU.
-	// seeded_at IS NOT NULL is kept as a belt-and-suspenders lifecycle
-	// check (CreateGeneration always stamps it now, R5).
+	// The seeded_at gate was removed: seeding was the old queue-population
+	// phase, which scan-and-fill no longer has, so a legacy/crashed gen with
+	// seeded_at=NULL but full coverage must be activatable. Coverage
+	// (missing==0) is the real gate.
 	res, err := tx.ExecContext(ctx,
 		`UPDATE index_generations
 		    SET state = 'active', activated_at = $1, completed_at = COALESCE(completed_at, $2)
 		  WHERE id = $3 AND state = 'building'
-		    AND ($4 OR seeded_at IS NOT NULL)
 		    AND ($4 OR NOT `+missingForGenExistsClause("$3")+`)`,
 		now, now, int64(gen), force)
 	if err != nil {
@@ -286,8 +288,7 @@ func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationI
 
 // activateGateError re-reads gen inside the activation tx to return a
 // precise reason the gated promote affected zero rows: messages still
-// needing embedding, not seeded (legacy), unknown generation, or not in
-// 'building' state.
+// needing embedding, unknown generation, or not in 'building' state.
 func activateGateError(ctx context.Context, tx *sql.Tx, gen vector.GenerationID, force bool) error {
 	var missing bool
 	if err := tx.QueryRowContext(ctx,
@@ -298,17 +299,12 @@ func activateGateError(ctx context.Context, tx *sql.Tx, gen vector.GenerationID,
 		return fmt.Errorf("generation %d still has messages needing embedding; run `msgvault embeddings resume` or pass --force", gen)
 	}
 	var state vector.GenerationState
-	var seededAt sql.NullInt64
 	if err := tx.QueryRowContext(ctx,
-		`SELECT state, seeded_at FROM index_generations WHERE id = $1`, int64(gen)).Scan(&state, &seededAt); err != nil {
+		`SELECT state FROM index_generations WHERE id = $1`, int64(gen)).Scan(&state); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("%w: %d", vector.ErrUnknownGeneration, gen)
 		}
 		return fmt.Errorf("lookup generation %d: %w", gen, err)
-	}
-	if state == vector.GenerationBuilding && !seededAt.Valid && !force {
-		return fmt.Errorf("generation %d has not finished seeding; run `msgvault embeddings resume` or pass --force",
-			gen)
 	}
 	return fmt.Errorf("generation %d not in 'building' state", gen)
 }

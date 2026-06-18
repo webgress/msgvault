@@ -226,6 +226,37 @@ func TestBackend_CreateGeneration_StampsSeededAt(t *testing.T) {
 	assertpkg.True(t, seededAt.Valid, "seeded_at stamped at creation")
 }
 
+// TestBackend_ActivateGeneration_NullSeededAtActivatesWithCoverage pins
+// FIX A: a legacy/crashed generation whose seeded_at is NULL must still
+// activate WITHOUT --force as long as coverage is complete (missing==0).
+// The old seeded_at IS NOT NULL gate would have rejected it and pointed
+// users at `embeddings resume`, which cannot stamp seeded_at — making the
+// row unactivatable except via --force. Coverage is the real gate now.
+func TestBackend_ActivateGeneration_NullSeededAtActivatesWithCoverage(t *testing.T) {
+	b, ctx := newBackendForTest(t)
+	gen, err := b.CreateGeneration(ctx, "m", 768, "")
+	requirepkg.NoError(t, err, "CreateGeneration")
+
+	// Simulate a legacy/crashed generation: clear seeded_at.
+	_, err = b.db.ExecContext(ctx,
+		`UPDATE index_generations SET seeded_at = NULL WHERE id = ?`, int64(gen))
+	requirepkg.NoError(t, err, "clear seeded_at")
+	var seededAt sql.NullInt64
+	requirepkg.NoError(t, b.db.QueryRowContext(ctx,
+		`SELECT seeded_at FROM index_generations WHERE id = ?`, int64(gen)).Scan(&seededAt))
+	requirepkg.False(t, seededAt.Valid, "precondition: seeded_at is NULL")
+
+	// Make coverage complete (worker would stamp this after upsert).
+	_, err = b.mainDB.ExecContext(ctx, `UPDATE messages SET embed_gen = ? WHERE id = 1`, int64(gen))
+	requirepkg.NoError(t, err, "stamp embed_gen")
+	requirepkg.Equal(t, 0, missingCountSV(t, b, gen), "precondition: coverage complete")
+
+	// Activation succeeds WITHOUT force despite seeded_at=NULL.
+	requirepkg.NoError(t, b.ActivateGeneration(ctx, gen, false),
+		"NULL seeded_at + full coverage must activate without --force")
+	assertpkg.Equal(t, vector.GenerationActive, genStateSV(t, b, gen), "now active")
+}
+
 // TestBackend_CreateGeneration_ResumesBuilding confirms that calling
 // CreateGeneration while a building row already exists with the same
 // fingerprint returns the existing id instead of failing on the unique

@@ -128,6 +128,34 @@ func TestBackend_ActivateGeneration_CoverageGate(t *testing.T) {
 	require.NoError(t, b.ActivateGeneration(ctx, gen, false), "activate after coverage complete")
 }
 
+// TestBackend_ActivateGeneration_NullSeededAtActivatesWithCoverage mirrors
+// the sqlitevec FIX A test: a legacy/crashed generation with seeded_at
+// NULL must still activate WITHOUT --force as long as coverage is complete
+// (missing==0). The old seeded_at IS NOT NULL gate is gone; coverage is the
+// real gate.
+func TestBackend_ActivateGeneration_NullSeededAtActivatesWithCoverage(t *testing.T) {
+	b, ctx, db := newBackendForTest(t)
+	gen, err := b.CreateGeneration(ctx, "m", 768, "")
+	require.NoError(t, err, "Create")
+
+	// Simulate a legacy/crashed generation: clear seeded_at.
+	_, err = db.ExecContext(ctx,
+		`UPDATE index_generations SET seeded_at = NULL WHERE id = $1`, int64(gen))
+	require.NoError(t, err, "clear seeded_at")
+	var seededAt sql.NullInt64
+	require.NoError(t, b.db.QueryRowContext(ctx,
+		`SELECT seeded_at FROM index_generations WHERE id = $1`, int64(gen)).Scan(&seededAt))
+	require.False(t, seededAt.Valid, "precondition: seeded_at is NULL")
+
+	// Make coverage complete (worker would stamp this after upsert).
+	_, err = db.ExecContext(ctx, `UPDATE messages SET embed_gen = $1 WHERE id = 1`, int64(gen))
+	require.NoError(t, err, "stamp embed_gen")
+
+	// Activation succeeds WITHOUT force despite seeded_at=NULL.
+	require.NoError(t, b.ActivateGeneration(ctx, gen, false),
+		"NULL seeded_at + full coverage must activate without --force")
+}
+
 // TestBackend_EnsureSeeded_NoOp asserts EnsureSeeded is a no-op under the
 // scan-and-fill design (kept on the interface): it never errors,
 // regardless of generation state.

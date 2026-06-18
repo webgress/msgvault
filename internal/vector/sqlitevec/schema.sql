@@ -11,10 +11,11 @@ CREATE TABLE IF NOT EXISTS index_generations (
     dimension     INTEGER NOT NULL,
     fingerprint   TEXT NOT NULL,
     started_at    INTEGER NOT NULL,
-    -- seeded_at is stamped at CreateGeneration. Under the scan-and-fill
-    -- design there is no separate seed pass; this column is retained only
-    -- because the activation gate still asserts seeded_at IS NOT NULL as a
-    -- belt-and-suspenders lifecycle check.
+    -- seeded_at is stamped at CreateGeneration as harmless vestigial
+    -- metadata. Under the scan-and-fill design there is no separate seed
+    -- pass, and activation no longer gates on it (coverage — missing==0 —
+    -- is the real gate). Retained only so the column stays populated for
+    -- legacy display; no destructive migration drops it.
     seeded_at     INTEGER,
     completed_at  INTEGER,
     activated_at  INTEGER,
