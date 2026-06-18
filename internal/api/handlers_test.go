@@ -1898,9 +1898,6 @@ func (f *fakeVectorBackend) EmbeddedMessageCount(_ context.Context, _ vector.Gen
 	return 0, errors.New("not implemented")
 }
 func (f *fakeVectorBackend) Close() error { return nil }
-func (f *fakeVectorBackend) EnsureSeeded(_ context.Context, _ vector.GenerationID) error {
-	return errors.New("not implemented")
-}
 
 func TestHandleStats_VectorDisabled(t *testing.T) {
 	srv, _ := newTestServerWithMockStore(t)

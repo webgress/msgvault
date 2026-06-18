@@ -61,9 +61,6 @@ func (f *fakeBackend) EmbeddedMessageCount(context.Context, GenerationID) (int64
 	return 0, errors.New("not implemented")
 }
 func (f *fakeBackend) Close() error { return nil }
-func (f *fakeBackend) EnsureSeeded(context.Context, GenerationID) error {
-	return errors.New("not implemented")
-}
 
 func TestResolveActiveForFingerprint_Matches(t *testing.T) {
 	b := &fakeBackend{active: &Generation{ID: 1, Fingerprint: "m:768:p1-111111"}}

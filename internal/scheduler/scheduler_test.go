@@ -401,8 +401,8 @@ func TestTriggerSyncAfterStop(t *testing.T) {
 // ---------- fakes for EmbedJob tests ----------
 
 // fakeBackend implements vector.Backend. Only ActiveGeneration,
-// BuildingGeneration, ActivateGeneration, and EnsureSeeded are
-// meaningfully populated; the rest panic to catch accidental usage.
+// BuildingGeneration, and ActivateGeneration are meaningfully populated;
+// the rest panic to catch accidental usage.
 type fakeBackend struct {
 	active    vector.Generation
 	activeErr error
@@ -464,10 +464,6 @@ func (f *fakeBackend) EmbeddedMessageCount(ctx context.Context, gen vector.Gener
 	panic("unexpected: EmbeddedMessageCount")
 }
 func (f *fakeBackend) Close() error { return nil }
-
-// EnsureSeeded is a no-op under the scan-and-fill design (kept to satisfy
-// the vector.Backend interface).
-func (f *fakeBackend) EnsureSeeded(_ context.Context, _ vector.GenerationID) error { return nil }
 
 // fakeRunner records calls to satisfy EmbedRunner.
 type fakeRunner struct {

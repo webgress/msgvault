@@ -125,11 +125,6 @@ func (b *Backend) CreateGeneration(ctx context.Context, model string, dim int, f
 	return gen, nil
 }
 
-// EnsureSeeded is a no-op under the scan-and-fill design (R5): there is no
-// separate seed pass to re-run. Kept to satisfy the vector.Backend
-// interface.
-func (b *Backend) EnsureSeeded(ctx context.Context, gen vector.GenerationID) error { return nil }
-
 // claimOrInsertBuilding returns (id, isNew, err). See sqlitevec for
 // rationale — same race-recovery shape, translated to pgx error codes.
 func (b *Backend) claimOrInsertBuilding(ctx context.Context, model string, dim int, fp string, now int64) (vector.GenerationID, bool, error) {

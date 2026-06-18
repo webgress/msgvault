@@ -158,8 +158,6 @@ func setupVectorFeatures(ctx context.Context, mainStore *store.Store, mainPath s
 		HybridEngine: engine,
 		Worker:       worker,
 		Cfg:          cfg.Vector,
-		VectorsDB:    vectorsDB,
-		Rebind:       dialect.Rebind,
 		Close:        closeFn,
 	}, nil
 }

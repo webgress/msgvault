@@ -81,10 +81,6 @@ func (f *statsFakeBackend) EmbeddedMessageCount(context.Context, GenerationID) (
 
 func (f *statsFakeBackend) Close() error { return nil }
 
-func (f *statsFakeBackend) EnsureSeeded(context.Context, GenerationID) error {
-	return errors.New("not implemented")
-}
-
 var _ Backend = (*statsFakeBackend)(nil)
 
 func TestCollectStats_NilBackend(t *testing.T) {

@@ -100,7 +100,6 @@ func TestSetupVectorFeatures_SucceedsOnPostgres(t *testing.T) {
 	assert.NotNil(t, vf.Backend, "Backend wired")
 	assert.NotNil(t, vf.HybridEngine, "HybridEngine wired")
 	assert.NotNil(t, vf.Worker, "Worker wired")
-	assert.Same(t, db, vf.VectorsDB, "PG shares the main DB handle as the vectors DB")
 
 	// The pgvector schema was migrated into the isolated schema. Smoke-test
 	// that the embedding tables exist.

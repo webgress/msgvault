@@ -156,18 +156,6 @@ func TestBackend_ActivateGeneration_NullSeededAtActivatesWithCoverage(t *testing
 		"NULL seeded_at + full coverage must activate without --force")
 }
 
-// TestBackend_EnsureSeeded_NoOp asserts EnsureSeeded is a no-op under the
-// scan-and-fill design (kept on the interface): it never errors,
-// regardless of generation state.
-func TestBackend_EnsureSeeded_NoOp(t *testing.T) {
-	b, ctx, _ := newBackendForTest(t)
-	gen, err := b.CreateGeneration(ctx, "m", 768, "")
-	require.NoError(t, err, "Create")
-	require.NoError(t, b.EnsureSeeded(ctx, gen), "EnsureSeeded building")
-	require.NoError(t, b.ActivateGeneration(ctx, gen, true), "Activate")
-	require.NoError(t, b.EnsureSeeded(ctx, gen), "EnsureSeeded active (no-op)")
-}
-
 // TestBackend_Upsert_RejectsDimensionMismatch ensures the per-chunk
 // dimension check fires before any row is written.
 func TestBackend_Upsert_RejectsDimensionMismatch(t *testing.T) {

@@ -57,13 +57,14 @@ var (
 	// cannot delete the now-serving generation's embeddings.
 	ErrRefuseRetireActive = errors.New("refusing to retire the active (serving) generation without force")
 
-	// ErrGenerationNotBuilding is returned by EnsureSeeded when the
-	// target generation is no longer in state='building' — e.g. a
-	// concurrent activation flipped it to active, or a retire call
-	// moved it to retired, between the caller's BuildingGeneration
-	// read and EnsureSeeded. Callers performing a resume can treat
-	// this as a retryable race and re-resolve the active/building
-	// state instead of aborting.
+	// ErrGenerationNotBuilding signals that a generation expected to be in
+	// state='building' is no longer building — e.g. a concurrent activation
+	// flipped it to active, or a retire call moved it to retired, between a
+	// caller's BuildingGeneration read and a follow-up operation. Callers
+	// performing a resume can treat this as a retryable race and re-resolve
+	// the active/building state instead of aborting. (Currently unreferenced
+	// after the seed phase was removed under scan-and-fill; retained as the
+	// canonical sentinel for any future building-state guard.)
 	ErrGenerationNotBuilding = errors.New("generation is not in state=building")
 
 	// ErrEmbeddingTimeout is returned by the hybrid engine when the

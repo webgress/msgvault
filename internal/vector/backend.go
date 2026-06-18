@@ -187,12 +187,6 @@ type Backend interface {
 	// (gen == 0) path.
 	EmbeddedMessageCount(ctx context.Context, gen GenerationID) (int64, error)
 
-	// EnsureSeeded is a no-op under the scan-and-fill design: there is no
-	// separate pending_embeddings seed pass to re-run — the embed worker
-	// discovers work by scanning messages.embed_gen. Retained on the
-	// interface for compatibility with the resume paths that still call it.
-	EnsureSeeded(ctx context.Context, gen GenerationID) error
-
 	// LoadVector returns the embedding for a specific message in the
 	// active generation. Returns ErrNoActiveGeneration if none exists, or
 	// a descriptive error if the message isn't embedded in the active
