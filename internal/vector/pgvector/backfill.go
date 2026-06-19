@@ -128,6 +128,21 @@ func (b *Backend) BackfillEmbedGenForUpgrade(ctx context.Context) error {
 		}
 	}()
 
+	// Disable the pool-wide 30s statement_timeout for this tx: on a real corpus
+	// the stamp UPDATE below is a ≈28s nested-loop EXISTS-correlated semi-join
+	// over the full messages table (≈53k rows), which — combined with the
+	// preceding resetOrphanedEmbedGen UPDATE on the same Open — exceeds the
+	// shared store pool's statement_timeout=30s, cancelling the one-time
+	// upgrade backfill at 30s (SQLSTATE 57014) and rolling it back so the
+	// upgrade never completes (finding S1 family, mirroring
+	// Migrate/ActivateGeneration/RetireGeneration/EnsureVectorIndex). SET LOCAL
+	// is tx-scoped and auto-resets on commit/rollback, so the disabled timeout
+	// cannot leak onto other pooled connections. Must be the first statement in
+	// the tx to cover the stamp UPDATE.
+	if _, err := tx.ExecContext(ctx, "SET LOCAL statement_timeout = 0"); err != nil {
+		return fmt.Errorf("backfill: disable statement_timeout: %w", err)
+	}
+
 	// Stamp embed_gen=active for messages with an embedding row under the
 	// active generation, only where embed_gen is still NULL (never overwrite
 	// a row stamped for another generation).
@@ -199,11 +214,35 @@ func (b *Backend) resetOrphanedEmbedGen(ctx context.Context) error {
 	if !hasCol {
 		return nil
 	}
-	if _, err := b.db.ExecContext(ctx,
+
+	// Run the UPDATE inside a short tx that disables the pool-wide 30s
+	// statement_timeout (finding S1 family, mirroring
+	// Migrate/ActivateGeneration/RetireGeneration/EnsureVectorIndex and the
+	// upgrade backfill below). This reset is normally cheap (0 rows when there
+	// are no orphans), but on a partial restore it can clear corpus-size stamps
+	// and — running right before BackfillEmbedGenForUpgrade on the same Open —
+	// would otherwise risk a 30s cancellation (SQLSTATE 57014). SET LOCAL is
+	// tx-scoped and auto-resets on commit/rollback, so the disabled timeout
+	// cannot leak onto other pooled connections. Must be the first statement in
+	// the tx. Behaviour is otherwise identical: same WHERE clause, idempotent
+	// (a second run finds no orphans), and gated by the ReadOnly Open path.
+	tx, err := b.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("reset orphaned embed_gen: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, "SET LOCAL statement_timeout = 0"); err != nil {
+		return fmt.Errorf("reset orphaned embed_gen: disable statement_timeout: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
 		`UPDATE messages SET embed_gen = NULL
 		  WHERE embed_gen IS NOT NULL
 		    AND embed_gen NOT IN (SELECT id FROM index_generations)`); err != nil {
 		return fmt.Errorf("reset orphaned embed_gen: clear orphaned stamps: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("reset orphaned embed_gen: commit tx: %w", err)
 	}
 	return nil
 }

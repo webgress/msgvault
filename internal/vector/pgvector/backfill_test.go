@@ -5,6 +5,9 @@ package pgvector
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -493,4 +496,174 @@ func TestReadOnlyOpen_PerformsNoWrites(t *testing.T) {
 		`SELECT COUNT(*) FROM applied_migrations WHERE name = $1`,
 		embedGenBackfillMigration).Scan(&marked))
 	assert.Equal(t, 0, marked, "ReadOnly Open must NOT mark the backfill ledger")
+}
+
+// lowTimeoutMS is the SESSION statement_timeout the low-timeout backfill handle
+// runs under. It is sized to sit comfortably ABOVE the backfill's cheap
+// pre-flight reads (catalog probe, ledger check, active-generation lookup —
+// sub-millisecond once the catalog cache is warmed, see openLowTimeoutHandle)
+// yet far BELOW the stamp UPDATE over lowTimeoutSeedRows rows (≈190ms,
+// measured). The fix's `SET LOCAL statement_timeout = 0` lifts it for the tx, so
+// post-fix the UPDATE completes; pre-fix it is cancelled with SQLSTATE 57014.
+const lowTimeoutMS = 50
+
+// lowTimeoutSeedRows is the number of embedded-but-unstamped messages the
+// regression test seeds. Sized so the stamp UPDATE's nested-loop semi-join over
+// these rows reliably exceeds lowTimeoutMS (≈190ms at 30k, ≈4x margin) while
+// staying cheap to seed (one bulk INSERT … SELECT generate_series).
+const lowTimeoutSeedRows = 30000
+
+// openLowTimeoutHandle opens a dedicated single-connection *sql.DB on the SAME
+// per-test schema as db, with the session statement_timeout pinned to
+// lowTimeoutMS. SetMaxOpenConns(1) makes the SET sticky: every query the
+// backfill issues on this handle runs on the one connection that carries the low
+// session timeout, so the test is deterministic — the timeout provably applies
+// to the exact connection the backfill uses (no pool flakiness). The schema is
+// read from db's live search_path so both handles see the same tables.
+//
+// The PostgreSQL catalog cache is WARMED (an information_schema probe of the
+// same shape the backfill's messagesHasEmbedGen guard issues) BEFORE the timeout
+// is lowered: the first such probe on a fresh connection is cold (~15ms), but
+// warm reruns are sub-millisecond, so warming guarantees the backfill's
+// pre-flight reads clear lowTimeoutMS with a large margin. Only the heavy stamp
+// UPDATE is meant to trip the timeout.
+func openLowTimeoutHandle(t *testing.T, db *sql.DB) *sql.DB {
+	t.Helper()
+
+	// The per-test schema is the first entry of db's search_path (set by
+	// openPGTestDB as "<schema>,public"). Read it back so the low-timeout
+	// handle targets the SAME tables.
+	var searchPath string
+	require.NoError(t, db.QueryRow(`SHOW search_path`).Scan(&searchPath),
+		"read search_path from test db")
+	require.NotEmpty(t, searchPath, "search_path must be set on the test db")
+
+	url := os.Getenv("MSGVAULT_TEST_DB")
+	require.NotEmpty(t, url, "MSGVAULT_TEST_DB must be set")
+	sep := "?"
+	if strings.Contains(url, "?") {
+		sep = "&"
+	}
+	lowURL := url + sep + "search_path=" + searchPath
+
+	low, err := sql.Open("pgx", lowURL)
+	require.NoError(t, err, "open low-timeout handle")
+	// Single connection: the SET below is then sticky for every subsequent
+	// query on this handle (no other pooled connection to dodge the timeout).
+	low.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = low.Close() })
+
+	// Warm the catalog cache on this connection so the backfill's pre-flight
+	// reads (the same information_schema probe) are sub-millisecond, well under
+	// lowTimeoutMS. Done BEFORE lowering the timeout so the cold first probe is
+	// never itself cancelled.
+	var n int
+	require.NoError(t, low.QueryRow(
+		`SELECT COUNT(*) FROM information_schema.columns
+		  WHERE table_name = 'messages' AND column_name = 'embed_gen'
+		    AND table_schema = ANY (current_schemas(false))`).Scan(&n),
+		"warm catalog cache on low handle")
+
+	_, err = low.Exec(fmt.Sprintf(`SET statement_timeout = '%dms'`, lowTimeoutMS))
+	require.NoError(t, err, "set low statement_timeout on low handle")
+	return low
+}
+
+// TestBackfillEmbedGen_CompletesUnderLowStatementTimeout is the regression test
+// for the prod-corpus bug (msgvault-129): on a real 53k-row corpus the one-time
+// upgrade backfill's stamp UPDATE (a ≈28s nested-loop semi-join) was cancelled
+// by the pool's 30s statement_timeout (SQLSTATE 57014) and rolled back, so the
+// upgrade never completed. The fix adds `SET LOCAL statement_timeout = 0` as the
+// first statement inside the backfill tx (and the orphan-reset tx).
+//
+// Determinism: rather than reproduce 28s of work, we pin the SESSION
+// statement_timeout to lowTimeoutMS on a SINGLE-connection handle
+// (SetMaxOpenConns(1)) and run the backfill on that handle. With
+// lowTimeoutSeedRows embedded rows the stamp UPDATE takes ≈190ms — well over the
+// 50ms timeout — so PRE-FIX it is cancelled (57014); POST-FIX the tx's
+// `SET LOCAL statement_timeout = 0` lifts the timeout for exactly that tx, so
+// the backfill commits and stamps embed_gen. The backfill's cheap pre-flight
+// reads stay well under the timeout (catalog cache warmed in
+// openLowTimeoutHandle).
+//
+// Ordering matters: ALL seeding (schema, messages, embeddings, the embed_gen
+// reset, the ledger clear) runs on the NORMAL db handle BEFORE the low timeout
+// is applied, so seeding is never itself cancelled. Only the backfill runs under
+// the low timeout.
+//
+// Pre-fix verification (recorded in the task report): with backfill.go reverted
+// to pr5-pre-timeoutfix, this test FAILS — BackfillEmbedGenForUpgrade returns a
+// "canceling statement due to statement timeout (SQLSTATE 57014)" error and
+// embed_gen stays NULL.
+func TestBackfillEmbedGen_CompletesUnderLowStatementTimeout(t *testing.T) {
+	ctx := context.Background()
+	db := openPGTestDB(t)
+	_, err := db.Exec(`CREATE TABLE applied_migrations (
+		name TEXT PRIMARY KEY,
+		applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+	)`)
+	require.NoError(t, err, "create applied_migrations")
+
+	// Bring up the embeddings schema (index_generations, embeddings, …) via a
+	// full Open on the NORMAL handle, then bulk-seed lowTimeoutSeedRows messages
+	// + one embedding each so the stamp UPDATE has real work to do.
+	b, err := Open(ctx, Options{DB: db, Dimension: 4})
+	require.NoError(t, err, "Open")
+	t.Cleanup(func() { _ = b.Close() })
+
+	gen, err := b.CreateGeneration(ctx, "fake", 4, "")
+	require.NoError(t, err, "CreateGeneration")
+
+	_, err = db.ExecContext(ctx,
+		`INSERT INTO messages (id) SELECT generate_series(1, $1)`, lowTimeoutSeedRows)
+	require.NoError(t, err, "bulk insert messages")
+	// One embedding per message under the generation. Columns mirror schema.sql's
+	// NOT NULL set; the vector value is irrelevant (the backfill only checks
+	// existence via EXISTS).
+	_, err = db.ExecContext(ctx,
+		`INSERT INTO embeddings
+		    (generation_id, message_id, chunk_index, embedded_at, source_char_len, dimension, embedding)
+		 SELECT $1, g, 0, 0, 1, 4, ('[' || (g % 4) || ',0,0,0]')::vector
+		   FROM generate_series(1, $2) g`, int64(gen), lowTimeoutSeedRows)
+	require.NoError(t, err, "bulk insert embeddings")
+	require.NoError(t, b.ActivateGeneration(ctx, gen, true), "Activate (force)")
+
+	// Simulate the upgrade: embeddings + active gen present, embed_gen NULL, the
+	// backfill ledger cleared so the next backfill call reproduces the real
+	// first-post-upgrade timing. All on the NORMAL handle, before lowering the
+	// timeout.
+	_, err = db.ExecContext(ctx, `UPDATE messages SET embed_gen = NULL`)
+	require.NoError(t, err, "reset embed_gen to NULL (simulate upgrade)")
+	_, err = db.ExecContext(ctx,
+		`DELETE FROM applied_migrations WHERE name = $1`, embedGenBackfillMigration)
+	require.NoError(t, err, "clear backfill ledger")
+
+	// NOW switch to the low-timeout single-connection handle and run the backfill
+	// on it. Pre-fix the stamp UPDATE is cancelled (57014); post-fix the tx's
+	// SET LOCAL statement_timeout = 0 lets it complete.
+	low := openLowTimeoutHandle(t, db)
+	lowBackend := &Backend{db: low}
+
+	require.NoErrorf(t, lowBackend.BackfillEmbedGenForUpgrade(ctx),
+		"backfill must COMPLETE under a %dms statement_timeout (SET LOCAL lifts it)", lowTimeoutMS)
+
+	// The stamp landed despite the low session timeout: a sample of embedded rows
+	// is now stamped for the active generation, and the full count matches.
+	for _, id := range []int64{1, lowTimeoutSeedRows / 2, lowTimeoutSeedRows} {
+		v, isNull := embedGenOf(t, db, id)
+		assert.Falsef(t, isNull, "msg %d should be stamped by the low-timeout backfill", id)
+		assert.Equalf(t, int64(gen), v, "msg %d embed_gen", id)
+	}
+	var stamped int64
+	require.NoError(t, db.QueryRow(
+		`SELECT COUNT(*) FROM messages WHERE embed_gen = $1`, int64(gen)).Scan(&stamped))
+	assert.Equal(t, int64(lowTimeoutSeedRows), stamped,
+		"every embedded row stamped after the low-timeout backfill")
+
+	// And the ledger is marked so the one-time backfill never re-runs.
+	var marked int
+	require.NoError(t, db.QueryRow(
+		`SELECT COUNT(*) FROM applied_migrations WHERE name = $1`,
+		embedGenBackfillMigration).Scan(&marked))
+	assert.Equal(t, 1, marked, "backfill ledger marked after completing under low timeout")
 }
