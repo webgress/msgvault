@@ -90,14 +90,14 @@ func (b *Backend) Stats(_ context.Context, _ vector.GenerationID) (vector.Stats,
 	return vector.Stats{}, ErrNotBuilt
 }
 
-// EnsureSeeded always returns ErrNotBuilt in non-pgvector builds.
-func (b *Backend) EnsureSeeded(_ context.Context, _ vector.GenerationID) error {
-	return ErrNotBuilt
-}
-
 // LoadVector always returns ErrNotBuilt in non-pgvector builds.
 func (b *Backend) LoadVector(_ context.Context, _ int64) ([]float32, error) {
 	return nil, ErrNotBuilt
+}
+
+// EmbeddedMessageCount always returns ErrNotBuilt in non-pgvector builds.
+func (b *Backend) EmbeddedMessageCount(_ context.Context, _ vector.GenerationID) (int64, error) {
+	return 0, ErrNotBuilt
 }
 
 // Compile-time check that the stub matches the vector.Backend

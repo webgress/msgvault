@@ -22,12 +22,6 @@ import (
 // ErrHistoryExpired indicates that the Gmail history ID is too old and a full sync is required.
 var ErrHistoryExpired = errors.New("history expired - run full sync")
 
-// EmbedEnqueuer is optionally supplied to a Syncer; nil means vector
-// search is disabled. Set via SetEmbedEnqueuer.
-type EmbedEnqueuer interface {
-	EnqueueMessages(ctx context.Context, messageIDs []int64) error
-}
-
 // Options configures sync behavior.
 type Options struct {
 	// SourceType is the type of source being synced ("gmail" or "imap").
@@ -63,12 +57,11 @@ func DefaultOptions() *Options {
 
 // Syncer performs Gmail synchronization.
 type Syncer struct {
-	client        gmail.API
-	store         *store.Store
-	logger        *slog.Logger
-	progress      gmail.SyncProgress
-	opts          *Options
-	embedEnqueuer EmbedEnqueuer
+	client   gmail.API
+	store    *store.Store
+	logger   *slog.Logger
+	progress gmail.SyncProgress
+	opts     *Options
 }
 
 // New creates a new Syncer.
@@ -96,12 +89,6 @@ func (s *Syncer) WithLogger(logger *slog.Logger) *Syncer {
 func (s *Syncer) WithProgress(p gmail.SyncProgress) *Syncer {
 	s.progress = p
 	return s
-}
-
-// SetEmbedEnqueuer wires up the optional vector-search enqueuer. Safe
-// to call with nil to disable.
-func (s *Syncer) SetEmbedEnqueuer(e EmbedEnqueuer) {
-	s.embedEnqueuer = e
 }
 
 // syncState holds the state for a sync operation.
@@ -201,7 +188,6 @@ func (s *Syncer) processBatch(ctx context.Context, syncID, sourceID int64, listR
 			return nil, fmt.Errorf("fetch messages: %w", err)
 		}
 
-		var insertedIDs []int64
 		for i, fetch := range rawMessages {
 			raw := fetch.Message
 			if raw == nil {
@@ -235,7 +221,7 @@ func (s *Syncer) processBatch(ctx context.Context, syncID, sourceID int64, listR
 			}
 
 			threadID := threadIDs[newIDs[i]]
-			insertedID, err := s.ingestMessage(sourceID, raw, threadID, labelMap)
+			_, err := s.ingestMessage(sourceID, raw, threadID, labelMap)
 			if err != nil {
 				if errors.Is(err, errDuplicateRFC822) {
 					result.skipped++
@@ -247,25 +233,13 @@ func (s *Syncer) processBatch(ctx context.Context, syncID, sourceID int64, listR
 				continue
 			}
 
-			if insertedID > 0 {
-				insertedIDs = append(insertedIDs, insertedID)
-			}
 			result.added++
 			summary.BytesDownloaded += int64(len(raw.Raw))
 		}
 
-		// Hook vector-search enqueue after the batch-insert point.
-		// A failed enqueue is non-fatal on both backends: the message
-		// rows are already persisted, and any IDs missed by a failed
-		// enqueue are recovered by a full vector rebuild
-		// (`msgvault embed --full-rebuild`), which re-seeds every live
-		// message (both pgvector and sqlitevec provide this path). So we
-		// warn and continue rather than abort the sync.
-		if s.embedEnqueuer != nil && len(insertedIDs) > 0 {
-			if err := s.embedEnqueuer.EnqueueMessages(ctx, insertedIDs); err != nil {
-				s.logger.Warn("vector enqueue failed", "ids", len(insertedIDs), "error", err)
-			}
-		}
+		// Newly-persisted messages get embed_gen = NULL by column default,
+		// so the scan-and-fill embed worker picks them up automatically on
+		// its next run — no sync-time enqueue step is needed.
 	}
 
 	return result, nil
@@ -614,8 +588,10 @@ func (s *Syncer) parseToModel(sourceID int64, raw *gmail.RawMessage, threadID st
 	}, nil
 }
 
-// persistMessage stores a parsed message and all related data. Returns
-// the internal message ID for hooks (e.g. vector-search enqueue).
+// persistMessage stores a parsed message and all related data, returning
+// the internal message ID to callers. No vector-search enqueue happens
+// here: persisted rows leave embed_gen NULL (column default) and the
+// scan-and-fill worker discovers them later.
 func (s *Syncer) persistMessage(data *messageData, labelMap map[string]int64) (int64, error) {
 	// Map Gmail label IDs to internal IDs
 	var labelIDs []int64
