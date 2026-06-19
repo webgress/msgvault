@@ -364,7 +364,8 @@ func assertCreateExtensionOutsideTx(t *testing.T, tracer *sqlTracer) {
 // TestOpen_SkipExtensionWiring (V5) pins the Options.SkipExtension wiring:
 // Open with SkipExtension:true must succeed and produce a working backend
 // (schema created without running CREATE EXTENSION). Distinct from
-// SkipMigrate, which suppresses all DDL.
+// SkipMigrate (suppresses CREATE EXTENSION + the heavy full migrate) and
+// ReadOnly (suppresses ALL writes).
 func TestOpen_SkipExtensionWiring(t *testing.T) {
 	db := openPGTestDB(t)
 	ctx := context.Background()

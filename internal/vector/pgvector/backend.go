@@ -39,11 +39,25 @@ type Options struct {
 	// per-dimension HNSW index on first migration. Optional; if zero
 	// the index is created on first CreateGeneration.
 	Dimension int
-	// SkipMigrate suppresses the automatic schema migration on Open.
-	// Set this when the caller holds a read-only connection (e.g. the
-	// MCP server), where CREATE EXTENSION and DDL statements are
-	// rejected by PostgreSQL with SQLSTATE 25006.
+	// SkipMigrate suppresses the privileged CREATE EXTENSION + full
+	// migrate. A WRITABLE open still applies the (extension-less) schema so
+	// the one-time upgrade lands — read-only-ness is now signalled by
+	// ReadOnly, not SkipMigrate. Set this when the caller cannot run the
+	// privileged `CREATE EXTENSION vector` (e.g. a management command on a
+	// DB whose extension+schema were already installed by serve/build), but
+	// still wants the writable Open to bring up the extension-less schema +
+	// run the one-time upgrade backfill. The heavy migrate (CREATE EXTENSION
+	// + eager index build) is skipped; the extension-less schema apply is
+	// not (it is gated by ReadOnly instead).
 	SkipMigrate bool
+	// ReadOnly indicates the connection cannot write — e.g. MCP
+	// store.OpenReadOnly, where CREATE EXTENSION and DDL statements are
+	// rejected by PostgreSQL with SQLSTATE 25006. When set, Open performs NO
+	// writes: no Migrate, no schema apply, no orphan reset, no upgrade
+	// backfill. Mirrors sqlitevec.Options.ReadOnly. A read-only open must set
+	// this (typically alongside SkipMigrate); a writable management open
+	// leaves it false so the upgrade backfill still lands.
+	ReadOnly bool
 	// SkipExtension suppresses only the `CREATE EXTENSION IF NOT EXISTS
 	// vector` step during migration while still creating the schema
 	// tables and indexes. Set this when the vector extension is
@@ -73,8 +87,23 @@ func Open(ctx context.Context, opts Options) (*Backend, error) {
 	}
 	b := &Backend{db: opts.DB}
 	if !opts.SkipMigrate {
+		// serve / build / search: full migrate incl. CREATE EXTENSION (the
+		// extension step is gated by SkipExtension for managed PG). The eager
+		// per-dimension HNSW index is built here too.
 		if err := Migrate(ctx, opts.DB, opts.Dimension, opts.SkipExtension); err != nil {
 			return nil, fmt.Errorf("pgvector migrate: %w", err)
+		}
+	}
+	if !opts.ReadOnly {
+		// Writable open. When the heavy Migrate above was skipped (management
+		// sets SkipMigrate=true to avoid the privileged CREATE EXTENSION), still
+		// apply the schema WITHOUT the extension so embed_watermark etc. exist
+		// and the one-time upgrade backfill lands — parity with sqlitevec (which
+		// always Migrates vectors.db + backfills unless ReadOnly).
+		if opts.SkipMigrate {
+			if err := Migrate(ctx, opts.DB, opts.Dimension, true /* skipExtension */); err != nil {
+				return nil, fmt.Errorf("pgvector migrate (schema-only): %w", err)
+			}
 		}
 		// Orphaned-stamp reset (DB-recreate safety): clear embed_gen for any
 		// message whose stamp points to a generation id absent from
@@ -84,16 +113,15 @@ func Open(ctx context.Context, opts Options) (*Backend, error) {
 		// but the reset is kept for symmetry with sqlitevec and to defend
 		// against partial restores (e.g. messages restored, embeddings not).
 		// Not ledger-guarded: re-checks every writable Open; cheap + idempotent.
-		// Skipped here on the SkipMigrate (read-only) path, where writes are
-		// rejected anyway.
+		// Skipped on the ReadOnly path, where writes are rejected anyway.
 		if err := b.resetOrphanedEmbedGen(ctx); err != nil {
 			return nil, fmt.Errorf("reset orphaned embed_gen: %w", err)
 		}
 		// One-time upgrade backfill (Package A): stamp embed_gen for messages
 		// already embedded under the active generation so an upgraded archive
 		// is not reported as entirely missing (which would re-embed it all).
-		// Ledger-guarded, runs at most once. Skipped on the SkipMigrate
-		// (read-only) path, where writes are rejected anyway.
+		// Ledger-guarded, runs at most once. Skipped on the ReadOnly path,
+		// where writes are rejected anyway.
 		if err := b.BackfillEmbedGenForUpgrade(ctx); err != nil {
 			return nil, fmt.Errorf("embed_gen upgrade backfill: %w", err)
 		}

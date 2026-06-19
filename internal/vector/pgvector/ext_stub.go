@@ -25,6 +25,7 @@ type Options struct {
 	DB            *sql.DB
 	Dimension     int
 	SkipMigrate   bool
+	ReadOnly      bool
 	SkipExtension bool
 }
 

@@ -177,10 +177,10 @@ func (b *Backend) BackfillEmbedGenForUpgrade(ctx context.Context) error {
 // and index_generations.id is NOT NULL so the NULL-in-subquery pitfall cannot
 // arise.
 //
-// Guards (mirror BackfillEmbedGenForUpgrade / the Open SkipMigrate gate): the
-// caller (Open) skips this on the read-only SkipMigrate path. NOT
-// ledger-guarded: it re-checks every writable Open; cheap + idempotent (a
-// second run finds no orphans and updates nothing).
+// Guards (mirror BackfillEmbedGenForUpgrade / the Open ReadOnly gate): the
+// caller (Open) skips this on the ReadOnly path. NOT ledger-guarded: it
+// re-checks every writable Open; cheap + idempotent (a second run finds no
+// orphans and updates nothing).
 func (b *Backend) resetOrphanedEmbedGen(ctx context.Context) error {
 	// Robustness guard (mirrors the SQLite resetOrphanedEmbedGen, which skips
 	// when applied_migrations is absent because "such a fixture also lacks the

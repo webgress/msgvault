@@ -408,9 +408,17 @@ func openEmbeddingsBackend(ctx context.Context) (vector.Backend, func(), error) 
 		if err != nil {
 			return nil, nil, fmt.Errorf("open postgres for embeddings backend: %w", err)
 		}
-		// SkipMigrate: the metadata tables already exist (the caller's
-		// openEmbeddingsMetadataDB pre-checks index_generations), and a
-		// management command must not run migrations as a side effect.
+		// SkipMigrate skips only the privileged CREATE EXTENSION + full
+		// migrate: the extension + metadata tables already exist (the caller's
+		// openEmbeddingsMetadataDB pre-checks index_generations), so a
+		// management command must not attempt the privileged extension step.
+		// This open is WRITABLE management, NOT read-only — ReadOnly stays
+		// false so Open still applies the extension-less schema (bringing up
+		// embed_watermark etc. if missing) and runs the one-time embed_gen
+		// upgrade backfill, matching the SQLite management path (which always
+		// migrates vectors.db + backfills). Without this, a post-upgrade PG
+		// archive would report its whole corpus as missing on the first
+		// writable management command.
 		b, err := pgvector.Open(ctx, pgvector.Options{
 			DB:          db,
 			Dimension:   cfg.Vector.Embeddings.Dimension,

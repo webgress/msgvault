@@ -30,15 +30,17 @@ import (
 // (store.IsPostgresURL).
 //
 // readOnly marks mainDB as a read-only connection — e.g. the MCP server's
-// store.OpenReadOnly. On PostgreSQL it sets pgvector.Options.SkipMigrate,
-// which suppresses ALL of Open's DDL — CREATE EXTENSION, schema/index
-// migration, and the embed_gen backfill — because PG vector tables share
-// the (read-only) main connection and DDL would be rejected with SQLSTATE
-// 25006. On SQLite it sets sqlitevec.Options.ReadOnly so only the one-time
-// embed_gen upgrade backfill — which WRITES messages.embed_gen +
-// applied_migrations through the main handle — is skipped (the query-only
-// handle would reject those writes); Migrate still runs there because it
-// only touches the separate vectors.db, which is read-write regardless.
+// store.OpenReadOnly. On PostgreSQL it sets BOTH pgvector.Options.SkipMigrate
+// and pgvector.Options.ReadOnly: SkipMigrate suppresses the privileged
+// CREATE EXTENSION + full migrate, and ReadOnly suppresses ALL remaining
+// writes — the extension-less schema apply, the orphan reset, and the
+// embed_gen backfill — because PG vector tables share the (read-only) main
+// connection and any DDL/UPDATE would be rejected with SQLSTATE 25006. On
+// SQLite it sets sqlitevec.Options.ReadOnly so only the one-time embed_gen
+// upgrade backfill — which WRITES messages.embed_gen + applied_migrations
+// through the main handle — is skipped (the query-only handle would reject
+// those writes); Migrate still runs there because it only touches the
+// separate vectors.db, which is read-write regardless.
 func setupVectorFeatures(ctx context.Context, mainStore *store.Store, mainPath string, readOnly bool) (*vectorFeatures, error) {
 	if !cfg.Vector.Enabled {
 		return nil, nil //nolint:nilnil // vector disabled: callers nil-check vf; (nil, nil) means "no features, no error"
@@ -75,6 +77,11 @@ func setupVectorFeatures(ctx context.Context, mainStore *store.Store, mainPath s
 			DB:          mainDB,
 			Dimension:   cfg.Vector.Embeddings.Dimension,
 			SkipMigrate: readOnly,
+			// ReadOnly MUST track readOnly here: this is the MCP read-only
+			// path (store.OpenReadOnly). When set, Open performs no writes —
+			// no schema apply, no orphan reset, no upgrade backfill — so the
+			// query-only connection never attempts DDL/UPDATE (SQLSTATE 25006).
+			ReadOnly: readOnly,
 			// On a managed/locked-down PG the `vector` extension is
 			// pre-installed by an admin and CREATE EXTENSION would fail
 			// for the msgvault role; SkipExtensionCreate lets schema +
